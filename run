@@ -1,0 +1,1 @@
+node service.js 2>&1 | tee ../strubs.out
