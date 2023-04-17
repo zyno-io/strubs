@@ -1,10 +1,10 @@
 const fs = require('fs');
 const fsp = fs.promises;
 
-global.constants = require('./lib/constants');
+global.constants = require('../lib/constants');
 
-const Core = require('./lib/core');
-const log = require('./lib/log')('bootstrap');
+const Core = require('../lib/core');
+const log = require('../lib/log')('bootstrap');
 
 process.on('uncaughtException', err => {
     log.error('!! an uncaught exception has occurred', err);
@@ -20,9 +20,9 @@ process.on('unhandledRejection', err => {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
-const database = require('./lib/database');
-const server = require('./lib/server/manager');
-const IOManager = require('./lib/io/manager');
+const database = require('../lib/database');
+const server = require('../lib/server/manager');
+const IOManager = require('../lib/io/manager');
 const { v4: uuid } = require('uuid');
 
 server.init = async function() {
