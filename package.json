@@ -4,6 +4,7 @@
   "description": "STRUBS (Striping & Redundancy using Basic Disks): A single-host fault-tolerant mass-storage service for providing a scalable storage system for small scale operations.",
   "main": "service.js",
   "scripts": {
+    "dev": "nodemon --inspect service.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "Signal24 <hello@sgnl24.com>",
@@ -17,6 +18,7 @@
     "fuse-native": "^2.2.6",
     "lodash": "^4.17.20",
     "mongodb": "^3.6.3",
+    "nodemon": "^2.0.22",
     "uuid": "^8.3.2"
   }
 }
