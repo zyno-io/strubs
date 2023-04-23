@@ -16,19 +16,21 @@ const updatePathFormat = async () => {
         //  find subdirectories within UUID base directories
         const files = await fsp.readdir(`${baseDir}${uuids[i]}/strubs`, { withFileTypes: true });
 
-        const fileName = files.find(file => file.name.length == 1 && /\d/.test(file.name[0])).name;
-        const oldPath = `${ baseDir }${ uuids[i] }/strubs/${ fileName }`
+        const fileNames = files.filter(file => file.name.length == 1 && /[0-9a-z]/.test(file.name[0])).map(file => file.name);
 
-        //  find files and move
-        move(oldPath)
+        for (let j = 0; j < fileNames.length; ++j) {
+            const oldPath = `${ baseDir }${ uuids[i] }/strubs/${ fileName }`;
+            //  find files and move
+            await move(oldPath);
+        }
     }
 };
 
 const move = async (oldPath) => {
     const files = await fsp.readdir(oldPath, { withFileTypes: true });
 
-    if (files.length == 1 && files[0].isDirectory()) {
-        move(`${ oldPath }/${ files[0].name }`);
+    if (files.length === 1 && files[0].isDirectory()) {
+        await move(`${ oldPath }/${ files[0].name }`);
         return;
     }
 
@@ -48,27 +50,8 @@ const move = async (oldPath) => {
 
         //  move files
         await fsp.rename(oldPath + '/' + fileNames[i], newPath + '/' + fileNames[i]);
-    }
-};
-
-//  updatePathFormat();
-
-const removeOldPath = async () => {
-    const files = await fsp.readdir(baseDir, { withFileTypes: true });
-    const uuids = files.map(file => file.name);
-
-    for (let i = 0; i < uuids.length; ++i) {
-        
-        //  find subdirectories within UUID base directories
-        const files = await fsp.readdir(`${baseDir}${uuids[i]}/strubs`, { withFileTypes: true });
-
-        //  get base directory with old path format
-        const fileName = files.find(file => file.name.length == 1 && /\d/.test(file.name[0])).name;
-        const oldPath = `${ baseDir }${ uuids[i] }/strubs/${ fileName }`
-
-        //  remove remnant directories
         await fsp.rm(oldPath, { recursive: true });
     }
 };
 
-removeOldPath();
+updatePathFormat();
