@@ -26,6 +26,7 @@ type VolumeStatus = {
     bytesTotal: number;
     bytesFree: number | null;
     verifyErrors: Volume['verifyErrors'];
+    mountError: string | null;
     isDeleted: boolean;
 };
 
@@ -276,7 +277,8 @@ export class HttpMgmt {
             bytesTotal: volume.bytesTotal,
             bytesFree: volume.bytesFree,
             verifyErrors: volume.verifyErrors,
-            isDeleted: volume.isDeleted
+            isDeleted: volume.isDeleted,
+            mountError: volume.mountError
         };
     }
 

@@ -43,6 +43,8 @@ export class SmartInfoService {
                     return null;
                 }
             }
+
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
     }
 }

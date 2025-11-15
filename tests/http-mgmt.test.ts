@@ -158,7 +158,8 @@ describe('HttpMgmt.handle', () => {
                 bytesTotal: 1024,
                 bytesFree: 512,
                 verifyErrors: null,
-                isDeleted: false
+                isDeleted: false,
+                mountError: undefined
             }
         ]);
     });
@@ -244,7 +245,8 @@ describe('HttpMgmt.handle', () => {
             bytesUsedData: 40,
             bytesUsedParity: 10,
             verifyErrors: { checksum: 1, total: 2 },
-            isDeleted: false
+            isDeleted: false,
+            mountError: 'failed to mount'
         };
         const volume2 = {
             uuid: 'vol-2',
@@ -263,7 +265,8 @@ describe('HttpMgmt.handle', () => {
             bytesUsedData: 80,
             bytesUsedParity: 0,
             verifyErrors: null,
-            isDeleted: false
+            isDeleted: false,
+            mountError: null
         };
         ioManagerMock.getVolumeEntries.mockReturnValue([[1, volume1], [2, volume2]]);
 

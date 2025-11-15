@@ -56,6 +56,7 @@ export class Volume extends EventEmitter {
     public deviceName: string | null = null;
     public deviceGroup: number | null = null;
     public verifyErrors: VolumeVerifyErrors | null;
+    public mountError: string | null = null;
     private readonly log: ReturnType<typeof createLogger>;
 
     constructor(inConfig: VolumeConfig) {
@@ -129,6 +130,8 @@ export class Volume extends EventEmitter {
         }
 
         catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            this.mountError = message;
             this.log.error('error encountered while starting the volume', err);
             this.emit('error', err);
             throw err;
@@ -159,6 +162,7 @@ export class Volume extends EventEmitter {
 
     async mount(): Promise<void> {
         this.mountPoint = '/run/strubs/mounts/' + this.uuid;
+        this.mountError = null;
 
         try {
             await fsp.access(this.mountPoint);
@@ -188,7 +192,9 @@ export class Volume extends EventEmitter {
             await mountVolume(this.blockPath, this.mountPoint, this.fsType, this.mountOptions || {});
         }
         catch (err) {
-            throw new Error('unable to mount: ' + err);
+            const message = 'unable to mount: ' + err;
+            this.mountError = message;
+            throw new Error(message);
         }
 
         const volumeTempPath = this.mountPoint + '/strubs/.tmp';

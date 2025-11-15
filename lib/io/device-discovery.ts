@@ -109,7 +109,9 @@ export class DeviceDiscovery {
     }
 
     private async populateSmartInfo(devices: RawBlockDevice[]): Promise<void> {
-        await Promise.all(devices.map(device => this.queryDeviceSMARTInfo(device)));
+        for (const device of devices) {
+            await this.queryDeviceSMARTInfo(device);
+        }
     }
 
     private async queryDeviceSMARTInfo(blkDevice: RawBlockDevice): Promise<void> {
