@@ -176,6 +176,61 @@ describe('HttpMgmt.handle', () => {
         expect(listRawBlockDevicesMock).toHaveBeenCalledTimes(1);
     });
 
+    it('returns array state in status endpoint', async () => {
+        const volume1 = {
+            uuid: 'vol-1',
+            blockPath: null,
+            mountPoint: null,
+            isMounted: false,
+            isVerified: false,
+            isStarted: false,
+            isEnabled: true,
+            isHealthy: true,
+            isReadOnly: false,
+            deviceSerial: 'SN1',
+            partitionUuid: 'part-1',
+            bytesTotal: 100,
+            bytesFree: 50,
+            bytesUsedData: 40,
+            bytesUsedParity: 10,
+            verifyErrors: { checksum: 1, total: 2 },
+            isDeleted: false
+        };
+        const volume2 = {
+            uuid: 'vol-2',
+            blockPath: '/dev/sdb1',
+            mountPoint: '/mnt/2',
+            isMounted: true,
+            isVerified: true,
+            isStarted: true,
+            isEnabled: false,
+            isHealthy: true,
+            isReadOnly: true,
+            deviceSerial: 'SN2',
+            partitionUuid: 'part-2',
+            bytesTotal: 200,
+            bytesFree: 100,
+            bytesUsedData: 80,
+            bytesUsedParity: 0,
+            verifyErrors: null,
+            isDeleted: false
+        };
+        ioManagerMock.getVolumeEntries.mockReturnValue([[1, volume1], [2, volume2]]);
+
+        const response = await HttpMgmt.handle(5, createRequest('GET', '/$/status'), nullResponse);
+
+        expect(response).toEqual({
+            availableVolumeIds: [2],
+            unavailableVolumeIds: [1],
+            disabledVolumeIds: [2],
+            readOnlyVolumeIds: [2],
+            verifyErrors: { '1': { checksum: 1, total: 2 } },
+            gbStored: 80 / (1024 ** 3),
+            gbCapacity: 200 / (1024 ** 3),
+            gbFree: 100 / (1024 ** 3)
+        });
+    });
+
     it('creates a new volume when provisioning a block device', async () => {
         deviceProvisionerProvisionMock.mockResolvedValue({
             id: 2,

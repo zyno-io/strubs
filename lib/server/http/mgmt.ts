@@ -37,6 +37,17 @@ type RouteDefinition = {
 };
 type RouteMatch = { handler: RouteHandler; params: RouteParams };
 
+type StatusResponse = {
+    availableVolumeIds: number[];
+    unavailableVolumeIds: number[];
+    disabledVolumeIds: number[];
+    readOnlyVolumeIds: number[];
+    verifyErrors: Record<string, Volume['verifyErrors']>;
+    gbStored: number;
+    gbCapacity: number;
+    gbFree: number;
+};
+
 export class HttpMgmt {
     private static readonly routes: RouteDefinition[] = HttpMgmt.createRoutes();
 
@@ -73,6 +84,48 @@ export class HttpMgmt {
 
     private static async handleVerifyJobStatusRequest(): Promise<{ running: boolean; startedAt: string | null; objectsVerified: number; errors: { total: number; volumes: Record<string, number> } }> {
         return verifyJob.getStatus();
+    }
+
+    private static async handleStatusRequest(): Promise<StatusResponse> {
+        const available: number[] = [];
+        const unavailable: number[] = [];
+        const disabled: number[] = [];
+        const readOnly: number[] = [];
+        const verifyErrors: Record<string, Volume['verifyErrors']> = {};
+        let bytesStored = 0;
+        let bytesCapacity = 0;
+        let bytesFree = 0;
+
+        for (const [id, volume] of ioManager.getVolumeEntries()) {
+            const isAvailable = volume.isStarted && Boolean(volume.blockPath);
+            if (isAvailable) {
+                available.push(id);
+                bytesCapacity += volume.bytesTotal;
+                bytesStored += volume.bytesUsedData ?? 0;
+                bytesStored += volume.bytesUsedParity ?? 0;
+                bytesFree += volume.bytesFree ?? 0;
+            }
+            else {
+                unavailable.push(id);
+            }
+            if (!volume.isEnabled)
+                disabled.push(id);
+            if (volume.isReadOnly)
+                readOnly.push(id);
+            if (volume.verifyErrors)
+                verifyErrors[String(id)] = volume.verifyErrors;
+        }
+
+        return {
+            availableVolumeIds: available,
+            unavailableVolumeIds: unavailable,
+            disabledVolumeIds: disabled,
+            readOnlyVolumeIds: readOnly,
+            verifyErrors,
+            gbStored: bytesStored / (1024 ** 3),
+            gbCapacity: bytesCapacity / (1024 ** 3),
+            gbFree: bytesFree / (1024 ** 3)
+        };
     }
 
     private static async handleVolumeCreationRequest(req: HttpRequest): Promise<VolumeStatus> {
@@ -264,6 +317,11 @@ export class HttpMgmt {
                 method: 'GET',
                 match: url => url === '/$/volumes' ? {} : null,
                 handler: async req => this.handleVolumesRequest(req)
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/status' ? {} : null,
+                handler: async () => this.handleStatusRequest()
             },
             {
                 method: 'GET',
