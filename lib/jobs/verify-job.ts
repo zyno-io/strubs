@@ -1,3 +1,4 @@
+import os from 'os';
 import { database, type SliceErrorInfo } from '../database';
 import { runtimeConfig } from '../runtime-config';
 import { fileObjectService, type FileObjectService } from '../io/file-object/service';
@@ -42,10 +43,54 @@ const defaultDeps: VerifyJobDeps = {
 };
 
 const VERIFY_BATCH_SIZE = 25;
+const envConcurrency = process.env.STRUBS_VERIFY_PARALLEL ? Number.parseInt(process.env.STRUBS_VERIFY_PARALLEL, 10) : NaN;
+const cpuCount = os.cpus?.().length ?? 1;
+
+class VolumeReadCoordinator {
+    private readonly locked = new Set<number>();
+    private readonly queues = new Map<number, Array<() => void>>();
+
+    async acquire(volumeId: number | null | undefined): Promise<() => void> {
+        if (volumeId === null || volumeId === undefined)
+            return () => undefined;
+        if (!this.locked.has(volumeId)) {
+            this.locked.add(volumeId);
+            return this.createRelease(volumeId);
+        }
+        return new Promise<() => void>(resolve => {
+            const queue = this.queues.get(volumeId) ?? [];
+            queue.push(() => {
+                this.locked.add(volumeId);
+                resolve(this.createRelease(volumeId));
+            });
+            this.queues.set(volumeId, queue);
+        });
+    }
+
+    private createRelease(volumeId: number): () => void {
+        let released = false;
+        return () => {
+            if (released)
+                return;
+            released = true;
+            const queue = this.queues.get(volumeId);
+            if (queue && queue.length) {
+                const next = queue.shift();
+                if (next)
+                    next();
+                if (!queue.length)
+                    this.queues.delete(volumeId);
+                return;
+            }
+            this.locked.delete(volumeId);
+        };
+    }
+}
 
 export class VerifyJob {
     private readonly deps: VerifyJobDeps;
     private readonly log: ReturnType<typeof createLogger>;
+    private readonly volumeCoordinator = new VolumeReadCoordinator();
     private running: Promise<void> | null = null;
     private cancelRequested = false;
     private startedAt: string | null = null;
@@ -147,26 +192,55 @@ export class VerifyJob {
         let checksumErrors = 0;
         let totalErrors = 0;
 
+        const concurrency = this.resolveConcurrency();
+
         try {
             while (!this.cancelRequested) {
                 const batch = await this.fetchBatch(startedAtDate);
                 if (!batch.length)
                     break;
 
-                for (const record of batch) {
-                    if (this.cancelRequested)
+                let interrupted = false;
+                let nextIndex = 0;
+                const active: Array<{ record: StoredObjectRecord; promise: Promise<VerifyObjectResult | null> }> = [];
+
+                const startNext = (): void => {
+                    while (nextIndex < batch.length && active.length < concurrency && !this.cancelRequested) {
+                        const record = batch[nextIndex++];
+                        active.push({
+                            record,
+                            promise: this.verifyObject(record, startedAtDate)
+                        });
+                    }
+                };
+
+                startNext();
+
+                while (active.length && !this.cancelRequested) {
+                    const settled = await Promise.race(active.map(entry => entry.promise.then(result => ({ entry, result }))));
+                    const { entry, result } = settled;
+                    const index = active.indexOf(entry);
+                    if (index !== -1)
+                        active.splice(index, 1);
+
+                    if (!result) {
+                        interrupted = true;
                         break;
-                    const result = await this.verifyObject(record, startedAtDate);
-                    if (!result)
-                        break;
+                    }
+
                     this.progress.objectsVerified++;
                     checksumErrors += result.checksumErrors;
                     totalErrors += result.totalErrors;
                     await this.mergeVolumeResults(volumeCounts, result.volumeImpacts);
                     this.logProgress(totalErrors, volumeCounts);
+
+                    startNext();
                 }
 
-                if (this.cancelRequested)
+                if (active.length)
+                    await Promise.allSettled(active.map(entry => entry.promise));
+
+                if (this.cancelRequested || interrupted)
                     break;
             }
         }
@@ -208,6 +282,9 @@ export class VerifyJob {
     }
 
     private async verifyObject(record: StoredObjectRecord, startedAt: Date): Promise<VerifyObjectResult | null> {
+        const volumeLocks = await this.acquireVolumeLocks(record);
+        if (volumeLocks === null)
+            return null;
         try {
             if (this.cancelRequested)
                 return null;
@@ -318,6 +395,41 @@ export class VerifyJob {
                 volumeImpacts
             };
         }
+        finally {
+            this.releaseVolumeLocks(volumeLocks);
+        }
+    }
+
+    private async acquireVolumeLocks(record: StoredObjectRecord): Promise<(() => void)[] | null> {
+        const volumes = this.collectRecordVolumeIds(record);
+        const releases: (() => void)[] = [];
+        for (const volumeId of volumes) {
+            if (this.cancelRequested) {
+                this.releaseVolumeLocks(releases);
+                return null;
+            }
+            const release = await this.volumeCoordinator.acquire(volumeId);
+            releases.push(release);
+        }
+        return releases;
+    }
+
+    private releaseVolumeLocks(releases: (() => void)[]): void {
+        for (const release of releases.reverse())
+            release();
+    }
+
+    private collectRecordVolumeIds(record: StoredObjectRecord): number[] {
+        const unique = new Set<number>();
+        for (const id of record.dataVolumes ?? []) {
+            if (typeof id === 'number')
+                unique.add(id);
+        }
+        for (const id of record.parityVolumes ?? []) {
+            if (typeof id === 'number')
+                unique.add(id);
+        }
+        return Array.from(unique).sort((a, b) => a - b);
     }
 
     private describeSlice(
@@ -362,6 +474,15 @@ export class VerifyJob {
             volumeId,
             isChecksum
         };
+    }
+
+    private resolveConcurrency(): number {
+        if (Number.isFinite(envConcurrency) && envConcurrency > 0)
+            return envConcurrency;
+        const entries = this.deps.ioManager.getVolumeEntries();
+        const enabledCount = entries.filter(([, volume]) => volume.isEnabled && !volume.isDeleted).length;
+        const effective = enabledCount || entries.length || cpuCount;
+        return Math.max(1, Math.min(cpuCount, effective));
     }
 
     private isIOAbortError(err: unknown): boolean {

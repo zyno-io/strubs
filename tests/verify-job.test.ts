@@ -96,6 +96,69 @@ describe('VerifyJob', () => {
         }));
     });
 
+    it('verifies multiple objects in parallel batches', async () => {
+        const deps = createDeps();
+        const recordA = {
+            id: 'obj-a',
+            size: 1,
+            dataVolumes: [1],
+            parityVolumes: [],
+            chunkSize: 1,
+            dataSliceVolumeIds: [1],
+            paritySliceVolumeIds: [],
+            unavailableSlices: [],
+            damagedSlices: [],
+            isFile: true,
+            name: 'fileA',
+            md5: null
+        };
+        const recordB = {
+            id: 'obj-b',
+            size: 1,
+            dataVolumes: [2],
+            parityVolumes: [],
+            chunkSize: 1,
+            dataSliceVolumeIds: [2],
+            paritySliceVolumeIds: [],
+            unavailableSlices: [],
+            damagedSlices: [],
+            isFile: true,
+            name: 'fileB',
+            md5: null
+        };
+
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+        deps.database.findObjectsNeedingVerification
+            .mockResolvedValueOnce([recordA, recordB])
+            .mockResolvedValueOnce([]);
+
+        const verifierSpies: Array<ReturnType<typeof vi.fn>> = [];
+        deps.fileObjectService.load.mockResolvedValue({} as any);
+        deps.createSliceVerifier.mockImplementation(() => {
+            const fn = vi.fn().mockResolvedValue(undefined);
+            verifierSpies.push(fn);
+            return { verifySlice: fn };
+        });
+
+        const job = new VerifyJob(deps);
+        const { startedAt } = await job.start();
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        expect(verifierSpies).toHaveLength(2);
+        expect(verifierSpies[0]).toHaveBeenCalledWith(0);
+        expect(verifierSpies[1]).toHaveBeenCalledWith(0);
+        expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(recordA.id, {
+            lastVerifiedAt: new Date(startedAt),
+            sliceErrors: null
+        });
+        expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(recordB.id, {
+            lastVerifiedAt: new Date(startedAt),
+            sliceErrors: null
+        });
+    });
+
     it('records checksum failures and per-volume counts', async () => {
         const deps = createDeps();
         const record = {

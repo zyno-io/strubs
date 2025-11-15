@@ -165,15 +165,65 @@ describe('HttpMgmt.handle', () => {
 
     it('returns block device listings', async () => {
         const blockDevices: RawBlockDevice[] = [
+            { name: 'sdb', path: '/dev/sdb', type: 'disk', size: 2048, children: [] },
+            { name: 'sda', path: '/dev/sda', type: 'disk', size: 1024, children: [] }
+        ];
+        listRawBlockDevicesMock.mockResolvedValue(blockDevices);
+        const { readlinkSync } = require('fs');
+        const readlinkSpy = vi.spyOn(require('fs'), 'readlinkSync').mockImplementation((target: string) => {
+            if (target === '/sys/block/sda')
+                return '../devices/pci0000:00/sda';
+            if (target === '/sys/block/sdb')
+                return '../devices/pci0000:00/sdb';
+            throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+        });
+
+        const response = await HttpMgmt.handle(3, createRequest('GET', '/$/blockDevices'), nullResponse);
+
+        expect(response).toEqual([
+            { ...blockDevices[1], sysfsPath: '/sys/block/devices/pci0000:00/sda' },
+            { ...blockDevices[0], sysfsPath: '/sys/block/devices/pci0000:00/sdb' }
+        ]);
+        readlinkSpy.mockRestore();
+    });
+
+    it('sorts block devices by sysfs path when requested', async () => {
+        const blockDevices: RawBlockDevice[] = [
             { name: 'sda', path: '/dev/sda', type: 'disk', size: 1024, children: [] },
             { name: 'sdb', path: '/dev/sdb', type: 'disk', size: 2048, children: [] }
         ];
         listRawBlockDevicesMock.mockResolvedValue(blockDevices);
+        const readlinkSpy = vi.spyOn(require('fs'), 'readlinkSync').mockImplementation((target: string) => {
+            if (target === '/sys/block/sda')
+                return '../devices/pci0000:00/slot2';
+            if (target === '/sys/block/sdb')
+                return '../devices/pci0000:00/slot1';
+            throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+        });
 
-        const response = await HttpMgmt.handle(3, createRequest('GET', '/$/blockDevices'), nullResponse);
+        const req = createRequest('GET', '/$/blockDevices');
+        req.params.sort = 'sysfsPath';
+        const response = await HttpMgmt.handle(4, req, nullResponse);
 
-        expect(response).toBe(blockDevices);
-        expect(listRawBlockDevicesMock).toHaveBeenCalledTimes(1);
+        expect(response).toEqual([
+            { ...blockDevices[1], sysfsPath: '/sys/block/devices/pci0000:00/slot1' },
+            { ...blockDevices[0], sysfsPath: '/sys/block/devices/pci0000:00/slot2' }
+        ]);
+        readlinkSpy.mockRestore();
+    });
+
+    it('sorts block devices by size when requested', async () => {
+        const blockDevices: RawBlockDevice[] = [
+            { name: 'sdb', path: '/dev/sdb', type: 'disk', size: 2048, children: [] },
+            { name: 'sda', path: '/dev/sda', type: 'disk', size: 1024, children: [] }
+        ];
+        listRawBlockDevicesMock.mockResolvedValue(blockDevices);
+
+        const req = createRequest('GET', '/$/blockDevices');
+        req.params.sort = 'size';
+        const response = await HttpMgmt.handle(5, req, nullResponse);
+
+        expect(response.map(device => device.name)).toEqual(['sda', 'sdb']);
     });
 
     it('returns array state in status endpoint', async () => {

@@ -7,6 +7,8 @@ import { verifyJob } from '../../jobs/verify-job';
 import { database } from '../../database';
 import type { HttpRequest, HttpResponse } from './server';
 import type { Volume } from '../../io/volume';
+import fs from 'fs';
+import path from 'path';
 
 type VolumeStatus = {
     id: number;
@@ -69,12 +71,45 @@ export class HttpMgmt {
         return this.getVolumeStatus(includeDeleted);
     }
 
-    private static async handleBlockDevicesRequest(): Promise<RawBlockDevice[]> {
-        return listRawBlockDevices();
+    private static async handleBlockDevicesRequest(req: HttpRequest): Promise<Array<RawBlockDevice & { sysfsPath?: string }>> {
+        const devices = await listRawBlockDevices();
+        const enriched = devices.map(device => ({
+            ...device,
+            sysfsPath: this.extractSysfsPath(device.name)
+        }));
+        const sortParam = this.resolveSortParam(req.params);
+        enriched.sort((a, b) => {
+            if (sortParam === 'sysfsPath')
+                return (a.sysfsPath ?? '').localeCompare(b.sysfsPath ?? '');
+            if (sortParam === 'size')
+                return (Number(a.size) || 0) - (Number(b.size) || 0);
+            return a.name.localeCompare(b.name);
+        });
+        return enriched;
     }
 
     private static async handleVerifyJobStartRequest(): Promise<{ startedAt: string }> {
         return verifyJob.start();
+    }
+
+    private static extractSysfsPath(name: string): string | undefined {
+        try {
+            const link = fs.readlinkSync(`/sys/block/${name}`);
+            return path.resolve(`/sys/block/${name}`, link);
+        }
+        catch {
+            return undefined;
+        }
+    }
+
+    private static resolveSortParam(params: Record<string, unknown>): 'name' | 'sysfsPath' | 'size' {
+        const raw = params.sort;
+        const value = Array.isArray(raw) ? raw[0] : raw;
+        if (value === 'sysfsPath')
+            return 'sysfsPath';
+        if (value === 'size')
+            return 'size';
+        return 'name';
     }
 
     private static async handleVerifyJobStopRequest(): Promise<{ stopped: boolean }> {
@@ -326,7 +361,7 @@ export class HttpMgmt {
             {
                 method: 'GET',
                 match: url => url === '/$/blockDevices' ? {} : null,
-                handler: async () => this.handleBlockDevicesRequest()
+                handler: async req => this.handleBlockDevicesRequest(req)
             },
             {
                 method: 'POST',
