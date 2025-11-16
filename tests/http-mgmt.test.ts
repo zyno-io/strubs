@@ -157,6 +157,7 @@ describe('HttpMgmt.handle', () => {
             deviceModel: 'DiskModel',
             deviceVendor: 'DiskVendor',
             partitionUuid: 'part-1',
+            label: 'Primary',
             bytesTotal: 1024,
             bytesFree: 512,
             verifyErrors: null,
@@ -185,6 +186,7 @@ describe('HttpMgmt.handle', () => {
                 deviceVendor: 'DiskVendor',
                 partitionUuid: 'part-1',
                 busGroup: null,
+                label: 'Primary',
                 bytesTotal: 1024,
                 bytesFree: 512,
                 verifyErrors: null,
@@ -273,13 +275,14 @@ describe('HttpMgmt.handle', () => {
             isEnabled: true,
             isHealthy: true,
             isReadOnly: false,
-            deviceSerial: 'SN123',
-            deviceModel: 'DiskModel',
-            deviceVendor: 'DiskVendor',
-            partitionUuid: 'part-1',
-            bytesTotal: 1024,
-            bytesFree: 512,
-            verifyErrors: null,
+                deviceSerial: 'SN123',
+                deviceModel: 'DiskModel',
+                deviceVendor: 'DiskVendor',
+                partitionUuid: 'part-1',
+                label: 'Primary',
+                bytesTotal: 1024,
+                bytesFree: 512,
+                verifyErrors: null,
             isDeleted: false,
             mountError: null
         }]]);
@@ -324,6 +327,9 @@ describe('HttpMgmt.handle', () => {
             }
         ];
         ioManagerMock.getCachedDevices.mockReturnValue(cachedDevices);
+        ioManagerMock.getVolumeEntries.mockReturnValue([
+            [5, { partitionUuid: 'part-b', label: 'Data' }]
+        ]);
 
         const response = await HttpMgmt.handle(3, createRequest('GET', '/$/blockDevices'), nullResponse);
 
@@ -340,6 +346,8 @@ describe('HttpMgmt.handle', () => {
                 pttype: 'gpt',
                 sysfsPath: '/sys/block/devices/pci0000:00/slot1',
                 busGroup: 1,
+                volumeId: undefined,
+                volumeLabel: undefined,
                 children: []
             },
             {
@@ -354,6 +362,8 @@ describe('HttpMgmt.handle', () => {
                 pttype: 'gpt',
                 sysfsPath: '/sys/block/devices/pci0000:00/slot2',
                 busGroup: 2,
+                volumeId: 5,
+                volumeLabel: 'Data',
                 children: [
                     {
                         type: 'part',
@@ -447,6 +457,58 @@ describe('HttpMgmt.handle', () => {
         const response = await HttpMgmt.handle(5, req, nullResponse);
 
         expect(response.map(device => device.name)).toEqual(['sda', 'sdb']);
+    });
+
+    it('sorts block devices by volume metadata when requested', async () => {
+        const cachedDevices = [
+            {
+                sysfsPath: '../devices/pci0000:00/a',
+                name: 'sda',
+                model: 'DiskA',
+                vendor: 'VendorA',
+                serial: 'SNA',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-a',
+                partitionTableType: 'gpt',
+                size: 1024,
+                partitions: [
+                    { name: 'sda1', path: '/dev/sda1', uuid: 'part-a', size: 1024, fsType: 'ext4', mountPoint: null }
+                ],
+                smartInfo: { serial_number: 'SNA' },
+                busGroup: 1
+            },
+            {
+                sysfsPath: '../devices/pci0000:00/b',
+                name: 'sdb',
+                model: 'DiskB',
+                vendor: 'VendorB',
+                serial: 'SNB',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-b',
+                partitionTableType: 'gpt',
+                size: 2048,
+                partitions: [
+                    { name: 'sdb1', path: '/dev/sdb1', uuid: 'part-b', size: 2048, fsType: 'ext4', mountPoint: null }
+                ],
+                smartInfo: { serial_number: 'SNB' },
+                busGroup: 2
+            }
+        ];
+        ioManagerMock.getCachedDevices.mockReturnValue(cachedDevices);
+        ioManagerMock.getVolumeEntries.mockReturnValue([
+            [5, { partitionUuid: 'part-b', label: 'Backup' }],
+            [3, { partitionUuid: 'part-a', label: 'Archive' }]
+        ]);
+
+        const reqId = createRequest('GET', '/$/blockDevices');
+        reqId.params.sort = 'volumeId';
+        const sortedById = await HttpMgmt.handle(6, reqId, nullResponse);
+        expect(sortedById.map(device => device.volumeId)).toEqual([3, 5]);
+
+        const reqLabel = createRequest('GET', '/$/blockDevices');
+        reqLabel.params.sort = 'volumeLabel';
+        const sortedByLabel = await HttpMgmt.handle(7, reqLabel, nullResponse);
+        expect(sortedByLabel.map(device => device.volumeLabel)).toEqual(['Archive', 'Backup']);
     });
 
     it('reloads block devices when requested', async () => {
@@ -822,6 +884,18 @@ describe('HttpMgmt.handle', () => {
         expect(response).toEqual({ updated: true });
         expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(4, { isEnabled: false, isReadOnly: true });
         expect(ioManagerMock.updateVolumeFlags).toHaveBeenCalledWith(4, { isEnabled: false, isReadOnly: true });
+    });
+
+    it('updates volume labels via PUT', async () => {
+        const req = createRequest('PUT', '/$/volumes/7', { label: 'Archive' });
+        databaseUpdateFlagsMock.mockResolvedValue(undefined);
+        ioManagerMock.updateVolumeFlags.mockResolvedValue(undefined);
+
+        const response = await HttpMgmt.handle(18, req, nullResponse);
+
+        expect(response).toEqual({ updated: true });
+        expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(7, { label: 'Archive' });
+        expect(ioManagerMock.updateVolumeFlags).toHaveBeenCalledWith(7, { label: 'Archive' });
     });
 
     it('throws HttpNotFoundError when file metadata cannot be resolved', async () => {

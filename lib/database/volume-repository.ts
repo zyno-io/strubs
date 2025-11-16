@@ -27,17 +27,29 @@ export class VolumeRepository {
         );
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean }): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; label?: string | null }): Promise<void> {
         const set: Record<string, unknown> = {};
+        const unset: Record<string, unknown> = {};
         if (changes.isEnabled !== undefined)
             set.enabled = changes.isEnabled;
         if (changes.isReadOnly !== undefined)
             set.read_only = changes.isReadOnly;
         if (changes.isDeleted !== undefined)
             set.is_deleted = changes.isDeleted;
-        if (!Object.keys(set).length)
+        if (changes.label !== undefined) {
+            if (changes.label === null)
+                unset.label = '';
+            else
+                set.label = changes.label;
+        }
+        const update: Record<string, Record<string, unknown>> = {};
+        if (Object.keys(set).length)
+            update.$set = set;
+        if (Object.keys(unset).length)
+            update.$unset = unset;
+        if (!Object.keys(update).length)
             return;
-        await this.collection.updateOne({ id }, { $set: set });
+        await this.collection.updateOne({ id }, update);
     }
 
     async setVerifyErrors(id: number, errors: VolumeVerifyErrors | null): Promise<void> {

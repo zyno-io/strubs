@@ -27,6 +27,7 @@ type VolumeStatus = {
     deviceVendor: string | null;
     partitionUuid: string | null;
     busGroup: number | null;
+    label: string | null;
     bytesTotal: number;
     bytesFree: number | null;
     verifyErrors: Volume['verifyErrors'];
@@ -94,19 +95,26 @@ export class HttpMgmt {
         return this.handleBlockDevicesRequest(req);
     }
 
-    private static serializeBlockDevices(devices: CachedDevice[], sortParam: 'name' | 'sysfsPath' | 'size'): Array<Record<string, unknown>> {
-        const enriched = devices.map(device => this.serializeCachedDevice(device));
+    private static serializeBlockDevices(devices: CachedDevice[], sortParam: 'name' | 'sysfsPath' | 'size' | 'volumeId' | 'volumeLabel'): Array<Record<string, unknown>> {
+        const volumes = new Map<number, Volume>();
+        for (const [id, volume] of ioManager.getVolumeEntries())
+            volumes.set(id, volume);
+        const enriched = devices.map(device => this.serializeCachedDevice(device, volumes));
         enriched.sort((a, b) => {
             if (sortParam === 'sysfsPath')
                 return String(a.sysfsPath ?? '').localeCompare(String(b.sysfsPath ?? ''));
             if (sortParam === 'size')
                 return (Number(a.size) || 0) - (Number(b.size) || 0);
+            if (sortParam === 'volumeId')
+                return (Number(a.volumeId) || 0) - (Number(b.volumeId) || 0);
+            if (sortParam === 'volumeLabel')
+                return String(a.volumeLabel ?? '').localeCompare(String(b.volumeLabel ?? ''));
             return String(a.name ?? '').localeCompare(String(b.name ?? ''));
         });
         return enriched;
     }
 
-    private static serializeCachedDevice(device: CachedDevice): Record<string, unknown> {
+    private static serializeCachedDevice(device: CachedDevice, volumes: Map<number, Volume>): Record<string, unknown> {
         const sysfsResolved = path.resolve(`/sys/block/${device.name}`, device.sysfsPath);
         const children = device.partitions.map(partition => ({
             type: 'part',
@@ -131,6 +139,16 @@ export class HttpMgmt {
             busGroup: device.busGroup ?? null,
             children
         };
+        const primaryPartition = device.partitions.find(part => part.uuid);
+        if (primaryPartition?.uuid) {
+            for (const [volumeId, volume] of volumes.entries()) {
+                if (volume.partitionUuid === primaryPartition.uuid) {
+                    serialized.volumeId = volumeId;
+                    serialized.volumeLabel = volume.label ?? null;
+                    break;
+                }
+            }
+        }
         return serialized;
     }
 
@@ -142,13 +160,17 @@ export class HttpMgmt {
         return verifyVolumesJob.start();
     }
 
-    private static resolveSortParam(params: Record<string, unknown>): 'name' | 'sysfsPath' | 'size' {
+    private static resolveSortParam(params: Record<string, unknown>): 'name' | 'sysfsPath' | 'size' | 'volumeId' | 'volumeLabel' {
         const raw = params.sort;
         const value = Array.isArray(raw) ? raw[0] : raw;
         if (value === 'sysfsPath')
             return 'sysfsPath';
         if (value === 'size')
             return 'size';
+        if (value === 'volumeId')
+            return 'volumeId';
+        if (value === 'volumeLabel')
+            return 'volumeLabel';
         return 'name';
     }
 
@@ -271,10 +293,10 @@ export class HttpMgmt {
     }
 
     private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
-        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown }>(req);
+        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; label?: unknown }>(req);
         const id = this.parseVolumeId(params);
 
-        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean } = {};
+        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; label?: string | null } = {};
         let shouldSoftDelete = false;
 
         if (payload.isEnabled !== undefined) {
@@ -296,6 +318,12 @@ export class HttpMgmt {
                 shouldSoftDelete = true;
             else
                 updates.isDeleted = false;
+        }
+
+        if (payload.label !== undefined) {
+            if (payload.label !== null && typeof payload.label !== 'string')
+                throw new HttpBadRequestError('label must be a string or null');
+            updates.label = payload.label as string | null;
         }
 
         if (!shouldSoftDelete && !Object.keys(updates).length)
@@ -340,6 +368,7 @@ export class HttpMgmt {
             deviceVendor: volume.deviceVendor ?? null,
             partitionUuid: volume.partitionUuid,
             busGroup: volume.deviceGroup ?? null,
+            label: volume.label ?? null,
             bytesTotal: volume.bytesTotal,
             bytesFree: volume.bytesFree,
             verifyErrors: volume.verifyErrors,

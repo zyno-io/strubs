@@ -81,7 +81,7 @@ export class Database {
         await this.volumeRepository.softDeleteVolume(id);
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean }): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; label?: string | null }): Promise<void> {
         await this.volumeRepository.updateVolumeFlags(id, changes);
     }
 

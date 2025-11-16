@@ -28,6 +28,7 @@ export interface VolumeConfig {
     data_size: number;
     parity_size?: number;
     verifyErrors?: VolumeVerifyErrors | null;
+    label?: string | null;
     is_deleted?: boolean;
 }
 
@@ -59,6 +60,7 @@ export class Volume extends EventEmitter {
     public deviceName: string | null = null;
     public deviceGroup: number | null = null;
     public verifyErrors: VolumeVerifyErrors | null;
+    public label: string | null = null;
     public mountError: string | null = null;
     private readonly log: ReturnType<typeof createLogger>;
 
@@ -80,6 +82,7 @@ export class Volume extends EventEmitter {
         this.bytesUsedData = inConfig.data_size;
         this.bytesUsedParity = inConfig.parity_size || 0; // TODO: add
         this.verifyErrors = inConfig.verifyErrors ?? null;
+        this.label = typeof inConfig.label === 'string' ? inConfig.label : (inConfig.label ?? null);
 
         this.log = createLogger('volume' + this.id);
 
@@ -109,6 +112,10 @@ export class Volume extends EventEmitter {
 
     setVerifyErrors(errors: VolumeVerifyErrors | null): void {
         this.verifyErrors = errors;
+    }
+
+    setLabel(value: string | null): void {
+        this.label = value;
     }
 
     async start(): Promise<void> {
