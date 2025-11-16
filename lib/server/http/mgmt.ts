@@ -149,8 +149,11 @@ export class HttpMgmt {
 
     private static serializeBlockDevices(devices: CachedDevice[], sortParam: 'name' | 'sysfsPath' | 'size' | 'volumeId' | 'volumeLabel'): BlockDevice[] {
         const volumes = new Map<number, Volume>();
-        for (const [id, volume] of ioManager.getVolumeEntries())
+        for (const [id, volume] of ioManager.getVolumeEntries()) {
+            if ((volume as Volume).isDeleted)
+                continue;
             volumes.set(id, volume);
+        }
         const enriched = devices.map(device => this.serializeCachedDevice(device, volumes));
         enriched.sort((a, b) => {
             if (sortParam === 'sysfsPath')

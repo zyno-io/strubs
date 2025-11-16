@@ -421,6 +421,35 @@ describe('HttpMgmt.handle', () => {
         expect(response.map(device => device.name)).toEqual(['sda', 'sdb']);
     });
 
+    it('omits deleted volumes when associating block devices', async () => {
+        const cachedDevices = [
+            {
+                sysfsPath: '../devices/pci0000:00/a',
+                name: 'sda',
+                model: 'DiskA',
+                vendor: 'VendorA',
+                serial: 'SNA',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-a',
+                partitionTableType: 'gpt',
+                size: 1024,
+                partitions: [
+                    { name: 'sda1', path: '/dev/sda1', uuid: 'part-a', size: 1024, fsType: 'ext4', mountPoint: null }
+                ],
+                smartInfo: { serial_number: 'SNA' },
+                busGroup: 1
+            }
+        ];
+        ioManagerMock.getCachedDevices.mockReturnValue(cachedDevices);
+        ioManagerMock.getVolumeEntries.mockReturnValue([
+            [3, { partitionUuid: 'part-a', label: 'Archive', isDeleted: true }]
+        ]);
+
+        const response = await HttpMgmt.handle(6, createRequest('GET', '/$/blockDevices'), nullResponse);
+        expect(response[0].volumeId).toBeUndefined();
+        expect(response[0].volumeLabel).toBeUndefined();
+    });
+
     it('sorts block devices by size when requested', async () => {
         const cachedDevices = [
             {
