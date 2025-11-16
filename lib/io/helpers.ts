@@ -3,6 +3,11 @@ import os from 'os';
 
 import { spawnHelper } from '../helpers/spawn';
 
+export type SmartctlResult<T = Record<string, unknown>> = {
+    data: T;
+    exitCode: number;
+};
+
 const hostname = os.hostname();
 const hostId = crypto.createHash('md5').update(hostname).digest().slice(13);
 
@@ -38,15 +43,32 @@ export async function lsblk(additionalParams?: string[]): Promise<any> {
     return JSON.parse(stdout);
 }
 
-export async function smartctl(...args: string[]): Promise<any> {
+const FATAL_SMARTCTL_MASK = 0x03; // parsing/device open failures
+
+export async function smartctl<T = Record<string, unknown>>(...args: string[]): Promise<SmartctlResult<T>> {
     args.unshift('--json=c');
 
     const { code, stdout } = await spawnHelper('smartctl', args);
+    const exitCode = typeof code === 'number' ? code : -1;
 
-    if (code !== 0)
-        throw new Error('smartctl exited with code ' + code);
+    if (exitCode < 0 || (exitCode & FATAL_SMARTCTL_MASK) !== 0)
+        throw new Error('smartctl exited with code ' + exitCode);
 
-    return JSON.parse(stdout);
+    if (!stdout.length)
+        throw new Error('smartctl produced no output');
+
+    let parsed: T;
+    try {
+        parsed = JSON.parse(stdout) as T;
+    }
+    catch {
+        throw new Error('smartctl output was not valid JSON');
+    }
+
+    return {
+        data: parsed,
+        exitCode
+    };
 }
 
 export async function mount(blockPath: string, mountPath: string, fsType: string, options?: Record<string, string | number | boolean>): Promise<void> {

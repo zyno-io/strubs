@@ -47,6 +47,8 @@ export class Volume extends EventEmitter {
     public isReadOnly: boolean;
     public isDeleted: boolean;
     public deviceSerial: string | null;
+    public deviceModel: string | null = null;
+    public deviceVendor: string | null = null;
     public partitionUuid: string | null;
     public bytesTotal: number;
     public bytesUsedData: number;

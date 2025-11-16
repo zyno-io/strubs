@@ -6,6 +6,7 @@ import { ioManager } from './io/manager';
 import { serverManager } from './server/manager';
 import { verifyJob } from './jobs/verify-job';
 import { createLogger } from './log';
+import { volumeSmartMonitor } from './io/volume-smart-monitor';
 
 const log = createLogger('core');
 
@@ -15,6 +16,7 @@ type CoreDependencies = {
     database: typeof database;
     ioManager: typeof ioManager;
     serverManager: typeof serverManager;
+    volumeSmartMonitor: typeof volumeSmartMonitor;
 };
 
 const defaultDeps: CoreDependencies = {
@@ -22,7 +24,8 @@ const defaultDeps: CoreDependencies = {
     fs,
     database,
     ioManager,
-    serverManager
+    serverManager,
+    volumeSmartMonitor
 };
 
 export class Core {
@@ -42,13 +45,14 @@ export class Core {
             return this.startPromise;
 
         this.startPromise = (async () => {
-            const { config, database, ioManager, serverManager } = this.deps;
+            const { config, database, ioManager, serverManager, volumeSmartMonitor } = this.deps;
             log('starting up STRUBS...');
 
             await config.loadIdentity();
             await this.createRunDirectory();
             await database.connect();
             await ioManager.init();
+            await volumeSmartMonitor.start();
             await serverManager.start();
             await verifyJob.resumePendingJob();
 
@@ -82,6 +86,14 @@ export class Core {
 
             try {
                 await verifyJob.stop();
+            }
+            catch (err) {
+                if (!stopError)
+                    stopError = err;
+            }
+
+            try {
+                await this.deps.volumeSmartMonitor.stop();
             }
             catch (err) {
                 if (!stopError)

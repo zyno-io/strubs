@@ -25,8 +25,8 @@ export class SmartInfoService {
         while (true) {
             try {
                 this.log('querying SMART info for ' + path);
-                const info = await this.deps.smartctl('-i', path);
-                return info as { serial_number?: string };
+                const { data } = await this.deps.smartctl('-i', path);
+                return data as { serial_number?: string };
             }
 
             catch (err) {

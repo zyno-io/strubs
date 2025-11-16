@@ -84,6 +84,8 @@ export class VolumeFleet {
         }
 
         volume.deviceSerial = onlineDevice.serial ?? null;
+        volume.deviceModel = onlineDevice.model ?? null;
+        volume.deviceVendor = onlineDevice.vendor ?? null;
         volume.deviceName = onlineDevice.name;
         volume.deviceGroup = onlineDevice.busGroup ?? null;
         volume.fsType = partition.fsType ?? null;

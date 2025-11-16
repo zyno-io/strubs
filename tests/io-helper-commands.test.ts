@@ -38,13 +38,19 @@ describe('io helper commands', () => {
 
         const result = await ioHelpers.smartctl('-i', '/dev/sda');
 
-        expect(result).toEqual({ serial_number: 'XYZ' });
+        expect(result).toEqual({ data: { serial_number: 'XYZ' }, exitCode: 0 });
         expect(spawnHelperMock).toHaveBeenCalledWith('smartctl', ['--json=c', '-i', '/dev/sda']);
     });
 
-    it('propagates smartctl failures', async () => {
-        spawnHelperMock.mockResolvedValue({ code: 2, stdout: '' });
+    it('propagates smartctl failures when device cannot be opened', async () => {
+        spawnHelperMock.mockResolvedValue({ code: 2, stdout: '{"error":"failed"}' });
         await expect(ioHelpers.smartctl('-H', '/dev/sdb')).rejects.toThrow('smartctl exited with code 2');
+    });
+
+    it('surfaces SMART health failures but still returns parsed data', async () => {
+        spawnHelperMock.mockResolvedValue({ code: 4, stdout: '{"smart_status":{"passed":false}}' });
+        const result = await ioHelpers.smartctl('-H', '/dev/sdb');
+        expect(result).toEqual({ data: { smart_status: { passed: false } }, exitCode: 4 });
     });
 
     it('mounts block devices with provided options', async () => {

@@ -55,6 +55,8 @@ type VolumeMockInstance = {
     deviceGroup: number | null;
     blockPath: string | null;
     mountPoint: string | null;
+    deviceModel: string | null;
+    deviceVendor: string | null;
 };
 
 const createdVolumes: VolumeMockInstance[] = [];
@@ -74,6 +76,8 @@ vi.mock('../lib/io/volume', () => ({
             deviceGroup: null,
             blockPath: null,
             mountPoint: null,
+            deviceModel: null,
+            deviceVendor: null,
             start: vi.fn().mockImplementation(async () => {
                 this.isStarted = true;
             }),
@@ -132,7 +136,7 @@ describe('IOManager', () => {
         readdirMock.mockResolvedValue([]);
         databaseMock.getVolumes.mockResolvedValue([ buildVolumeConfig() ]);
         lsblkMock.mockResolvedValue({ blockdevices: [ buildBlockDevice() ] });
-        smartctlMock.mockResolvedValue({ serial_number: 'SER123' });
+        smartctlMock.mockResolvedValue({ data: { serial_number: 'SER123' }, exitCode: 0 });
         ensureMountRootMock.mockResolvedValue(undefined);
     });
 
@@ -203,7 +207,7 @@ describe('IOManager', () => {
     });
 
     it('does not skip devices that lack serial numbers', async () => {
-        smartctlMock.mockResolvedValueOnce({});
+        smartctlMock.mockResolvedValueOnce({ data: {}, exitCode: 0 });
 
         const { IOManager } = await import('../lib/io/manager');
         const manager = new IOManager();
@@ -231,8 +235,8 @@ describe('IOManager', () => {
         };
 
         lsblkMock.mockResolvedValue({ blockdevices: [ buildBlockDevice(), duplicateDevice ] });
-        smartctlMock.mockResolvedValueOnce({ serial_number: 'SER123' });
-        smartctlMock.mockResolvedValueOnce({ serial_number: 'SER123' });
+        smartctlMock.mockResolvedValueOnce({ data: { serial_number: 'SER123' }, exitCode: 0 });
+        smartctlMock.mockResolvedValueOnce({ data: { serial_number: 'SER123' }, exitCode: 0 });
 
         const { IOManager } = await import('../lib/io/manager');
         const manager = new IOManager();

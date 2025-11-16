@@ -45,6 +45,7 @@ export interface CachedDevice {
     sysfsPath: string;
     name: string;
     model?: string;
+    vendor?: string;
     serial?: string;
     byIdPaths: string[];
     partitionTableUuid?: string | null;
@@ -174,6 +175,7 @@ export class DeviceDiscovery {
             sysfsPath,
             name: blkDevice.name,
             model: blkDevice.model,
+            vendor: blkDevice.vendor,
             serial: blkDevice.serial,
             byIdPaths,
             partitionTableUuid: blkDevice.ptuuid ?? null,

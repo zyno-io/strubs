@@ -39,6 +39,15 @@ vi.mock('../lib/jobs/verify-job', () => ({
     }
 }));
 
+const smartMonitorStartMock = vi.fn();
+const smartMonitorStopMock = vi.fn();
+vi.mock('../lib/io/volume-smart-monitor', () => ({
+    volumeSmartMonitor: {
+        start: smartMonitorStartMock,
+        stop: smartMonitorStopMock
+    }
+}));
+
 const serverStartMock = vi.fn();
 const serverStopMock = vi.fn();
 vi.mock('../lib/server/manager', () => ({
@@ -71,12 +80,16 @@ describe('Core', () => {
         mkdirMock.mockResolvedValue();
         verifyResumeMock.mockReset();
         verifyStopMock.mockReset();
+        smartMonitorStartMock.mockReset();
+        smartMonitorStopMock.mockReset();
         loadIdentityMock.mockResolvedValue(undefined);
         connectMock.mockResolvedValue(undefined);
         ioInitMock.mockResolvedValue(undefined);
         ioStopMock.mockResolvedValue(undefined);
         serverStartMock.mockResolvedValue(undefined);
         serverStopMock.mockResolvedValue(undefined);
+        smartMonitorStartMock.mockResolvedValue(undefined);
+        smartMonitorStopMock.mockResolvedValue(undefined);
     });
 
     it('performs the full startup sequence', async () => {
@@ -89,6 +102,7 @@ describe('Core', () => {
         expect(mkdirMock).toHaveBeenCalledWith('/run/strubs');
         expect(connectMock).toHaveBeenCalledTimes(1);
         expect(ioInitMock).toHaveBeenCalledTimes(1);
+        expect(smartMonitorStartMock).toHaveBeenCalledTimes(1);
         expect(serverStartMock).toHaveBeenCalledTimes(1);
         expect(verifyResumeMock).toHaveBeenCalledTimes(1);
     });
@@ -141,6 +155,7 @@ describe('Core', () => {
         await core.stop();
 
         expect(serverStopMock).toHaveBeenCalledTimes(1);
+        expect(smartMonitorStopMock).toHaveBeenCalledTimes(1);
         expect(ioStopMock).toHaveBeenCalledTimes(1);
         expect(verifyStopMock).toHaveBeenCalledTimes(1);
     });

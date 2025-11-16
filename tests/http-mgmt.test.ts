@@ -24,6 +24,10 @@ const verifyJobMock = {
 };
 const databaseSoftDeleteMock = vi.fn();
 const databaseUpdateFlagsMock = vi.fn();
+const volumeSmartMonitorMock = {
+    getSummary: vi.fn(),
+    getInfo: vi.fn()
+};
 
 vi.mock('../lib/io/manager', () => ({
     ioManager: ioManagerMock
@@ -58,6 +62,10 @@ vi.mock('../lib/database', () => ({
     }
 }));
 
+vi.mock('../lib/io/volume-smart-monitor', () => ({
+    volumeSmartMonitor: volumeSmartMonitorMock
+}));
+
 let HttpMgmt: typeof import('../lib/server/http/mgmt').HttpMgmt;
 let HttpNotFoundError: typeof import('../lib/server/http/errors').HttpNotFoundError;
 let HttpBadRequestError: typeof import('../lib/server/http/errors').HttpBadRequestError;
@@ -82,6 +90,20 @@ beforeEach(() => {
     verifyJobMock.stop.mockReset();
     verifyJobMock.getStatus.mockReset();
     ioManagerMock.getVolumeEntries.mockReturnValue([]);
+    const summary = {
+        updatedAt: '2023-01-01T00:00:00.000Z',
+        isHealthy: true,
+        temperatureC: 35,
+        powerOnHours: 1000,
+        error: null,
+        statusFlags: [],
+        isSupported: true
+    };
+    volumeSmartMonitorMock.getSummary.mockReturnValue(summary);
+    volumeSmartMonitorMock.getInfo.mockReturnValue({
+        summary,
+        details: { smart_status: { passed: true } }
+    });
 });
 
 const createRequest = (method: string, url: string, body?: unknown): HttpRequest => {
@@ -130,11 +152,14 @@ describe('HttpMgmt.handle', () => {
             isHealthy: true,
             isReadOnly: false,
             deviceSerial: 'SN123',
+            deviceModel: 'DiskModel',
+            deviceVendor: 'DiskVendor',
             partitionUuid: 'part-1',
             bytesTotal: 1024,
             bytesFree: 512,
             verifyErrors: null,
-            isDeleted: false
+            isDeleted: false,
+            mountError: null
         };
 
         ioManagerMock.getVolumeEntries.mockReturnValue([[1, volume]]);
@@ -154,14 +179,112 @@ describe('HttpMgmt.handle', () => {
                 isHealthy: true,
                 isReadOnly: false,
                 deviceSerial: 'SN123',
+                deviceModel: 'DiskModel',
+                deviceVendor: 'DiskVendor',
                 partitionUuid: 'part-1',
                 bytesTotal: 1024,
                 bytesFree: 512,
                 verifyErrors: null,
                 isDeleted: false,
-                mountError: undefined
+                mountError: null,
+                isSmartHealthy: true,
+                smartInfoSummary: {
+                    updatedAt: '2023-01-01T00:00:00.000Z',
+                    isHealthy: true,
+                    temperatureC: 35,
+                    powerOnHours: 1000,
+                    error: null,
+                    statusFlags: [],
+                    isSupported: true
+                }
             }
         ]);
+    });
+
+    it('returns detailed volume SMART info when requested', async () => {
+        const volume = {
+            uuid: 'vol-1',
+            blockPath: '/dev/sda1',
+            mountPoint: '/mnt/1',
+            isMounted: true,
+            isVerified: true,
+            isStarted: true,
+            isEnabled: true,
+            isHealthy: true,
+            isReadOnly: false,
+            deviceSerial: 'SN123',
+            partitionUuid: 'part-1',
+            bytesTotal: 1024,
+            bytesFree: 512,
+            verifyErrors: null,
+            isDeleted: false,
+            mountError: null
+        };
+
+        ioManagerMock.getVolume.mockReturnValue(volume);
+
+        const response = await HttpMgmt.handle(2, createRequest('GET', '/$/volumes/1'), nullResponse);
+
+        expect(response).toMatchObject({
+            id: 1,
+            smartInfo: {
+                summary: {
+                    updatedAt: '2023-01-01T00:00:00.000Z',
+                    isHealthy: true,
+                    temperatureC: 35,
+                    powerOnHours: 1000,
+                    error: null,
+                    statusFlags: [],
+                    isSupported: true
+                },
+                details: { smart_status: { passed: true } }
+            }
+        });
+        expect(ioManagerMock.getVolume).toHaveBeenCalledWith(1);
+        expect(volumeSmartMonitorMock.getInfo).toHaveBeenCalledWith(1);
+    });
+
+    it('omits SMART fields when the device does not support SMART', async () => {
+        const summary = {
+            updatedAt: '2023-01-01T00:00:00.000Z',
+            isHealthy: null,
+            temperatureC: null,
+            powerOnHours: null,
+            error: null,
+            statusFlags: [],
+            isSupported: false
+        };
+        const smartInfo = {
+            summary,
+            details: { smart_support: { available: false } }
+        };
+        volumeSmartMonitorMock.getSummary.mockReturnValueOnce(summary);
+        volumeSmartMonitorMock.getInfo.mockReturnValueOnce(smartInfo);
+        ioManagerMock.getVolumeEntries.mockReturnValue([[1, {
+            uuid: 'vol-1',
+            blockPath: '/dev/sda1',
+            mountPoint: '/mnt/1',
+            isMounted: true,
+            isVerified: true,
+            isStarted: true,
+            isEnabled: true,
+            isHealthy: true,
+            isReadOnly: false,
+            deviceSerial: 'SN123',
+            deviceModel: 'DiskModel',
+            deviceVendor: 'DiskVendor',
+            partitionUuid: 'part-1',
+            bytesTotal: 1024,
+            bytesFree: 512,
+            verifyErrors: null,
+            isDeleted: false,
+            mountError: null
+        }]]);
+
+        const response = await HttpMgmt.handle(10, createRequest('GET', '/$/volumes'), nullResponse);
+
+        expect(response[0]?.isSmartHealthy).toBeNull();
+        expect(response[0]?.smartInfoSummary).toBeNull();
     });
 
     it('returns block device listings', async () => {

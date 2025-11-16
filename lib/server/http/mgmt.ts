@@ -9,6 +9,7 @@ import type { HttpRequest, HttpResponse } from './server';
 import type { Volume } from '../../io/volume';
 import fs from 'fs';
 import path from 'path';
+import { volumeSmartMonitor, type VolumeSmartInfo, type VolumeSmartSummary } from '../../io/volume-smart-monitor';
 
 type VolumeStatus = {
     id: number;
@@ -22,12 +23,20 @@ type VolumeStatus = {
     isHealthy: boolean;
     isReadOnly: boolean;
     deviceSerial: string | null;
+    deviceModel: string | null;
+    deviceVendor: string | null;
     partitionUuid: string | null;
     bytesTotal: number;
     bytesFree: number | null;
     verifyErrors: Volume['verifyErrors'];
     mountError: string | null;
     isDeleted: boolean;
+    isSmartHealthy: boolean | null;
+    smartInfoSummary: VolumeSmartSummary | null;
+};
+
+type VolumeDetail = VolumeStatus & {
+    smartInfo: VolumeSmartInfo | null;
 };
 
 type RouteParams = Record<string, unknown>;
@@ -200,11 +209,21 @@ export class HttpMgmt {
         return this._serializeVolume(volumeConfig.id, volume);
     }
 
+    private static async handleVolumeDetailRequest(params: RouteParams): Promise<VolumeDetail> {
+        const id = this.parseVolumeId(params);
+        const volume = ioManager.getVolume(id);
+        if (!volume)
+            throw new HttpNotFoundError();
+        const smartInfo = volumeSmartMonitor.getInfo(id);
+        const supportsSmart = smartInfo.summary.isSupported !== false;
+        return {
+            ...this._serializeVolume(id, volume),
+            smartInfo: supportsSmart ? smartInfo : null
+        };
+    }
+
     private static async handleVolumeDeleteRequest(params: RouteParams): Promise<{ deleted: boolean }> {
-        const idRaw = (params.id ?? '') as string;
-        const id = Number.parseInt(idRaw, 10);
-        if (!Number.isFinite(id))
-            throw new HttpBadRequestError('invalid volume id');
+        const id = this.parseVolumeId(params);
         await database.softDeleteVolume(id);
         await ioManager.softDeleteVolume(id).catch(() => undefined);
         return { deleted: true };
@@ -212,10 +231,7 @@ export class HttpMgmt {
 
     private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
         const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown }>(req);
-        const idRaw = (params.id ?? '') as string;
-        const id = Number.parseInt(idRaw, 10);
-        if (!Number.isFinite(id))
-            throw new HttpBadRequestError('invalid volume id');
+        const id = this.parseVolumeId(params);
 
         const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean } = {};
         let shouldSoftDelete = false;
@@ -265,6 +281,8 @@ export class HttpMgmt {
     }
 
     private static _serializeVolume(id: number, volume: Volume): VolumeStatus {
+        const smartInfoSummary = volumeSmartMonitor.getSummary(id);
+        const supportsSmart = smartInfoSummary.isSupported !== false;
         return {
             id,
             uuid: volume.uuid,
@@ -277,12 +295,16 @@ export class HttpMgmt {
             isHealthy: volume.isHealthy,
             isReadOnly: volume.isReadOnly,
             deviceSerial: volume.deviceSerial,
+            deviceModel: volume.deviceModel ?? null,
+            deviceVendor: volume.deviceVendor ?? null,
             partitionUuid: volume.partitionUuid,
             bytesTotal: volume.bytesTotal,
             bytesFree: volume.bytesFree,
             verifyErrors: volume.verifyErrors,
             isDeleted: volume.isDeleted,
-            mountError: volume.mountError
+            mountError: volume.mountError,
+            isSmartHealthy: supportsSmart ? smartInfoSummary.isHealthy : null,
+            smartInfoSummary: supportsSmart ? smartInfoSummary : null
         };
     }
 
@@ -361,6 +383,11 @@ export class HttpMgmt {
             },
             {
                 method: 'GET',
+                match: url => this.matchVolumeIdRoute(url),
+                handler: async (_req, params) => this.handleVolumeDetailRequest(params)
+            },
+            {
+                method: 'GET',
                 match: url => url === '/$/status' ? {} : null,
                 handler: async () => this.handleStatusRequest()
             },
@@ -376,12 +403,12 @@ export class HttpMgmt {
             },
             {
                 method: 'PUT',
-                match: url => this.matchVolumeDeleteRoute(url),
+                match: url => this.matchVolumeIdRoute(url),
                 handler: async (req, params) => this.handleVolumeUpdateRequest(req, params)
             },
             {
                 method: 'DELETE',
-                match: url => this.matchVolumeDeleteRoute(url),
+                match: url => this.matchVolumeIdRoute(url),
                 handler: async (_req, params) => this.handleVolumeDeleteRequest(params)
             },
             {
@@ -431,6 +458,14 @@ export class HttpMgmt {
         return unique.length ? unique : null;
     }
 
+    private static parseVolumeId(params: RouteParams): number {
+        const idRaw = (params.id ?? '') as string;
+        const id = Number.parseInt(idRaw, 10);
+        if (!Number.isFinite(id))
+            throw new HttpBadRequestError('invalid volume id');
+        return id;
+    }
+
     private static matchFileInfoRoute(url: string): FileInfoRouteParams | null {
         const prefix = '/$/fileinfo/';
         if (!url.toLowerCase().startsWith(prefix))
@@ -440,7 +475,7 @@ export class HttpMgmt {
         return { normalizedPath };
     }
 
-    private static matchVolumeDeleteRoute(url: string): RouteParams | null {
+    private static matchVolumeIdRoute(url: string): RouteParams | null {
         const match = /^\/\$\/volumes\/(\d+)$/.exec(url);
         if (!match)
             return null;
