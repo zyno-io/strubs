@@ -127,16 +127,18 @@ const sortedBlockDevices = computed<BlockDevice[]>(() => {
         bValue = b.name;
         break;
       case 'path':
-        aValue = a.path;
-        bValue = b.path;
+        aValue = a.sysfsPath;
+        bValue = b.sysfsPath;
         break;
       default:
         return 0;
     }
 
     // Handle null/empty values - push them to the end
-    if (!aValue && aValue !== 0) return 1;
-    if (!bValue && bValue !== 0) return -1;
+    const aIsEmpty = aValue === null || aValue === '' || (typeof aValue === 'number' && aValue < 0);
+    const bIsEmpty = bValue === null || bValue === '' || (typeof bValue === 'number' && bValue < 0);
+    if (aIsEmpty && !bIsEmpty) return 1;
+    if (!aIsEmpty && bIsEmpty) return -1;
 
     // Compare values
     if (aValue < bValue) return -1;
