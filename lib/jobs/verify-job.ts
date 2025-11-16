@@ -104,6 +104,7 @@ export class VerifyJob {
         }
     };
     private progressLogger: NodeJS.Timeout | null = null;
+    private currentConcurrency = 0;
 
     constructor(deps?: Partial<VerifyJobDeps>) {
         this.deps = { ...defaultDeps, ...deps };
@@ -156,12 +157,13 @@ export class VerifyJob {
         return Boolean(this.running);
     }
 
-    getStatus(): { running: boolean; startedAt: string | null; objectsVerified: number; errors: VerifyErrorSnapshot } {
+    getStatus(): { running: boolean; startedAt: string | null; objectsVerified: number; errors: VerifyErrorSnapshot; concurrency: number } {
         return {
             running: this.isRunning(),
             startedAt: this.startedAt,
             objectsVerified: this.progress.objectsVerified,
-            errors: this.progress.errors
+            errors: this.progress.errors,
+            concurrency: this.currentConcurrency
         };
     }
 
@@ -188,6 +190,7 @@ export class VerifyJob {
                 this.startedAt = null;
                 this.running = null;
                 this.cancelRequested = false;
+                this.currentConcurrency = 0;
                 this.volumeFilter = null;
             });
     }
@@ -204,6 +207,7 @@ export class VerifyJob {
         let totalErrors = 0;
 
         const concurrency = this.resolveConcurrency();
+        this.currentConcurrency = concurrency;
 
         try {
             while (!this.cancelRequested) {
@@ -213,14 +217,23 @@ export class VerifyJob {
 
                 let interrupted = false;
                 let nextIndex = 0;
-                const active: Array<{ record: StoredObjectRecord; promise: Promise<VerifyObjectResult | null> }> = [];
+                const active: Array<{
+                    record: StoredObjectRecord;
+                    promise: Promise<VerifyObjectResult | null>;
+                    lane: number;
+                }> = [];
+                const lanePool = Array.from({ length: concurrency }, (_value, index) => index + 1);
 
                 const startNext = (): void => {
-                    while (nextIndex < batch.length && active.length < concurrency && !this.cancelRequested) {
+                    while (nextIndex < batch.length && active.length < concurrency && lanePool.length && !this.cancelRequested) {
                         const record = batch[nextIndex++];
+                        const lane = lanePool.shift() as number;
                         active.push({
                             record,
-                            promise: this.verifyObject(record, startedAtDate)
+                            lane,
+                            promise: this.verifyObject(record, startedAtDate, lane).finally(() => {
+                                lanePool.push(lane);
+                            })
                         });
                     }
                 };
@@ -256,6 +269,7 @@ export class VerifyJob {
             }
         }
         finally {
+            this.currentConcurrency = 0;
             if (!this.cancelRequested) {
                 await this.deps.runtimeConfig.delete('verifyStartedAt');
                 await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
@@ -297,7 +311,7 @@ export class VerifyJob {
         return objects as StoredObjectRecord[];
     }
 
-    private async verifyObject(record: StoredObjectRecord, startedAt: Date): Promise<VerifyObjectResult | null> {
+    private async verifyObject(record: StoredObjectRecord, startedAt: Date, lane?: number): Promise<VerifyObjectResult | null> {
         const volumeLocks = await this.acquireVolumeLocks(record);
         if (volumeLocks === null)
             return null;
@@ -305,7 +319,8 @@ export class VerifyJob {
             if (this.cancelRequested)
                 return null;
 
-            const object = await this.deps.fileObjectService.load(record, { requestId: 'verify', priority: 'low' });
+            const requestId = typeof lane === 'number' ? `verify:${lane}` : 'verify';
+            const object = await this.deps.fileObjectService.load(record, { requestId, priority: 'low' });
             const verifier = this.deps.createSliceVerifier(object);
 
             const totalSlices = record.dataVolumes.length + record.parityVolumes.length;

@@ -507,9 +507,9 @@ describe('HttpMgmt.handle', () => {
     });
 
     it('returns verify job status via GET', async () => {
-        verifyJobMock.getStatus.mockReturnValue({ running: true, startedAt: 't', objectsVerified: 5, errors: { total: 2, volumes: { '1': 2 } } });
+        verifyJobMock.getStatus.mockReturnValue({ running: true, startedAt: 't', objectsVerified: 5, errors: { total: 2, volumes: { '1': 2 } }, concurrency: 3 });
         const response = await HttpMgmt.handle(14, createRequest('GET', '/$/jobs/verify'), nullResponse);
-        expect(response).toEqual({ running: true, startedAt: 't', objectsVerified: 5, errors: { total: 2, volumes: { '1': 2 } } });
+        expect(response).toEqual({ running: true, startedAt: 't', objectsVerified: 5, errors: { total: 2, volumes: { '1': 2 } }, concurrency: 3 });
         expect(verifyJobMock.getStatus).toHaveBeenCalledTimes(1);
     });
 

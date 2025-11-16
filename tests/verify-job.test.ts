@@ -29,8 +29,8 @@ const createDeps = () => {
     const fileObjectService = {
         load: vi.fn()
     };
-    const volumeStub1 = { setVerifyErrors: vi.fn(), verifyErrors: { checksum: 2, total: 3 } };
-    const volumeStub2 = { setVerifyErrors: vi.fn(), verifyErrors: { checksum: 0, total: 0 } };
+    const volumeStub1 = { setVerifyErrors: vi.fn(), verifyErrors: { checksum: 2, total: 3 }, isEnabled: true, isDeleted: false };
+    const volumeStub2 = { setVerifyErrors: vi.fn(), verifyErrors: { checksum: 0, total: 0 }, isEnabled: true, isDeleted: false };
     const ioManager = {
         getVolumeEntries: vi.fn().mockReturnValue([[1, volumeStub1], [2, volumeStub2]]),
         getVolume: vi.fn((id: number) => (id === 1 ? volumeStub1 : volumeStub2))
@@ -147,6 +147,16 @@ describe('VerifyJob', () => {
         if (running)
             await running;
 
+        expect(deps.fileObjectService.load).toHaveBeenCalledTimes(2);
+        expect(deps.fileObjectService.load).toHaveBeenNthCalledWith(1, recordA, {
+            requestId: 'verify:1',
+            priority: 'low'
+        });
+        const secondCallOptions = deps.fileObjectService.load.mock.calls[1]?.[1];
+        expect(secondCallOptions).toEqual(expect.objectContaining({
+            requestId: expect.stringMatching(/^verify:\d+$/),
+            priority: 'low'
+        }));
         expect(verifierSpies).toHaveLength(2);
         expect(verifierSpies[0]).toHaveBeenCalledWith(0);
         expect(verifierSpies[1]).toHaveBeenCalledWith(0);
@@ -390,5 +400,33 @@ describe('VerifyJob', () => {
         expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(1, 'verifyVolumeIds', [2]);
         expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(2, 'verifyStartedAt', startedAt);
         expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds']));
+    });
+
+    it('reports current concurrency via status', async () => {
+        const deps = createDeps();
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+
+        const volumeStub1 = { setVerifyErrors: vi.fn(), verifyErrors: { checksum: 0, total: 0 }, isEnabled: true, isDeleted: false };
+        const volumeStub2 = { setVerifyErrors: vi.fn(), verifyErrors: { checksum: 0, total: 0 }, isEnabled: true, isDeleted: false };
+        deps.ioManager.getVolumeEntries.mockReturnValue([[1, volumeStub1], [2, volumeStub2]]);
+        deps.ioManager.getVolume.mockImplementation((id: number) => (id === 1 ? volumeStub1 : volumeStub2));
+
+        let releaseBatch: (() => void) | null = null;
+        deps.database.findObjectsNeedingVerification.mockImplementationOnce(() => new Promise(resolve => {
+            releaseBatch = () => resolve([]);
+        }));
+        deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
+
+        const job = new VerifyJob(deps);
+        await job.start();
+
+        expect(job.getStatus().concurrency).toBe(2);
+
+        releaseBatch?.();
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        expect(job.getStatus().concurrency).toBe(0);
     });
 });

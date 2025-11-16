@@ -122,7 +122,7 @@ export class HttpMgmt {
         return { stopped: true };
     }
 
-    private static async handleVerifyJobStatusRequest(): Promise<{ running: boolean; startedAt: string | null; objectsVerified: number; errors: { total: number; volumes: Record<string, number> } }> {
+    private static async handleVerifyJobStatusRequest(): Promise<{ running: boolean; startedAt: string | null; objectsVerified: number; errors: { total: number; volumes: Record<string, number> }; concurrency: number }> {
         return verifyJob.getStatus();
     }
 
