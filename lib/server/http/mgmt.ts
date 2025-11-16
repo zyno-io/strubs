@@ -170,9 +170,9 @@ export class HttpMgmt {
             type: 'part' as const,
             name: partition.name,
             path: partition.path ?? (partition.name ? `/dev/${partition.name}` : undefined),
-            uuid: partition.uuid,
+            uuid: partition.uuid ?? null,
             size: partition.size,
-            fstype: partition.fsType,
+            fstype: partition.fsType ?? null,
             mountpoint: partition.mountPoint ?? null
         }));
         const serialized: BlockDevice = {
@@ -180,9 +180,9 @@ export class HttpMgmt {
             path: `/dev/${device.name}`,
             type: 'disk' as const,
             size: device.size,
-            model: device.model,
-            vendor: device.vendor,
-            serial: device.serial,
+            model: device.model ?? null,
+            vendor: device.vendor ?? null,
+            serial: device.serial ?? null,
             ptuuid: device.partitionTableUuid ?? undefined,
             pttype: device.partitionTableType ?? undefined,
             sysfsPath: sysfsResolved,
@@ -506,11 +506,6 @@ export class HttpMgmt {
                 method: 'GET',
                 match: url => this.matchUiRoute(url),
                 handler: async (req, params) => this.handleUiRequest(req, params as UiRouteParams)
-            },
-            {
-                method: 'GET',
-                match: url => url === '/$/ui' ? {} : null,
-                handler: async () => this.handleUiRequest()
             },
             {
                 method: 'GET',
