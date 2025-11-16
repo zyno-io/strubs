@@ -486,6 +486,19 @@ describe('HttpMgmt.handle', () => {
         expect(verifyJobMock.start).toHaveBeenCalledTimes(1);
     });
 
+    it('starts the verify job with a volume filter when provided', async () => {
+        verifyJobMock.start.mockResolvedValue({ startedAt: '2024-01-02T00:00:00.000Z' });
+        const response = await HttpMgmt.handle(17, createRequest('POST', '/$/jobs/verify', { volumeIds: [3, 3, 4] }), nullResponse);
+        expect(response).toEqual({ startedAt: '2024-01-02T00:00:00.000Z' });
+        expect(verifyJobMock.start).toHaveBeenCalledWith({ volumeIds: [3, 4] });
+    });
+
+    it('rejects invalid volume filter payloads', async () => {
+        await expect(HttpMgmt.handle(18, createRequest('POST', '/$/jobs/verify', { volumeIds: ['bad'] }), nullResponse))
+            .rejects.toBeInstanceOf(HttpBadRequestError);
+        expect(verifyJobMock.start).not.toHaveBeenCalled();
+    });
+
     it('stops the verify job via DELETE', async () => {
         verifyJobMock.stop.mockResolvedValue(undefined);
         const response = await HttpMgmt.handle(13, createRequest('DELETE', '/$/jobs/verify'), nullResponse);

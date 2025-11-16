@@ -1,4 +1,4 @@
-import { Collection, ObjectId } from 'mongodb';
+import { Collection, ObjectId, type Filter } from 'mongodb';
 
 import { createError } from '../helpers';
 import { ContainerCache } from './container-cache';
@@ -81,14 +81,28 @@ export class ContentRepository {
         });
     }
 
-    async findObjectsNeedingVerification(startedAt: Date, limit: number): Promise<ContentDocument[]> {
-        const cursor = this.collection.find<ContentDocument>({
+    async findObjectsNeedingVerification(startedAt: Date, limit: number, volumeIds?: number[]): Promise<ContentDocument[]> {
+        const conditions: Filter<ContentDocument>[] = [
+            {
+                $or: [
+                    { lastVerifiedAt: { $lt: startedAt } },
+                    { lastVerifiedAt: { $exists: false } }
+                ]
+            }
+        ];
+        if (Array.isArray(volumeIds) && volumeIds.length) {
+            conditions.push({
+                $or: [
+                    { dataVolumes: { $in: volumeIds } },
+                    { parityVolumes: { $in: volumeIds } }
+                ]
+            });
+        }
+        const query: Filter<ContentDocument> = {
             isFile: true,
-            $or: [
-                { lastVerifiedAt: { $lt: startedAt } },
-                { lastVerifiedAt: { $exists: false } }
-            ]
-        }, {
+            $and: conditions
+        };
+        const cursor = this.collection.find<ContentDocument>(query, {
             sort: { _id: 1 },
             limit
         });

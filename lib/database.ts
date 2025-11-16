@@ -127,8 +127,8 @@ export class Database {
         return this.contentRepository.getObjectByPath(path);
     }
 
-    async findObjectsNeedingVerification(startedAt: Date, limit: number): Promise<ContentDocument[]> {
-        return this.contentRepository.findObjectsNeedingVerification(startedAt, limit);
+    async findObjectsNeedingVerification(startedAt: Date, limit: number, volumeIds?: number[]): Promise<ContentDocument[]> {
+        return this.contentRepository.findObjectsNeedingVerification(startedAt, limit, volumeIds);
     }
 
     async updateObjectVerificationState(

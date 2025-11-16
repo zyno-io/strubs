@@ -43,6 +43,7 @@ const defaultDeps: VerifyJobDeps = {
 };
 
 const VERIFY_BATCH_SIZE = 25;
+const VERIFY_VOLUME_IDS_KEY = 'verifyVolumeIds';
 const envConcurrency = process.env.STRUBS_VERIFY_PARALLEL ? Number.parseInt(process.env.STRUBS_VERIFY_PARALLEL, 10) : NaN;
 const cpuCount = os.cpus?.().length ?? 1;
 
@@ -94,6 +95,7 @@ export class VerifyJob {
     private running: Promise<void> | null = null;
     private cancelRequested = false;
     private startedAt: string | null = null;
+    private volumeFilter: Set<number> | null = null;
     private progress = {
         objectsVerified: 0,
         errors: {
@@ -108,19 +110,23 @@ export class VerifyJob {
         this.log = this.deps.createLogger('verify-job');
     }
 
-    async start(): Promise<{ startedAt: string }> {
+    async start(options?: { volumeIds?: number[] }): Promise<{ startedAt: string }> {
         if (this.running)
             return { startedAt: this.startedAt as string };
 
         const existing = await this.deps.runtimeConfig.get('verifyStartedAt');
         if (typeof existing === 'string' && existing.length) {
-            this.launch(existing, true);
+            const persistedFilter = await this.loadPersistedVolumeFilter();
+            this.launch(existing, true, persistedFilter);
             return { startedAt: existing };
         }
 
+        const normalizedFilter = this.normalizeVolumeIds(options?.volumeIds);
+        await this.persistVolumeFilter(normalizedFilter);
+
         const startedAt = new Date().toISOString();
         await this.deps.runtimeConfig.set('verifyStartedAt', startedAt);
-        this.launch(startedAt, false);
+        this.launch(startedAt, false, normalizedFilter);
         return { startedAt };
     }
 
@@ -131,7 +137,8 @@ export class VerifyJob {
         if (typeof existing !== 'string' || !existing.length)
             return;
         this.log('resuming verify job started at %s', existing);
-        this.launch(existing, true);
+        const persistedFilter = await this.loadPersistedVolumeFilter();
+        this.launch(existing, true, persistedFilter);
     }
 
     async stop(): Promise<void> {
@@ -141,6 +148,8 @@ export class VerifyJob {
         this.log('stop requested');
         this.cancelRequested = true;
         await running;
+        await this.deps.runtimeConfig.delete('verifyStartedAt');
+        await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
     }
 
     isRunning(): boolean {
@@ -156,11 +165,12 @@ export class VerifyJob {
         };
     }
 
-    private launch(startedAt: string, isResume: boolean): void {
+    private launch(startedAt: string, isResume: boolean, volumeIds: number[] | null): void {
         if (this.running)
             return;
 
         this.startedAt = startedAt;
+        this.applyVolumeFilter(volumeIds);
         if (isResume)
             this.log('starting verification (resume) at %s', startedAt);
         else
@@ -178,6 +188,7 @@ export class VerifyJob {
                 this.startedAt = null;
                 this.running = null;
                 this.cancelRequested = false;
+                this.volumeFilter = null;
             });
     }
 
@@ -245,8 +256,10 @@ export class VerifyJob {
             }
         }
         finally {
-            if (!this.cancelRequested)
+            if (!this.cancelRequested) {
                 await this.deps.runtimeConfig.delete('verifyStartedAt');
+                await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
+            }
             if (!this.cancelRequested) {
                 const finishedAt = new Date().toISOString();
                 await this.deps.runtimeConfig.set('lastVerify', {
@@ -270,6 +283,8 @@ export class VerifyJob {
     private initializeVolumeCounters(): Map<number, VolumeErrorCounters> {
         const counts = new Map<number, VolumeErrorCounters>();
         for (const [id, volume] of this.deps.ioManager.getVolumeEntries()) {
+            if (this.volumeFilter && !this.volumeFilter.has(id))
+                continue;
             const existing = volume.verifyErrors ?? { checksum: 0, total: 0 };
             counts.set(id, { checksum: existing.checksum, total: existing.total });
         }
@@ -277,7 +292,8 @@ export class VerifyJob {
     }
 
     private async fetchBatch(startedAt: Date): Promise<StoredObjectRecord[]> {
-        const objects = await this.deps.database.findObjectsNeedingVerification(startedAt, VERIFY_BATCH_SIZE);
+        const filter = this.volumeFilter ? Array.from(this.volumeFilter.values()) : undefined;
+        const objects = await this.deps.database.findObjectsNeedingVerification(startedAt, VERIFY_BATCH_SIZE, filter);
         return objects as StoredObjectRecord[];
     }
 
@@ -297,11 +313,16 @@ export class VerifyJob {
             const volumeImpacts = new Map<number, VolumeErrorCounters>();
             let checksumErrors = 0;
             let totalErrors = 0;
+            let processedSlices = 0;
 
             for (let sliceIndex = 0; sliceIndex < totalSlices; sliceIndex++) {
                 if (this.cancelRequested)
                     return null;
+                const descriptor = this.describeSlice(record, sliceIndex);
+                if (!this.shouldVerifyVolume(descriptor.volumeId))
+                    continue;
                 try {
+                    processedSlices++;
                     await verifier.verifySlice(sliceIndex);
                 }
                 catch (err) {
@@ -342,6 +363,12 @@ export class VerifyJob {
 
             if (this.cancelRequested)
                 return null;
+            if (!processedSlices)
+                return {
+                    checksumErrors: 0,
+                    totalErrors: 0,
+                    volumeImpacts
+                };
 
             await this.deps.database.updateObjectVerificationState(record.id, {
                 lastVerifiedAt: startedAt,
@@ -422,11 +449,11 @@ export class VerifyJob {
     private collectRecordVolumeIds(record: StoredObjectRecord): number[] {
         const unique = new Set<number>();
         for (const id of record.dataVolumes ?? []) {
-            if (typeof id === 'number')
+            if (typeof id === 'number' && this.shouldVerifyVolume(id))
                 unique.add(id);
         }
         for (const id of record.parityVolumes ?? []) {
-            if (typeof id === 'number')
+            if (typeof id === 'number' && this.shouldVerifyVolume(id))
                 unique.add(id);
         }
         return Array.from(unique).sort((a, b) => a - b);
@@ -476,6 +503,45 @@ export class VerifyJob {
         };
     }
 
+    private shouldVerifyVolume(volumeId: number | null | undefined): boolean {
+        if (!this.volumeFilter)
+            return true;
+        if (volumeId === null || volumeId === undefined)
+            return false;
+        return this.volumeFilter.has(volumeId);
+    }
+
+    private async loadPersistedVolumeFilter(): Promise<number[] | null> {
+        const stored = await this.deps.runtimeConfig.get(VERIFY_VOLUME_IDS_KEY);
+        return this.normalizeVolumeIds(stored);
+    }
+
+    private async persistVolumeFilter(volumeIds: number[] | null): Promise<void> {
+        if (volumeIds && volumeIds.length)
+            await this.deps.runtimeConfig.set(VERIFY_VOLUME_IDS_KEY, volumeIds);
+        else
+            await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
+    }
+
+    private applyVolumeFilter(volumeIds: number[] | null): void {
+        if (volumeIds && volumeIds.length)
+            this.volumeFilter = new Set(volumeIds);
+        else
+            this.volumeFilter = null;
+    }
+
+    private normalizeVolumeIds(value: unknown): number[] | null {
+        if (!Array.isArray(value))
+            return null;
+        const unique = new Set<number>();
+        for (const entry of value) {
+            if (typeof entry !== 'number' || !Number.isFinite(entry))
+                continue;
+            unique.add(entry);
+        }
+        return unique.size ? Array.from(unique.values()) : null;
+    }
+
     private resolveConcurrency(): number {
         if (Number.isFinite(envConcurrency) && envConcurrency > 0)
             return envConcurrency;
@@ -498,6 +564,8 @@ export class VerifyJob {
         impacts.forEach((impact, volumeId) => {
             if (!impact.total)
                 return;
+            if (this.volumeFilter && !this.volumeFilter.has(volumeId))
+                return;
             const entry = aggregate.get(volumeId) ?? { checksum: 0, total: 0 };
             entry.checksum += impact.checksum;
             entry.total += impact.total;
@@ -510,6 +578,8 @@ export class VerifyJob {
     private async resetVolumeCounters(counts: Map<number, VolumeErrorCounters>): Promise<void> {
         const operations: Promise<void>[] = [];
         counts.forEach((entry, volumeId) => {
+            if (this.volumeFilter && !this.volumeFilter.has(volumeId))
+                return;
             entry.checksum = 0;
             entry.total = 0;
             operations.push(this.persistVolumeError(volumeId, entry));

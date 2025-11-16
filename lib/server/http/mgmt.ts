@@ -89,7 +89,11 @@ export class HttpMgmt {
         return enriched;
     }
 
-    private static async handleVerifyJobStartRequest(): Promise<{ startedAt: string }> {
+    private static async handleVerifyJobStartRequest(req: HttpRequest): Promise<{ startedAt: string }> {
+        const payload = await this.parseJsonBody<{ volumeIds?: unknown }>(req);
+        const volumeIds = this.normalizeVolumeIdFilter(payload.volumeIds);
+        if (volumeIds)
+            return verifyJob.start({ volumeIds });
         return verifyJob.start();
     }
 
@@ -383,7 +387,7 @@ export class HttpMgmt {
             {
                 method: 'POST',
                 match: url => url === '/$/jobs/verify' ? {} : null,
-                handler: async () => this.handleVerifyJobStartRequest()
+                handler: async req => this.handleVerifyJobStartRequest(req)
             },
             {
                 method: 'GET',
@@ -410,6 +414,21 @@ export class HttpMgmt {
         if (Array.isArray(value))
             return value.some(item => typeof item === 'string' && item.toLowerCase() === 'true');
         return false;
+    }
+
+    private static normalizeVolumeIdFilter(raw: unknown): number[] | null {
+        if (raw === undefined || raw === null)
+            return null;
+        if (!Array.isArray(raw))
+            throw new HttpBadRequestError('volumeIds must be an array of numbers');
+        const normalized: number[] = [];
+        for (const entry of raw) {
+            if (typeof entry !== 'number' || !Number.isFinite(entry))
+                throw new HttpBadRequestError('volumeIds must be an array of numbers');
+            normalized.push(entry);
+        }
+        const unique = Array.from(new Set(normalized));
+        return unique.length ? unique : null;
     }
 
     private static matchFileInfoRoute(url: string): FileInfoRouteParams | null {

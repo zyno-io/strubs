@@ -94,6 +94,7 @@ describe('VerifyJob', () => {
             checksumErrors: 0,
             totalErrors: 0
         }));
+        expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds']));
     });
 
     it('verifies multiple objects in parallel batches', async () => {
@@ -313,6 +314,81 @@ describe('VerifyJob', () => {
         expect(deps.database.updateObjectVerificationState).not.toHaveBeenCalled();
         expect(deps.runtimeConfig.set).toHaveBeenCalledTimes(1);
         expect(deps.runtimeConfig.set).toHaveBeenCalledWith('verifyStartedAt', startedAt);
-        expect(deps.runtimeConfig.delete).not.toHaveBeenCalled();
+        const deleteKeys = deps.runtimeConfig.delete.mock.calls.map(call => call[0]);
+        expect(deleteKeys).not.toContain('verifyStartedAt');
+        expect(deleteKeys).toContain('verifyVolumeIds');
+    });
+
+    it('cleans up pending resume state when the job is stopped', async () => {
+        const deps = createDeps();
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+
+        let releaseBatch: (() => void) | null = null;
+        let batchReadyResolve: (() => void) | null = null;
+        const batchReady = new Promise<void>(resolve => {
+            batchReadyResolve = resolve;
+        });
+        deps.database.findObjectsNeedingVerification.mockImplementationOnce(() => new Promise(resolve => {
+            releaseBatch = () => resolve([]);
+            batchReadyResolve?.();
+        }));
+        deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
+
+        const job = new VerifyJob(deps);
+        await job.start();
+        await batchReady;
+
+        const stopPromise = job.stop();
+        releaseBatch?.();
+        await stopPromise;
+
+        expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds']));
+    });
+
+    it('limits verification to the specified volume ids', async () => {
+        const deps = createDeps();
+        const record = {
+            id: 'vol-filter',
+            size: 1,
+            dataVolumes: [1, 2],
+            parityVolumes: [2],
+            chunkSize: 1,
+            dataSliceVolumeIds: [1, 2],
+            paritySliceVolumeIds: [3],
+            unavailableSlices: [],
+            damagedSlices: [],
+            isFile: true,
+            name: 'file',
+            md5: null
+        };
+
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+        deps.database.findObjectsNeedingVerification
+            .mockResolvedValueOnce([record])
+            .mockResolvedValueOnce([]);
+
+        deps.fileObjectService.load.mockResolvedValue({} as any);
+        const verifySlice = vi.fn().mockResolvedValue(undefined);
+        deps.createSliceVerifier.mockReturnValue({ verifySlice });
+
+        const job = new VerifyJob(deps);
+        const { startedAt } = await job.start({ volumeIds: [2, 2] });
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        expect(verifySlice).toHaveBeenCalledTimes(2);
+        expect(verifySlice).toHaveBeenNthCalledWith(1, 1);
+        expect(verifySlice).toHaveBeenNthCalledWith(2, 2);
+        expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
+            lastVerifiedAt: new Date(startedAt),
+            sliceErrors: null
+        });
+        expect(deps.database.findObjectsNeedingVerification).toHaveBeenNthCalledWith(1, expect.any(Date), 25, [2]);
+        expect(deps.database.setVolumeVerifyErrors).toHaveBeenCalledTimes(1);
+        expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(1, 2, { checksum: 0, total: 0 });
+        expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(1, 'verifyVolumeIds', [2]);
+        expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(2, 'verifyStartedAt', startedAt);
+        expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds']));
     });
 });
