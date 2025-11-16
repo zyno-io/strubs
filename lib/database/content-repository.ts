@@ -110,6 +110,27 @@ export class ContentRepository {
         return objects.map(object => this.normalize(object));
     }
 
+    async countObjectsVerifiedSince(startedAt: Date, volumeIds?: number[]): Promise<number> {
+        const conditions: Filter<ContentDocument>[] = [
+            {
+                lastVerifiedAt: { $gte: startedAt }
+            }
+        ];
+        if (Array.isArray(volumeIds) && volumeIds.length) {
+            conditions.push({
+                $or: [
+                    { dataVolumes: { $in: volumeIds } },
+                    { parityVolumes: { $in: volumeIds } }
+                ]
+            });
+        }
+        const query: Filter<ContentDocument> = {
+            isFile: true,
+            $and: conditions
+        };
+        return this.collection.countDocuments(query);
+    }
+
     async updateObjectVerificationState(
         id: ObjectIdentifier,
         updates: { lastVerifiedAt?: Date; sliceErrors?: Record<string, SliceErrorInfo> | null }

@@ -19,7 +19,8 @@ const createDeps = () => {
     const database = {
         findObjectsNeedingVerification: vi.fn(),
         updateObjectVerificationState: vi.fn().mockResolvedValue(undefined),
-        setVolumeVerifyErrors: vi.fn().mockResolvedValue(undefined)
+        setVolumeVerifyErrors: vi.fn().mockResolvedValue(undefined),
+        countObjectsVerifiedSince: vi.fn().mockResolvedValue(0)
     };
     const runtimeConfig = {
         get: vi.fn(),
@@ -353,6 +354,25 @@ describe('VerifyJob', () => {
         await stopPromise;
 
         expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds']));
+    });
+
+    it('restores progress when resuming a pending job', async () => {
+        const deps = createDeps();
+        const startedAt = '2024-02-01T00:00:00.000Z';
+        deps.runtimeConfig.get
+            .mockResolvedValueOnce(startedAt)
+            .mockResolvedValueOnce([2]);
+        deps.database.countObjectsVerifiedSince.mockResolvedValueOnce(42);
+        deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
+
+        const job = new VerifyJob(deps);
+        await job.start();
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        expect(deps.database.countObjectsVerifiedSince).toHaveBeenCalledWith(new Date(startedAt), [2]);
+        expect(job.getStatus().objectsVerified).toBe(42);
     });
 
     it('limits verification to the specified volume ids', async () => {

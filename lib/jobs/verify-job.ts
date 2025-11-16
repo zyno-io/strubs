@@ -118,7 +118,8 @@ export class VerifyJob {
         const existing = await this.deps.runtimeConfig.get('verifyStartedAt');
         if (typeof existing === 'string' && existing.length) {
             const persistedFilter = await this.loadPersistedVolumeFilter();
-            this.launch(existing, true, persistedFilter);
+            const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
+            this.launch(existing, true, persistedFilter, restoredCount);
             return { startedAt: existing };
         }
 
@@ -127,7 +128,7 @@ export class VerifyJob {
 
         const startedAt = new Date().toISOString();
         await this.deps.runtimeConfig.set('verifyStartedAt', startedAt);
-        this.launch(startedAt, false, normalizedFilter);
+        this.launch(startedAt, false, normalizedFilter, 0);
         return { startedAt };
     }
 
@@ -139,7 +140,8 @@ export class VerifyJob {
             return;
         this.log('resuming verify job started at %s', existing);
         const persistedFilter = await this.loadPersistedVolumeFilter();
-        this.launch(existing, true, persistedFilter);
+        const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
+        this.launch(existing, true, persistedFilter, restoredCount);
     }
 
     async stop(): Promise<void> {
@@ -167,7 +169,7 @@ export class VerifyJob {
         };
     }
 
-    private launch(startedAt: string, isResume: boolean, volumeIds: number[] | null): void {
+    private launch(startedAt: string, isResume: boolean, volumeIds: number[] | null, initialObjectsVerified: number): void {
         if (this.running)
             return;
 
@@ -180,7 +182,7 @@ export class VerifyJob {
         else
             this.log('starting verification at %s', startedAt);
         this.cancelRequested = false;
-        this.progress.objectsVerified = 0;
+        this.progress.objectsVerified = initialObjectsVerified;
         this.progress.errors = { total: 0, volumes: {} };
         this.startProgressLogger();
         this.running = this.execute(startedAt, isResume, concurrency)
@@ -195,6 +197,21 @@ export class VerifyJob {
                 this.currentConcurrency = 0;
                 this.volumeFilter = null;
             });
+    }
+
+    private async getResumedObjectsVerified(startedAt: string, volumeIds: number[] | null): Promise<number> {
+        try {
+            const startedAtDate = new Date(startedAt);
+            if (!Number.isFinite(startedAtDate.getTime()))
+                return 0;
+            const filter = volumeIds && volumeIds.length ? volumeIds : undefined;
+            const count = await this.deps.database.countObjectsVerifiedSince(startedAtDate, filter);
+            return count;
+        }
+        catch (err) {
+            this.log.error('failed to restore verify progress for %s', startedAt, err);
+            return 0;
+        }
     }
 
     private async execute(startedAt: string, isResume: boolean, concurrency: number): Promise<void> {

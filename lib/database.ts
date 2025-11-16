@@ -131,6 +131,10 @@ export class Database {
         return this.contentRepository.findObjectsNeedingVerification(startedAt, limit, volumeIds);
     }
 
+    async countObjectsVerifiedSince(startedAt: Date, volumeIds?: number[]): Promise<number> {
+        return this.contentRepository.countObjectsVerifiedSince(startedAt, volumeIds);
+    }
+
     async updateObjectVerificationState(
         id: ObjectIdentifier,
         updates: { lastVerifiedAt?: Date; sliceErrors?: Record<string, SliceErrorInfo> | null }
