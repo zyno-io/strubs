@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 class MockProcess extends EventEmitter {
     stdout: EventEmitter | null = new EventEmitter();
+    stderr: EventEmitter | null = new EventEmitter();
 }
 
 const spawnMock = vi.fn();
@@ -31,9 +32,11 @@ describe('spawnHelper', () => {
 
         proc.stdout?.emit('data', Buffer.from('hello '));
         proc.stdout?.emit('data', Buffer.from('world'));
+        proc.stderr?.emit('data', Buffer.from('warn '));
+        proc.stderr?.emit('data', Buffer.from('msg'));
         proc.emit('exit', 0);
 
-        await expect(promise).resolves.toEqual({ code: 0, stdout: 'hello world' });
+        await expect(promise).resolves.toEqual({ code: 0, stdout: 'hello world', stderr: 'warn msg' });
         expect(spawnMock).toHaveBeenCalledWith('ls', ['-l']);
     });
 

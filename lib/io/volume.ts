@@ -9,6 +9,7 @@ import { createLogger } from '../log';
 import { config } from '../config';
 import { formatBytes, mount as mountVolume, unmount as unmountVolume } from './helpers';
 import { buildVolumeIdentityBuffer } from './volume-identity';
+import { ensureExtFilesystemHealthy } from './filesystem-check';
 
 export type VolumeVerifyErrors = {
     checksum: number;
@@ -190,6 +191,9 @@ export class Volume extends EventEmitter {
         if (!this.blockPath || !this.mountPoint || !this.fsType)
             throw new Error('volume mount path is not fully configured');
 
+        if (this.shouldPerformFilesystemCheck())
+            await ensureExtFilesystemHealthy(this.blockPath, this.log);
+
         try {
             await mountVolume(this.blockPath, this.mountPoint, this.fsType, this.mountOptions || {});
         }
@@ -240,6 +244,12 @@ export class Volume extends EventEmitter {
 
         this.isMounted = false;
         this.log('unmounted %s', this.mountPoint);
+    }
+
+    private shouldPerformFilesystemCheck(): boolean {
+        if (!this.fsType)
+            return false;
+        return this.fsType.toLowerCase().startsWith('ext');
     }
 
     async verify(): Promise<void> {

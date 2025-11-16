@@ -3,6 +3,7 @@ import { spawn } from 'child_process';
 export interface SpawnResult {
     code: number | null;
     stdout: string;
+    stderr?: string;
 }
 
 export function spawnHelper(path: string, args: string[]): Promise<SpawnResult> {
@@ -14,12 +15,17 @@ export function spawnHelper(path: string, args: string[]): Promise<SpawnResult> 
             out += data.toString();
         });
 
+        let errOut = '';
+        proc.stderr?.on('data', data => {
+            errOut += data.toString();
+        });
+
         proc.on('error', err => {
             reject(err);
         });
 
         proc.on('exit', code => {
-            resolve({ code, stdout: out });
+            resolve({ code, stdout: out, stderr: errOut });
         });
     });
 }
