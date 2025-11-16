@@ -178,7 +178,7 @@ const canCreateVolumes = computed<boolean>(() => {
 function getVolumeBackgroundColor(volume: VolumeStatus | null): string {
   if (!volume) return '#888888'; // darker gray for better contrast when faded
   if (!volume.isEnabled) return '#666666'; // darker gray for disabled
-  if (volume.isReadOnly) return '#ffeb3b'; // yellow
+  if (volume.isReadOnly) return '#f9a825'; // dark yellow (better contrast)
   if (volume.isEnabled && !volume.isStarted) return '#f44336'; // red
 
   // Check for SMART errors or verify errors
