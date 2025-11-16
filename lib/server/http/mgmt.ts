@@ -126,9 +126,14 @@ export class HttpMgmt {
 
     private static async handleUiRequest(_req: HttpRequest, params: UiRouteParams): Promise<HttpContentPayload> {
         const assetPath = typeof params.assetPath === 'string' ? params.assetPath : '';
-        const resolvedPath = this.resolveUiAssetPath(assetPath);
-        try {
-            const body = await fs.readFile(resolvedPath);
+        const candidates = this.getUiRootCandidates();
+
+        for (const root of candidates) {
+            const asset = await this.tryReadUiAsset(root, assetPath);
+            if (!asset)
+                continue;
+
+            const { body, resolvedPath } = asset;
             const contentType = this.resolveUiContentType(resolvedPath);
             return {
                 body,
@@ -138,11 +143,8 @@ export class HttpMgmt {
                 }
             };
         }
-        catch (err) {
-            if ((err as NodeJS.ErrnoException).code === 'ENOENT')
-                throw new HttpNotFoundError('UI bundle not found');
-            throw err;
-        }
+
+        throw new HttpNotFoundError('UI bundle not found');
     }
 
     private static serializeBlockDevices(devices: CachedDevice[], sortParam: 'name' | 'sysfsPath' | 'size' | 'volumeId' | 'volumeLabel'): BlockDevice[] {
@@ -609,14 +611,43 @@ export class HttpMgmt {
         return value;
     }
 
-    private static resolveUiAssetPath(rawPath: string): string {
-        const uiRoot = this.getUiRootPath();
+    private static async tryReadUiAsset(root: string, assetPath: string): Promise<{ body: Buffer; resolvedPath: string } | null> {
+        let resolvedPath: string;
+        try {
+            resolvedPath = this.resolveUiAssetPath(root, assetPath);
+        }
+        catch {
+            return null;
+        }
+
+        try {
+            const body = await fs.readFile(resolvedPath);
+            return { body, resolvedPath };
+        }
+        catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+                return null;
+            throw err;
+        }
+    }
+
+    private static resolveUiAssetPath(root: string, rawPath: string): string {
         const normalized = path.normalize(rawPath || '');
         const relative = !normalized || normalized === '.' ? 'index.html' : normalized;
-        const resolved = path.resolve(uiRoot, relative);
-        if (!resolved.startsWith(uiRoot + path.sep))
+        const rootResolved = path.resolve(root);
+        const resolved = path.resolve(rootResolved, relative);
+        const relativeToRoot = path.relative(rootResolved, resolved);
+        if (relativeToRoot.startsWith('..') || path.isAbsolute(relativeToRoot))
             throw new HttpNotFoundError();
         return resolved;
+    }
+
+    private static getUiRootCandidates(): string[] {
+        const cwd = process.cwd();
+        return [
+            path.resolve(cwd, 'ui', 'dist'),
+            path.resolve(cwd, '..', 'ui', 'dist')
+        ];
     }
 
     private static resolveUiContentType(filePath: string): string {
@@ -634,10 +665,6 @@ export class HttpMgmt {
         case '.ico': return 'image/x-icon';
         default: return 'application/octet-stream';
         }
-    }
-
-    private static getUiRootPath(): string {
-        return path.resolve(process.cwd(), 'ui', 'dist');
     }
 
     private static matchUiRoute(url: string): RouteParams | null {
