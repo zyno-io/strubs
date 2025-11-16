@@ -32,8 +32,8 @@ vi.mock('../lib/io/manager', () => ({
 
 const verifyResumeMock = vi.fn();
 const verifyStopMock = vi.fn();
-vi.mock('../lib/jobs/verify-job', () => ({
-    verifyJob: {
+vi.mock('../lib/jobs/verify-volumes-job', () => ({
+    verifyVolumesJob: {
         resumePendingJob: verifyResumeMock,
         stop: verifyStopMock
     }

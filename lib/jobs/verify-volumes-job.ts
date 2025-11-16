@@ -13,7 +13,7 @@ type VolumeErrorCounters = {
     total: number;
 };
 
-type VerifyJobDeps = {
+type VerifyVolumesJobDeps = {
     database: typeof database;
     runtimeConfig: typeof runtimeConfig;
     fileObjectService: FileObjectService;
@@ -22,18 +22,18 @@ type VerifyJobDeps = {
     createSliceVerifier: (object: FileObject) => { verifySlice: (sliceIndex: number) => Promise<void> };
 };
 
-type VerifyErrorSnapshot = {
+type VerifyVolumesErrorSnapshot = {
     total: number;
     volumes: Record<string, number>;
 };
 
-type VerifyObjectResult = {
+type VerifyVolumesObjectResult = {
     checksumErrors: number;
     totalErrors: number;
     volumeImpacts: Map<number, VolumeErrorCounters>;
 };
 
-const defaultDeps: VerifyJobDeps = {
+const defaultDeps: VerifyVolumesJobDeps = {
     database,
     runtimeConfig,
     fileObjectService,
@@ -88,8 +88,8 @@ class VolumeReadCoordinator {
     }
 }
 
-export class VerifyJob {
-    private readonly deps: VerifyJobDeps;
+export class VerifyVolumesJob {
+    private readonly deps: VerifyVolumesJobDeps;
     private readonly log: ReturnType<typeof createLogger>;
     private readonly volumeCoordinator = new VolumeReadCoordinator();
     private running: Promise<void> | null = null;
@@ -106,7 +106,7 @@ export class VerifyJob {
     private progressLogger: NodeJS.Timeout | null = null;
     private currentConcurrency = 0;
 
-    constructor(deps?: Partial<VerifyJobDeps>) {
+    constructor(deps?: Partial<VerifyVolumesJobDeps>) {
         this.deps = { ...defaultDeps, ...deps };
         this.log = this.deps.createLogger('verify-job');
     }
@@ -159,7 +159,7 @@ export class VerifyJob {
         return Boolean(this.running);
     }
 
-    getStatus(): { running: boolean; startedAt: string | null; objectsVerified: number; errors: VerifyErrorSnapshot; concurrency: number } {
+    getStatus(): { running: boolean; startedAt: string | null; objectsVerified: number; errors: VerifyVolumesErrorSnapshot; concurrency: number } {
         return {
             running: this.isRunning(),
             startedAt: this.startedAt,
@@ -235,7 +235,7 @@ export class VerifyJob {
                 let nextIndex = 0;
                 const active: Array<{
                     record: StoredObjectRecord;
-                    promise: Promise<VerifyObjectResult | null>;
+                    promise: Promise<VerifyVolumesObjectResult | null>;
                     lane: number;
                 }> = [];
                 const lanePool = Array.from({ length: concurrency }, (_value, index) => index + 1);
@@ -327,7 +327,7 @@ export class VerifyJob {
         return objects as StoredObjectRecord[];
     }
 
-    private async verifyObject(record: StoredObjectRecord, startedAt: Date, lane?: number): Promise<VerifyObjectResult | null> {
+    private async verifyObject(record: StoredObjectRecord, startedAt: Date, lane?: number): Promise<VerifyVolumesObjectResult | null> {
         try {
             if (this.cancelRequested)
                 return null;
@@ -634,4 +634,4 @@ export class VerifyJob {
     }
 }
 
-export const verifyJob = new VerifyJob();
+export const verifyVolumesJob = new VerifyVolumesJob();

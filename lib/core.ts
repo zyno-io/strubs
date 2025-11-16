@@ -4,7 +4,7 @@ import { config } from './config';
 import { database } from './database';
 import { ioManager } from './io/manager';
 import { serverManager } from './server/manager';
-import { verifyJob } from './jobs/verify-job';
+import { verifyVolumesJob } from './jobs/verify-volumes-job';
 import { createLogger } from './log';
 import { volumeSmartMonitor } from './io/volume-smart-monitor';
 
@@ -54,7 +54,7 @@ export class Core {
             await ioManager.init();
             await volumeSmartMonitor.start();
             await serverManager.start();
-            await verifyJob.resumePendingJob();
+            await verifyVolumesJob.resumePendingJob();
 
             this.started = true;
             log('STRUBS started.');
@@ -85,7 +85,7 @@ export class Core {
             }
 
             try {
-                await verifyJob.stop();
+                await verifyVolumesJob.stop();
             }
             catch (err) {
                 if (!stopError)

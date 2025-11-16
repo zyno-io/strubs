@@ -8,7 +8,7 @@ vi.mock('../lib/io/file-object/slice-verifier', () => ({
     FileObjectSliceVerifier: vi.fn()
 }));
 
-import { VerifyJob } from '../lib/jobs/verify-job';
+import { VerifyVolumesJob } from '../lib/jobs/verify-volumes-job';
 
 const createLoggerFactory = () => {
     const loggerInstance = Object.assign(vi.fn(), { error: vi.fn() });
@@ -47,7 +47,7 @@ const createDeps = () => {
     };
 };
 
-describe('VerifyJob', () => {
+describe('VerifyVolumesJob', () => {
     it('verifies objects and records lastVerify metadata', async () => {
         const deps = createDeps();
         const record = {
@@ -73,7 +73,7 @@ describe('VerifyJob', () => {
         deps.fileObjectService.load.mockResolvedValue({} as any);
         deps.createSliceVerifier.mockReturnValue(sliceVerifier);
 
-        const job = new VerifyJob(deps);
+        const job = new VerifyVolumesJob(deps);
         const startPromise = job.start();
         const { startedAt } = await startPromise;
         const running = (job as unknown as { running: Promise<void> | null }).running;
@@ -142,7 +142,7 @@ describe('VerifyJob', () => {
             return { verifySlice: fn };
         });
 
-        const job = new VerifyJob(deps);
+        const job = new VerifyVolumesJob(deps);
         const { startedAt } = await job.start();
         const running = (job as unknown as { running: Promise<void> | null }).running;
         if (running)
@@ -204,7 +204,7 @@ describe('VerifyJob', () => {
         deps.fileObjectService.load.mockResolvedValue({} as any);
         deps.createSliceVerifier.mockReturnValue(sliceVerifier);
 
-        const job = new VerifyJob(deps);
+        const job = new VerifyVolumesJob(deps);
         const startPromise = job.start();
         const { startedAt } = await startPromise;
         const running = (job as unknown as { running: Promise<void> | null }).running;
@@ -257,7 +257,7 @@ describe('VerifyJob', () => {
         deps.fileObjectService.load.mockResolvedValue({} as any);
         deps.createSliceVerifier.mockReturnValue({ verifySlice });
 
-        const job = new VerifyJob(deps);
+        const job = new VerifyVolumesJob(deps);
         const startPromise = job.start();
         const { startedAt } = await startPromise;
         const running = (job as unknown as { running: Promise<void> | null }).running;
@@ -315,7 +315,7 @@ describe('VerifyJob', () => {
         deps.fileObjectService.load.mockResolvedValue({} as any);
         deps.createSliceVerifier.mockReturnValue(sliceVerifier);
 
-        const job = new VerifyJob(deps);
+        const job = new VerifyVolumesJob(deps);
         const { startedAt } = await job.start();
         const running = (job as unknown as { running: Promise<void> | null }).running;
         if (running)
@@ -345,7 +345,7 @@ describe('VerifyJob', () => {
         }));
         deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
 
-        const job = new VerifyJob(deps);
+        const job = new VerifyVolumesJob(deps);
         await job.start();
         await batchReady;
 
@@ -365,7 +365,7 @@ describe('VerifyJob', () => {
         deps.database.countObjectsVerifiedSince.mockResolvedValueOnce(42);
         deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
 
-        const job = new VerifyJob(deps);
+        const job = new VerifyVolumesJob(deps);
         await job.start();
         const running = (job as unknown as { running: Promise<void> | null }).running;
         if (running)
@@ -401,7 +401,7 @@ describe('VerifyJob', () => {
         const verifySlice = vi.fn().mockResolvedValue(undefined);
         deps.createSliceVerifier.mockReturnValue({ verifySlice });
 
-        const job = new VerifyJob(deps);
+        const job = new VerifyVolumesJob(deps);
         const { startedAt } = await job.start({ volumeIds: [2, 2] });
         const running = (job as unknown as { running: Promise<void> | null }).running;
         if (running)
@@ -442,7 +442,7 @@ describe('VerifyJob', () => {
         }));
         deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
 
-        const job = new VerifyJob(deps);
+        const job = new VerifyVolumesJob(deps);
         await job.start();
         await batchReady;
 

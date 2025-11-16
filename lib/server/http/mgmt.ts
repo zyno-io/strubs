@@ -3,7 +3,7 @@ import { HttpBadRequestError, HttpNotFoundError } from './errors';
 import { ioManager } from '../../io/manager';
 import { deviceProvisioner } from '../../io/device-provisioner';
 import { listRawBlockDevices, type RawBlockDevice } from '../../io/device-discovery';
-import { verifyJob } from '../../jobs/verify-job';
+import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import { database } from '../../database';
 import type { HttpRequest, HttpResponse } from './server';
 import type { Volume } from '../../io/volume';
@@ -98,12 +98,12 @@ export class HttpMgmt {
         return enriched;
     }
 
-    private static async handleVerifyJobStartRequest(req: HttpRequest): Promise<{ startedAt: string }> {
+    private static async handleVerifyVolumesJobStartRequest(req: HttpRequest): Promise<{ startedAt: string }> {
         const payload = await this.parseJsonBody<{ volumeIds?: unknown }>(req);
         const volumeIds = this.normalizeVolumeIdFilter(payload.volumeIds);
         if (volumeIds)
-            return verifyJob.start({ volumeIds });
-        return verifyJob.start();
+            return verifyVolumesJob.start({ volumeIds });
+        return verifyVolumesJob.start();
     }
 
     private static extractSysfsPath(name: string): string | undefined {
@@ -126,13 +126,13 @@ export class HttpMgmt {
         return 'name';
     }
 
-    private static async handleVerifyJobStopRequest(): Promise<{ stopped: boolean }> {
-        await verifyJob.stop();
+    private static async handleVerifyVolumesJobStopRequest(): Promise<{ stopped: boolean }> {
+        await verifyVolumesJob.stop();
         return { stopped: true };
     }
 
-    private static async handleVerifyJobStatusRequest(): Promise<{ running: boolean; startedAt: string | null; objectsVerified: number; errors: { total: number; volumes: Record<string, number> }; concurrency: number }> {
-        return verifyJob.getStatus();
+    private static async handleVerifyVolumesJobStatusRequest(): Promise<{ running: boolean; startedAt: string | null; objectsVerified: number; errors: { total: number; volumes: Record<string, number> }; concurrency: number }> {
+        return verifyVolumesJob.getStatus();
     }
 
     private static async handleStatusRequest(): Promise<StatusResponse> {
@@ -413,18 +413,18 @@ export class HttpMgmt {
             },
             {
                 method: 'POST',
-                match: url => url === '/$/jobs/verify' ? {} : null,
-                handler: async req => this.handleVerifyJobStartRequest(req)
+                match: url => url === '/$/verify-volumesverify' ? {} : null,
+                handler: async req => this.handleVerifyVolumesJobStartRequest(req)
             },
             {
                 method: 'GET',
-                match: url => url === '/$/jobs/verify' ? {} : null,
-                handler: async () => this.handleVerifyJobStatusRequest()
+                match: url => url === '/$/verify-volumesverify' ? {} : null,
+                handler: async () => this.handleVerifyVolumesJobStatusRequest()
             },
             {
                 method: 'DELETE',
-                match: url => url === '/$/jobs/verify' ? {} : null,
-                handler: async () => this.handleVerifyJobStopRequest()
+                match: url => url === '/$/verify-volumesverify' ? {} : null,
+                handler: async () => this.handleVerifyVolumesJobStopRequest()
             },
             {
                 method: 'GET',
