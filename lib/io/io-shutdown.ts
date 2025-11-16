@@ -1,4 +1,5 @@
 import { createLogger } from '../log';
+import { volumePriorityManager } from './volume-priority-manager';
 
 class IOShutdownController {
     private aborted = false;
@@ -12,6 +13,16 @@ class IOShutdownController {
         this.aborted = true;
         this.reason = reason;
         this.log('aborting in-flight I/O due to %s', reason);
+
+        // Unblock all priority waiters to prevent hangs during shutdown
+        const stats = volumePriorityManager.getStats();
+        if (stats.length > 0) {
+            this.log('unblocking %d priority waiters across %d volumes',
+                stats.reduce((sum, s) => sum + s.waiters, 0),
+                stats.length);
+        }
+        volumePriorityManager.unblockAll();
+
         const waiters = this.abortWaiters.slice();
         this.abortWaiters.length = 0;
         waiters.forEach(resolve => {

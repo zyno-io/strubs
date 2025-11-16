@@ -11,6 +11,7 @@ import { database } from '../../database';
 import type { HttpRequest, HttpResponse, HttpContentPayload } from './server';
 import type { Volume } from '../../io/volume';
 import { volumeSmartMonitor, type VolumeSmartInfo, type VolumeSmartSummary } from '../../io/volume-smart-monitor';
+import { volumePriorityManager } from '../../io/volume-priority-manager';
 
 export type VolumeStatus = {
     id: number;
@@ -90,6 +91,20 @@ type StatusResponse = {
     gbStored: number;
     gbCapacity: number;
     gbFree: number;
+};
+
+type DebugResponse = {
+    priorityStats: Array<{ volumeId: number; highCount: number; waiters: number }>;
+    verifyStatus: {
+        running: boolean;
+        startedAt: string | null;
+        objectsVerified: number;
+        errors: {
+            total: number;
+            volumes: Record<string, number>;
+        };
+        concurrency: number;
+    };
 };
 
 export class HttpMgmt {
@@ -292,6 +307,16 @@ export class HttpMgmt {
             gbStored: bytesStored / (1024 ** 3),
             gbCapacity: bytesCapacity / (1024 ** 3),
             gbFree: bytesFree / (1024 ** 3)
+        };
+    }
+
+    private static async handleDebugRequest(): Promise<DebugResponse> {
+        const priorityStats = volumePriorityManager.getStats();
+        const verifyStatus = verifyVolumesJob.getStatus();
+
+        return {
+            priorityStats,
+            verifyStatus
         };
     }
 
@@ -521,6 +546,11 @@ export class HttpMgmt {
                 method: 'GET',
                 match: url => url === '/$/status' ? {} : null,
                 handler: async () => this.handleStatusRequest()
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/debug' ? {} : null,
+                handler: async () => this.handleDebugRequest()
             },
             {
                 method: 'GET',

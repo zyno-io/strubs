@@ -24,6 +24,18 @@ class VolumePriorityState {
         return new Promise(resolve => this.waiters.push(resolve));
     }
 
+    forceUnblock(): void {
+        this.drainWaiters();
+    }
+
+    getHighCount(): number {
+        return this.highCount;
+    }
+
+    getWaiterCount(): number {
+        return this.waiters.length;
+    }
+
     private drainWaiters(): void {
         if (!this.waiters.length)
             return;
@@ -62,6 +74,24 @@ export class VolumePriorityManager {
             released = true;
             state.decrementHigh();
         };
+    }
+
+    unblockAll(): void {
+        for (const state of this.states.values()) {
+            state.forceUnblock();
+        }
+    }
+
+    getStats(): Array<{ volumeId: number; highCount: number; waiters: number }> {
+        const stats: Array<{ volumeId: number; highCount: number; waiters: number }> = [];
+        for (const [volumeId, state] of this.states.entries()) {
+            const highCount = state.getHighCount();
+            const waiters = state.getWaiterCount();
+            if (highCount > 0 || waiters > 0) {
+                stats.push({ volumeId, highCount, waiters });
+            }
+        }
+        return stats;
     }
 
     private getState(volumeId: number): VolumePriorityState {

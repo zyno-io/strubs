@@ -105,8 +105,15 @@ export class Slice {
 
             this._registerPriorityHold();
 
-            ioShutdown.throwIfAborted();
-            await outputFh.write(writeBuf, 0, constants.FILE_HEADER_SIZE);
+            try {
+                ioShutdown.throwIfAborted();
+                await outputFh.write(writeBuf, 0, constants.FILE_HEADER_SIZE);
+            } catch (err) {
+                // Release priority hold on error to prevent deadlock
+                this._releasePriorityHold();
+                await this._cleanupOutputHandle();
+                throw err;
+            }
         }
         finally {
             this._isPerformingIO = false;
@@ -176,6 +183,10 @@ export class Slice {
                     'read slice header'
                 );
             } catch (err) {
+                // Release priority hold on error to prevent deadlock
+                this._releasePriorityHold();
+                await this._cleanupInputHandle();
+
                 const throwErr = new Error('failed to read slice header') as Error & { cause?: unknown; fileName?: string; volumeId?: number };
                 throwErr.cause = err;
                 throwErr.fileName = this._fileName;
@@ -347,6 +358,38 @@ export class Slice {
         if (this._priorityRelease)
             return;
         this._priorityRelease = volumePriorityManager.registerHandle(this._volumeId, this._priority);
+    }
+
+    private async _cleanupOutputHandle(): Promise<void> {
+        const outputFh = this._outputFh;
+        if (!outputFh)
+            return;
+        this._outputFh = null;
+        try {
+            await outputFh.close();
+        }
+        catch {
+            // ignore close errors to avoid masking original failure
+        }
+        try {
+            await this._volume.deleteTemporaryFile(this._fileName);
+        }
+        catch {
+            // ignore delete failures during cleanup
+        }
+    }
+
+    private async _cleanupInputHandle(): Promise<void> {
+        const inputFh = this._inputFh;
+        if (!inputFh)
+            return;
+        this._inputFh = null;
+        try {
+            await inputFh.close();
+        }
+        catch {
+            // ignore cleanup close errors
+        }
     }
 
     private _releasePriorityHold(): void {
