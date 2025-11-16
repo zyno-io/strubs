@@ -604,34 +604,34 @@ describe('HttpMgmt.handle', () => {
 
     it('starts the verify job via POST', async () => {
         verifyVolumesJobMock.start.mockResolvedValue({ startedAt: '2024-01-01T00:00:00.000Z' });
-        const response = await HttpMgmt.handle(12, createRequest('POST', '/$/verify-volumesverify'), nullResponse);
+        const response = await HttpMgmt.handle(12, createRequest('POST', '/$/verify-volumes'), nullResponse);
         expect(response).toEqual({ startedAt: '2024-01-01T00:00:00.000Z' });
         expect(verifyVolumesJobMock.start).toHaveBeenCalledTimes(1);
     });
 
     it('starts the verify job with a volume filter when provided', async () => {
         verifyVolumesJobMock.start.mockResolvedValue({ startedAt: '2024-01-02T00:00:00.000Z' });
-        const response = await HttpMgmt.handle(17, createRequest('POST', '/$/verify-volumesverify', { volumeIds: [3, 3, 4] }), nullResponse);
+        const response = await HttpMgmt.handle(17, createRequest('POST', '/$/verify-volumes', { volumeIds: [3, 3, 4] }), nullResponse);
         expect(response).toEqual({ startedAt: '2024-01-02T00:00:00.000Z' });
         expect(verifyVolumesJobMock.start).toHaveBeenCalledWith({ volumeIds: [3, 4] });
     });
 
     it('rejects invalid volume filter payloads', async () => {
-        await expect(HttpMgmt.handle(18, createRequest('POST', '/$/verify-volumesverify', { volumeIds: ['bad'] }), nullResponse))
+        await expect(HttpMgmt.handle(18, createRequest('POST', '/$/verify-volumes', { volumeIds: ['bad'] }), nullResponse))
             .rejects.toBeInstanceOf(HttpBadRequestError);
         expect(verifyVolumesJobMock.start).not.toHaveBeenCalled();
     });
 
     it('stops the verify job via DELETE', async () => {
         verifyVolumesJobMock.stop.mockResolvedValue(undefined);
-        const response = await HttpMgmt.handle(13, createRequest('DELETE', '/$/verify-volumesverify'), nullResponse);
+        const response = await HttpMgmt.handle(13, createRequest('DELETE', '/$/verify-volumes'), nullResponse);
         expect(response).toEqual({ stopped: true });
         expect(verifyVolumesJobMock.stop).toHaveBeenCalledTimes(1);
     });
 
     it('returns verify job status via GET', async () => {
         verifyVolumesJobMock.getStatus.mockReturnValue({ running: true, startedAt: 't', objectsVerified: 5, errors: { total: 2, volumes: { '1': 2 } }, concurrency: 3 });
-        const response = await HttpMgmt.handle(14, createRequest('GET', '/$/verify-volumesverify'), nullResponse);
+        const response = await HttpMgmt.handle(14, createRequest('GET', '/$/verify-volumes'), nullResponse);
         expect(response).toEqual({ running: true, startedAt: 't', objectsVerified: 5, errors: { total: 2, volumes: { '1': 2 } }, concurrency: 3 });
         expect(verifyVolumesJobMock.getStatus).toHaveBeenCalledTimes(1);
     });

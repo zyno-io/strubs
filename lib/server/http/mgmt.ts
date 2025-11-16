@@ -413,17 +413,17 @@ export class HttpMgmt {
             },
             {
                 method: 'POST',
-                match: url => url === '/$/verify-volumesverify' ? {} : null,
+                match: url => url === '/$/verify-volumes' ? {} : null,
                 handler: async req => this.handleVerifyVolumesJobStartRequest(req)
             },
             {
                 method: 'GET',
-                match: url => url === '/$/verify-volumesverify' ? {} : null,
+                match: url => url === '/$/verify-volumes' ? {} : null,
                 handler: async () => this.handleVerifyVolumesJobStatusRequest()
             },
             {
                 method: 'DELETE',
-                match: url => url === '/$/verify-volumesverify' ? {} : null,
+                match: url => url === '/$/verify-volumes' ? {} : null,
                 handler: async () => this.handleVerifyVolumesJobStopRequest()
             },
             {
