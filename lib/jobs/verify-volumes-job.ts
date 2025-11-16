@@ -144,15 +144,17 @@ export class VerifyVolumesJob {
         this.launch(existing, true, persistedFilter, restoredCount);
     }
 
-    async stop(): Promise<void> {
+    async stop(options?: { preserveState?: boolean }): Promise<void> {
         const running = this.running;
         if (!running)
             return;
         this.log('stop requested');
         this.cancelRequested = true;
         await running;
-        await this.deps.runtimeConfig.delete('verifyStartedAt');
-        await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
+        if (!options?.preserveState) {
+            await this.deps.runtimeConfig.delete('verifyStartedAt');
+            await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
+        }
     }
 
     isRunning(): boolean {

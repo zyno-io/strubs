@@ -20,7 +20,7 @@ export async function ensureExtFilesystemHealthy(blockPath: string, logger?: Log
     if (!needsFilesystemRepair(dumpCode, dumpOutput))
         return;
 
-    logInfo(logger, 'superblock issues detected on %s; running e2fsck -y', blockPath);
+    logInfo(logger, 'filesystem issues detected on %s; running e2fsck -y', blockPath);
     const repairResult = await spawnHelper('e2fsck', ['-y', blockPath]);
     const repairCode = typeof repairResult.code === 'number' ? repairResult.code : -1;
 

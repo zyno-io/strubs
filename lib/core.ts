@@ -85,7 +85,7 @@ export class Core {
             }
 
             try {
-                await verifyVolumesJob.stop();
+                await verifyVolumesJob.stop({ preserveState: true });
             }
             catch (err) {
                 if (!stopError)
