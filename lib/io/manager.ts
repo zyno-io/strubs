@@ -35,7 +35,7 @@ export class IOManager {
             log('starting IO manager');
 
             await this.deps.volumeFleet.loadConfig();
-            this._onlineDevices = await this.deps.deviceDiscovery.discover();
+            await this.reloadBlockDevices();
             await this.deps.mountRootManager.ensureExists();
             this.deps.volumeFleet.initializeVolumes(this._onlineDevices);
             await this.deps.volumeFleet.startVolumes();
@@ -94,7 +94,7 @@ export class IOManager {
     }
 
     async registerVolume(config: PersistedVolumeConfig): Promise<void> {
-        this._onlineDevices = await this.deps.deviceDiscovery.discover();
+        await this.reloadBlockDevices();
         await this.deps.mountRootManager.ensureExists();
         await this.deps.volumeFleet.registerVolume(config, this._onlineDevices);
         this.volumeGroupCount = this.deps.volumeFleet.countVolumeGroups();
@@ -105,8 +105,17 @@ export class IOManager {
     }
 
     async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean }): Promise<void> {
-        this._onlineDevices = await this.deps.deviceDiscovery.discover();
+        await this.reloadBlockDevices();
         await this.deps.volumeFleet.updateVolumeFlags(id, changes, this._onlineDevices);
+    }
+
+    getCachedDevices(): CachedDevice[] {
+        return this._onlineDevices;
+    }
+
+    async reloadBlockDevices(): Promise<CachedDevice[]> {
+        this._onlineDevices = await this.deps.deviceDiscovery.discover();
+        return this._onlineDevices;
     }
 }
 

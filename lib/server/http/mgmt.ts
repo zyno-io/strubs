@@ -2,13 +2,12 @@ import { HttpHelpers } from './helpers';
 import { HttpBadRequestError, HttpNotFoundError } from './errors';
 import { ioManager } from '../../io/manager';
 import { deviceProvisioner } from '../../io/device-provisioner';
-import { listRawBlockDevices, type RawBlockDevice } from '../../io/device-discovery';
+import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import { verifyFileJob } from '../../jobs/verify-file-job';
 import { database } from '../../database';
 import type { HttpRequest, HttpResponse } from './server';
 import type { Volume } from '../../io/volume';
-import fs from 'fs';
 import path from 'path';
 import { volumeSmartMonitor, type VolumeSmartInfo, type VolumeSmartSummary } from '../../io/volume-smart-monitor';
 
@@ -27,6 +26,7 @@ type VolumeStatus = {
     deviceModel: string | null;
     deviceVendor: string | null;
     partitionUuid: string | null;
+    busGroup: number | null;
     bytesTotal: number;
     bytesFree: number | null;
     verifyErrors: Volume['verifyErrors'];
@@ -83,21 +83,55 @@ export class HttpMgmt {
         return this.getVolumeStatus(includeDeleted);
     }
 
-    private static async handleBlockDevicesRequest(req: HttpRequest): Promise<Array<RawBlockDevice & { sysfsPath?: string }>> {
-        const devices = await listRawBlockDevices();
-        const enriched = devices.map(device => ({
-            ...device,
-            sysfsPath: this.extractSysfsPath(device.name)
-        }));
+    private static async handleBlockDevicesRequest(req: HttpRequest): Promise<Array<Record<string, unknown>>> {
+        const devices = ioManager.getCachedDevices();
         const sortParam = this.resolveSortParam(req.params);
+        return this.serializeBlockDevices(devices, sortParam);
+    }
+
+    private static async handleBlockDevicesReloadRequest(req: HttpRequest): Promise<Array<Record<string, unknown>>> {
+        await ioManager.reloadBlockDevices();
+        return this.handleBlockDevicesRequest(req);
+    }
+
+    private static serializeBlockDevices(devices: CachedDevice[], sortParam: 'name' | 'sysfsPath' | 'size'): Array<Record<string, unknown>> {
+        const enriched = devices.map(device => this.serializeCachedDevice(device));
         enriched.sort((a, b) => {
             if (sortParam === 'sysfsPath')
-                return (a.sysfsPath ?? '').localeCompare(b.sysfsPath ?? '');
+                return String(a.sysfsPath ?? '').localeCompare(String(b.sysfsPath ?? ''));
             if (sortParam === 'size')
                 return (Number(a.size) || 0) - (Number(b.size) || 0);
-            return a.name.localeCompare(b.name);
+            return String(a.name ?? '').localeCompare(String(b.name ?? ''));
         });
         return enriched;
+    }
+
+    private static serializeCachedDevice(device: CachedDevice): Record<string, unknown> {
+        const sysfsResolved = path.resolve(`/sys/block/${device.name}`, device.sysfsPath);
+        const children = device.partitions.map(partition => ({
+            type: 'part',
+            name: partition.name,
+            path: partition.path ?? (partition.name ? `/dev/${partition.name}` : undefined),
+            uuid: partition.uuid,
+            size: partition.size,
+            fstype: partition.fsType,
+            mountpoint: partition.mountPoint ?? null
+        }));
+        const serialized: Record<string, unknown> = {
+            name: device.name,
+            path: `/dev/${device.name}`,
+            type: 'disk',
+            size: device.size,
+            model: device.model,
+            vendor: device.vendor,
+            serial: device.serial,
+            ptuuid: device.partitionTableUuid ?? undefined,
+            pttype: device.partitionTableType ?? undefined,
+            sysfsPath: sysfsResolved,
+            busGroup: device.busGroup ?? null,
+            children
+        };
+        return serialized;
     }
 
     private static async handleVerifyVolumesJobStartRequest(req: HttpRequest): Promise<{ startedAt: string }> {
@@ -106,16 +140,6 @@ export class HttpMgmt {
         if (volumeIds)
             return verifyVolumesJob.start({ volumeIds });
         return verifyVolumesJob.start();
-    }
-
-    private static extractSysfsPath(name: string): string | undefined {
-        try {
-            const link = fs.readlinkSync(`/sys/block/${name}`);
-            return path.resolve(`/sys/block/${name}`, link);
-        }
-        catch {
-            return undefined;
-        }
     }
 
     private static resolveSortParam(params: Record<string, unknown>): 'name' | 'sysfsPath' | 'size' {
@@ -315,6 +339,7 @@ export class HttpMgmt {
             deviceModel: volume.deviceModel ?? null,
             deviceVendor: volume.deviceVendor ?? null,
             partitionUuid: volume.partitionUuid,
+            busGroup: volume.deviceGroup ?? null,
             bytesTotal: volume.bytesTotal,
             bytesFree: volume.bytesFree,
             verifyErrors: volume.verifyErrors,
@@ -412,6 +437,11 @@ export class HttpMgmt {
                 method: 'GET',
                 match: url => url === '/$/blockDevices' ? {} : null,
                 handler: async req => this.handleBlockDevicesRequest(req)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/blockDevices/reload' ? {} : null,
+                handler: async req => this.handleBlockDevicesReloadRequest(req)
             },
             {
                 method: 'POST',

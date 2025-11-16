@@ -1,21 +1,21 @@
 import { EventEmitter } from 'events';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HttpRequest, HttpResponse } from '../lib/server/http/server';
-import type { RawBlockDevice } from '../lib/io/device-discovery';
 
 const ioManagerMock = {
     getVolumeEntries: vi.fn(),
     getVolume: vi.fn(),
     registerVolume: vi.fn(),
     softDeleteVolume: vi.fn(),
-    updateVolumeFlags: vi.fn()
+    updateVolumeFlags: vi.fn(),
+    getCachedDevices: vi.fn(),
+    reloadBlockDevices: vi.fn()
 };
 
 const httpHelpersMock = {
     getObjectMeta: vi.fn()
 };
 
-const listRawBlockDevicesMock = vi.fn();
 const deviceProvisionerProvisionMock = vi.fn();
 const verifyVolumesJobMock = {
     start: vi.fn(),
@@ -39,14 +39,6 @@ vi.mock('../lib/io/manager', () => ({
 vi.mock('../lib/server/http/helpers', () => ({
     HttpHelpers: httpHelpersMock
 }));
-
-vi.mock('../lib/io/device-discovery', async () => {
-    const actual = await vi.importActual<typeof import('../lib/io/device-discovery')>('../lib/io/device-discovery');
-    return {
-        ...actual,
-        listRawBlockDevices: listRawBlockDevicesMock
-    };
-});
 
 vi.mock('../lib/io/device-provisioner', () => ({
     deviceProvisioner: {
@@ -89,15 +81,17 @@ beforeEach(() => {
     ioManagerMock.registerVolume.mockReset();
     ioManagerMock.softDeleteVolume.mockReset();
     ioManagerMock.updateVolumeFlags.mockReset();
+    ioManagerMock.getCachedDevices.mockReset();
+    ioManagerMock.reloadBlockDevices.mockReset();
     databaseSoftDeleteMock.mockReset();
     databaseUpdateFlagsMock.mockReset();
-    listRawBlockDevicesMock.mockReset();
     deviceProvisionerProvisionMock.mockReset();
     verifyVolumesJobMock.start.mockReset();
     verifyVolumesJobMock.stop.mockReset();
     verifyVolumesJobMock.getStatus.mockReset();
     verifyFileJobMock.verify.mockReset();
     ioManagerMock.getVolumeEntries.mockReturnValue([]);
+    ioManagerMock.getCachedDevices.mockReturnValue([]);
     const summary = {
         updatedAt: '2023-01-01T00:00:00.000Z',
         isHealthy: true,
@@ -190,6 +184,7 @@ describe('HttpMgmt.handle', () => {
                 deviceModel: 'DiskModel',
                 deviceVendor: 'DiskVendor',
                 partitionUuid: 'part-1',
+                busGroup: null,
                 bytesTotal: 1024,
                 bytesFree: 512,
                 verifyErrors: null,
@@ -296,66 +291,203 @@ describe('HttpMgmt.handle', () => {
     });
 
     it('returns block device listings', async () => {
-        const blockDevices: RawBlockDevice[] = [
-            { name: 'sdb', path: '/dev/sdb', type: 'disk', size: 2048, children: [] },
-            { name: 'sda', path: '/dev/sda', type: 'disk', size: 1024, children: [] }
+        const cachedDevices = [
+            {
+                sysfsPath: '../devices/pci0000:00/slot2',
+                name: 'sdb',
+                model: 'DiskB',
+                vendor: 'VendorB',
+                serial: 'SNB',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-b',
+                partitionTableType: 'gpt',
+                size: 2048,
+                partitions: [
+                    { name: 'sdb1', path: '/dev/sdb1', uuid: 'part-b', size: 1024, fsType: 'ext4', mountPoint: '/mnt/data' }
+                ],
+                smartInfo: { serial_number: 'SNB' },
+                busGroup: 2
+            },
+            {
+                sysfsPath: '../devices/pci0000:00/slot1',
+                name: 'sda',
+                model: 'DiskA',
+                vendor: 'VendorA',
+                serial: 'SNA',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-a',
+                partitionTableType: 'gpt',
+                size: 1024,
+                partitions: [],
+                smartInfo: { serial_number: 'SNA' },
+                busGroup: 1
+            }
         ];
-        listRawBlockDevicesMock.mockResolvedValue(blockDevices);
-        const { readlinkSync } = require('fs');
-        const readlinkSpy = vi.spyOn(require('fs'), 'readlinkSync').mockImplementation((target: string) => {
-            if (target === '/sys/block/sda')
-                return '../devices/pci0000:00/sda';
-            if (target === '/sys/block/sdb')
-                return '../devices/pci0000:00/sdb';
-            throw Object.assign(new Error('not found'), { code: 'ENOENT' });
-        });
+        ioManagerMock.getCachedDevices.mockReturnValue(cachedDevices);
 
         const response = await HttpMgmt.handle(3, createRequest('GET', '/$/blockDevices'), nullResponse);
 
         expect(response).toEqual([
-            { ...blockDevices[1], sysfsPath: '/sys/block/devices/pci0000:00/sda' },
-            { ...blockDevices[0], sysfsPath: '/sys/block/devices/pci0000:00/sdb' }
+            {
+                name: 'sda',
+                path: '/dev/sda',
+                type: 'disk',
+                size: 1024,
+                model: 'DiskA',
+                vendor: 'VendorA',
+                serial: 'SNA',
+                ptuuid: 'uuid-a',
+                pttype: 'gpt',
+                sysfsPath: '/sys/block/devices/pci0000:00/slot1',
+                busGroup: 1,
+                children: []
+            },
+            {
+                name: 'sdb',
+                path: '/dev/sdb',
+                type: 'disk',
+                size: 2048,
+                model: 'DiskB',
+                vendor: 'VendorB',
+                serial: 'SNB',
+                ptuuid: 'uuid-b',
+                pttype: 'gpt',
+                sysfsPath: '/sys/block/devices/pci0000:00/slot2',
+                busGroup: 2,
+                children: [
+                    {
+                        type: 'part',
+                        name: 'sdb1',
+                        path: '/dev/sdb1',
+                        uuid: 'part-b',
+                        size: 1024,
+                        fstype: 'ext4',
+                        mountpoint: '/mnt/data'
+                    }
+                ]
+            }
         ]);
-        readlinkSpy.mockRestore();
     });
 
     it('sorts block devices by sysfs path when requested', async () => {
-        const blockDevices: RawBlockDevice[] = [
-            { name: 'sda', path: '/dev/sda', type: 'disk', size: 1024, children: [] },
-            { name: 'sdb', path: '/dev/sdb', type: 'disk', size: 2048, children: [] }
+        const cachedDevices = [
+            {
+                sysfsPath: '../devices/pci0000:00/b',
+                name: 'sdb',
+                model: 'DiskB',
+                vendor: 'VendorB',
+                serial: 'SNB',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-b',
+                partitionTableType: 'gpt',
+                size: 2048,
+                partitions: [],
+                smartInfo: { serial_number: 'SNB' },
+                busGroup: 2
+            },
+            {
+                sysfsPath: '../devices/pci0000:00/a',
+                name: 'sda',
+                model: 'DiskA',
+                vendor: 'VendorA',
+                serial: 'SNA',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-a',
+                partitionTableType: 'gpt',
+                size: 1024,
+                partitions: [],
+                smartInfo: { serial_number: 'SNA' },
+                busGroup: 1
+            }
         ];
-        listRawBlockDevicesMock.mockResolvedValue(blockDevices);
-        const readlinkSpy = vi.spyOn(require('fs'), 'readlinkSync').mockImplementation((target: string) => {
-            if (target === '/sys/block/sda')
-                return '../devices/pci0000:00/slot2';
-            if (target === '/sys/block/sdb')
-                return '../devices/pci0000:00/slot1';
-            throw Object.assign(new Error('not found'), { code: 'ENOENT' });
-        });
+        ioManagerMock.getCachedDevices.mockReturnValue(cachedDevices);
 
         const req = createRequest('GET', '/$/blockDevices');
         req.params.sort = 'sysfsPath';
         const response = await HttpMgmt.handle(4, req, nullResponse);
 
-        expect(response).toEqual([
-            { ...blockDevices[1], sysfsPath: '/sys/block/devices/pci0000:00/slot1' },
-            { ...blockDevices[0], sysfsPath: '/sys/block/devices/pci0000:00/slot2' }
-        ]);
-        readlinkSpy.mockRestore();
+        expect(response.map(device => device.name)).toEqual(['sda', 'sdb']);
     });
 
     it('sorts block devices by size when requested', async () => {
-        const blockDevices: RawBlockDevice[] = [
-            { name: 'sdb', path: '/dev/sdb', type: 'disk', size: 2048, children: [] },
-            { name: 'sda', path: '/dev/sda', type: 'disk', size: 1024, children: [] }
+        const cachedDevices = [
+            {
+                sysfsPath: '../devices/pci0000:00/a',
+                name: 'sdb',
+                model: 'DiskB',
+                vendor: 'VendorB',
+                serial: 'SNB',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-b',
+                partitionTableType: 'gpt',
+                size: 2048,
+                partitions: [],
+                smartInfo: { serial_number: 'SNB' },
+                busGroup: 2
+            },
+            {
+                sysfsPath: '../devices/pci0000:00/b',
+                name: 'sda',
+                model: 'DiskA',
+                vendor: 'VendorA',
+                serial: 'SNA',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-a',
+                partitionTableType: 'gpt',
+                size: 1024,
+                partitions: [],
+                smartInfo: { serial_number: 'SNA' },
+                busGroup: 1
+            }
         ];
-        listRawBlockDevicesMock.mockResolvedValue(blockDevices);
+        ioManagerMock.getCachedDevices.mockReturnValue(cachedDevices);
 
         const req = createRequest('GET', '/$/blockDevices');
         req.params.sort = 'size';
         const response = await HttpMgmt.handle(5, req, nullResponse);
 
         expect(response.map(device => device.name)).toEqual(['sda', 'sdb']);
+    });
+
+    it('reloads block devices when requested', async () => {
+        const cachedDevices = [
+            {
+                sysfsPath: '../devices/pci0000:00/a',
+                name: 'sda',
+                model: 'DiskA',
+                vendor: 'VendorA',
+                serial: 'SNA',
+                byIdPaths: [],
+                partitionTableUuid: 'uuid-a',
+                partitionTableType: 'gpt',
+                size: 1024,
+                partitions: [],
+                smartInfo: { serial_number: 'SNA' },
+                busGroup: 1
+            }
+        ];
+        ioManagerMock.getCachedDevices.mockReturnValue(cachedDevices);
+        ioManagerMock.reloadBlockDevices.mockResolvedValue(cachedDevices);
+
+        const response = await HttpMgmt.handle(6, createRequest('POST', '/$/blockDevices/reload'), nullResponse);
+
+        expect(ioManagerMock.reloadBlockDevices).toHaveBeenCalledTimes(1);
+        expect(response).toEqual([
+            {
+                name: 'sda',
+                path: '/dev/sda',
+                type: 'disk',
+                size: 1024,
+                model: 'DiskA',
+                vendor: 'VendorA',
+                serial: 'SNA',
+                ptuuid: 'uuid-a',
+                pttype: 'gpt',
+                sysfsPath: '/sys/block/devices/pci0000:00/a',
+                busGroup: 1,
+                children: []
+            }
+        ]);
     });
 
     it('returns array state in status endpoint', async () => {
