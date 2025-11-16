@@ -155,7 +155,11 @@ export class Slice {
         this._isPerformingIO = true;
 
         try {
-            this._inputFh = await this._volume.openCommittedFh(this._fileName);
+            this._inputFh = await this._withTimeout(
+                () => this._volume.openCommittedFh(this._fileName),
+                30000,
+                'open slice file'
+            );
             ioShutdown.throwIfAborted();
 
             const inputFh = this._inputFh;
@@ -166,7 +170,11 @@ export class Slice {
 
             try {
                 await this._ensurePriorityWindow();
-                await inputFh.read(this._readBuf, 0, constants.FILE_HEADER_SIZE);
+                await this._withTimeout(
+                    () => inputFh.read(this._readBuf as Buffer, 0, constants.FILE_HEADER_SIZE),
+                    30000,
+                    'read slice header'
+                );
             } catch (err) {
                 const throwErr = new Error('failed to read slice header') as Error & { cause?: unknown; fileName?: string; volumeId?: number };
                 throwErr.cause = err;
@@ -219,7 +227,11 @@ export class Slice {
                 throw new Error('input file handle is not initialized');
 
             await this._ensurePriorityWindow();
-            await inputFh.read(readBuf, 0, readLen, this._cursorOffset);
+            await this._withTimeout(
+                () => inputFh.read(readBuf, 0, readLen, this._cursorOffset),
+                30000,
+                'read slice chunk'
+            );
 
             await hash(constants.CHUNK_HEADER_ALGO, readBuf, constants.CHUNK_HEADER_SIZE, readDataLen, hashBuf, 0);
 
@@ -232,6 +244,25 @@ export class Slice {
         }
         finally {
             this._isPerformingIO = false;
+        }
+    }
+
+    private async _withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, context: string): Promise<T> {
+        let timer: NodeJS.Timeout | null = null;
+        try {
+            const timeoutPromise = new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => {
+                    const err = new Error(`slice ${context} timed out after ${timeoutMs}ms`) as Error & { code?: string; volumeId?: number };
+                    err.code = 'ETIMEOUT';
+                    err.volumeId = this._volumeId;
+                    reject(err);
+                }, timeoutMs);
+            });
+            return await Promise.race([fn(), timeoutPromise]);
+        }
+        finally {
+            if (timer)
+                clearTimeout(timer);
         }
     }
 
