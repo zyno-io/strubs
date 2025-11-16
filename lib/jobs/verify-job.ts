@@ -173,6 +173,8 @@ export class VerifyJob {
 
         this.startedAt = startedAt;
         this.applyVolumeFilter(volumeIds);
+        const concurrency = this.resolveConcurrency();
+        this.currentConcurrency = concurrency;
         if (isResume)
             this.log('starting verification (resume) at %s', startedAt);
         else
@@ -181,7 +183,7 @@ export class VerifyJob {
         this.progress.objectsVerified = 0;
         this.progress.errors = { total: 0, volumes: {} };
         this.startProgressLogger();
-        this.running = this.execute(startedAt, isResume)
+        this.running = this.execute(startedAt, isResume, concurrency)
             .catch(err => {
                 this.log.error('verify job failed', err);
             })
@@ -195,7 +197,7 @@ export class VerifyJob {
             });
     }
 
-    private async execute(startedAt: string, isResume: boolean): Promise<void> {
+    private async execute(startedAt: string, isResume: boolean, concurrency: number): Promise<void> {
         const startedAtDate = new Date(startedAt);
         if (!Number.isFinite(startedAtDate.getTime()))
             throw new Error('invalid verify start time');
@@ -205,9 +207,6 @@ export class VerifyJob {
             await this.resetVolumeCounters(volumeCounts);
         let checksumErrors = 0;
         let totalErrors = 0;
-
-        const concurrency = this.resolveConcurrency();
-        this.currentConcurrency = concurrency;
 
         try {
             while (!this.cancelRequested) {
@@ -312,9 +311,6 @@ export class VerifyJob {
     }
 
     private async verifyObject(record: StoredObjectRecord, startedAt: Date, lane?: number): Promise<VerifyObjectResult | null> {
-        const volumeLocks = await this.acquireVolumeLocks(record);
-        if (volumeLocks === null)
-            return null;
         try {
             if (this.cancelRequested)
                 return null;
@@ -336,6 +332,11 @@ export class VerifyJob {
                 const descriptor = this.describeSlice(record, sliceIndex);
                 if (!this.shouldVerifyVolume(descriptor.volumeId))
                     continue;
+                const releaseLock = await this.acquireVolumeLock(descriptor.volumeId);
+                if (this.cancelRequested) {
+                    releaseLock?.();
+                    return null;
+                }
                 try {
                     processedSlices++;
                     await verifier.verifySlice(sliceIndex);
@@ -373,6 +374,9 @@ export class VerifyJob {
                         normalized.sliceKey,
                         message
                     );
+                }
+                finally {
+                    releaseLock?.();
                 }
             }
 
@@ -437,41 +441,6 @@ export class VerifyJob {
                 volumeImpacts
             };
         }
-        finally {
-            this.releaseVolumeLocks(volumeLocks);
-        }
-    }
-
-    private async acquireVolumeLocks(record: StoredObjectRecord): Promise<(() => void)[] | null> {
-        const volumes = this.collectRecordVolumeIds(record);
-        const releases: (() => void)[] = [];
-        for (const volumeId of volumes) {
-            if (this.cancelRequested) {
-                this.releaseVolumeLocks(releases);
-                return null;
-            }
-            const release = await this.volumeCoordinator.acquire(volumeId);
-            releases.push(release);
-        }
-        return releases;
-    }
-
-    private releaseVolumeLocks(releases: (() => void)[]): void {
-        for (const release of releases.reverse())
-            release();
-    }
-
-    private collectRecordVolumeIds(record: StoredObjectRecord): number[] {
-        const unique = new Set<number>();
-        for (const id of record.dataVolumes ?? []) {
-            if (typeof id === 'number' && this.shouldVerifyVolume(id))
-                unique.add(id);
-        }
-        for (const id of record.parityVolumes ?? []) {
-            if (typeof id === 'number' && this.shouldVerifyVolume(id))
-                unique.add(id);
-        }
-        return Array.from(unique).sort((a, b) => a - b);
     }
 
     private describeSlice(
@@ -516,6 +485,14 @@ export class VerifyJob {
             volumeId,
             isChecksum
         };
+    }
+
+    private async acquireVolumeLock(volumeId: number | null | undefined): Promise<(() => void) | null> {
+        if (volumeId === null || volumeId === undefined)
+            return null;
+        if (this.cancelRequested)
+            return null;
+        return this.volumeCoordinator.acquire(volumeId);
     }
 
     private shouldVerifyVolume(volumeId: number | null | undefined): boolean {

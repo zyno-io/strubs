@@ -412,13 +412,19 @@ describe('VerifyJob', () => {
         deps.ioManager.getVolume.mockImplementation((id: number) => (id === 1 ? volumeStub1 : volumeStub2));
 
         let releaseBatch: (() => void) | null = null;
+        let batchReadyResolve: (() => void) | null = null;
+        const batchReady = new Promise<void>(resolve => {
+            batchReadyResolve = resolve;
+        });
         deps.database.findObjectsNeedingVerification.mockImplementationOnce(() => new Promise(resolve => {
             releaseBatch = () => resolve([]);
+            batchReadyResolve?.();
         }));
         deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
 
         const job = new VerifyJob(deps);
         await job.start();
+        await batchReady;
 
         expect(job.getStatus().concurrency).toBe(2);
 
