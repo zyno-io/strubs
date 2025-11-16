@@ -1,4 +1,5 @@
 import os from 'os';
+import PQueue from 'p-queue';
 import { database, type SliceErrorInfo } from '../database';
 import { runtimeConfig } from '../runtime-config';
 import { fileObjectService, type FileObjectService } from '../io/file-object/service';
@@ -85,6 +86,32 @@ class VolumeReadCoordinator {
             }
             this.locked.delete(volumeId);
         };
+    }
+}
+
+class LaneAllocator {
+    private readonly available: number[] = [];
+    private readonly waiters: Array<(lane: number) => void> = [];
+
+    constructor(total: number) {
+        for (let lane = 1; lane <= total; lane++)
+            this.available.push(lane);
+    }
+
+    acquire(): Promise<number> {
+        const lane = this.available.shift();
+        if (lane !== undefined)
+            return Promise.resolve(lane);
+        return new Promise(resolve => this.waiters.push(resolve));
+    }
+
+    release(lane: number): void {
+        const waiter = this.waiters.shift();
+        if (waiter) {
+            waiter(lane);
+            return;
+        }
+        this.available.push(lane);
     }
 }
 
@@ -234,53 +261,32 @@ export class VerifyVolumesJob {
                     break;
 
                 let interrupted = false;
-                let nextIndex = 0;
-                const active: Array<{
-                    record: StoredObjectRecord;
-                    promise: Promise<VerifyVolumesObjectResult | null>;
-                    lane: number;
-                }> = [];
-                const lanePool = Array.from({ length: concurrency }, (_value, index) => index + 1);
+                const queue = new PQueue({ concurrency });
+                const laneAllocator = new LaneAllocator(concurrency);
 
-                const startNext = (): void => {
-                    while (nextIndex < batch.length && active.length < concurrency && lanePool.length && !this.cancelRequested) {
-                        const record = batch[nextIndex++];
-                        const lane = lanePool.shift() as number;
-                        active.push({
-                            record,
-                            lane,
-                            promise: this.verifyObject(record, startedAtDate, lane).finally(() => {
-                                lanePool.push(lane);
-                            })
-                        });
+                const taskPromises = batch.map(record => queue.add(async () => {
+                    if (this.cancelRequested || interrupted)
+                        return;
+                    const lane = await laneAllocator.acquire();
+                    try {
+                        const result = await this.verifyObject(record, startedAtDate, lane);
+                        if (!result) {
+                            interrupted = true;
+                            queue.clear();
+                            return;
+                        }
+                        this.progress.objectsVerified++;
+                        checksumErrors += result.checksumErrors;
+                        totalErrors += result.totalErrors;
+                        await this.mergeVolumeResults(volumeCounts, result.volumeImpacts);
+                        this.logProgress(totalErrors, volumeCounts);
                     }
-                };
-
-                startNext();
-
-                while (active.length && !this.cancelRequested) {
-                    const settled = await Promise.race(active.map(entry => entry.promise.then(result => ({ entry, result }))));
-                    const { entry, result } = settled;
-                    const index = active.indexOf(entry);
-                    if (index !== -1)
-                        active.splice(index, 1);
-
-                    if (!result) {
-                        interrupted = true;
-                        break;
+                    finally {
+                        laneAllocator.release(lane);
                     }
+                }));
 
-                    this.progress.objectsVerified++;
-                    checksumErrors += result.checksumErrors;
-                    totalErrors += result.totalErrors;
-                    await this.mergeVolumeResults(volumeCounts, result.volumeImpacts);
-                    this.logProgress(totalErrors, volumeCounts);
-
-                    startNext();
-                }
-
-                if (active.length)
-                    await Promise.allSettled(active.map(entry => entry.promise));
+                await Promise.allSettled(taskPromises);
 
                 if (this.cancelRequested || interrupted)
                     break;

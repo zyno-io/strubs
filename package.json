@@ -21,6 +21,7 @@
     "fuse-native": "^2.2.6",
     "lodash": "^4.17.21",
     "mongodb": "^7.0.0",
+    "p-queue": "^8.0.2",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
