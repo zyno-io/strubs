@@ -22,6 +22,9 @@ const verifyVolumesJobMock = {
     stop: vi.fn(),
     getStatus: vi.fn()
 };
+const verifyFileJobMock = {
+    verify: vi.fn()
+};
 const databaseSoftDeleteMock = vi.fn();
 const databaseUpdateFlagsMock = vi.fn();
 const volumeSmartMonitorMock = {
@@ -53,6 +56,10 @@ vi.mock('../lib/io/device-provisioner', () => ({
 
 vi.mock('../lib/jobs/verify-volumes-job', () => ({
     verifyVolumesJob: verifyVolumesJobMock
+}));
+
+vi.mock('../lib/jobs/verify-file-job', () => ({
+    verifyFileJob: verifyFileJobMock
 }));
 
 vi.mock('../lib/database', () => ({
@@ -89,6 +96,7 @@ beforeEach(() => {
     verifyVolumesJobMock.start.mockReset();
     verifyVolumesJobMock.stop.mockReset();
     verifyVolumesJobMock.getStatus.mockReset();
+    verifyFileJobMock.verify.mockReset();
     ioManagerMock.getVolumeEntries.mockReturnValue([]);
     const summary = {
         updatedAt: '2023-01-01T00:00:00.000Z',
@@ -634,6 +642,32 @@ describe('HttpMgmt.handle', () => {
         const response = await HttpMgmt.handle(14, createRequest('GET', '/$/verify-volumes'), nullResponse);
         expect(response).toEqual({ running: true, startedAt: 't', objectsVerified: 5, errors: { total: 2, volumes: { '1': 2 } }, concurrency: 3 });
         expect(verifyVolumesJobMock.getStatus).toHaveBeenCalledTimes(1);
+    });
+
+    it('verifies a file via POST', async () => {
+        const id = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+        const result = { '0': { ok: true, type: 'data', volumeId: 1 } };
+        verifyFileJobMock.verify.mockResolvedValue(result);
+        const response = await HttpMgmt.handle(19, createRequest('POST', `/$/verify-file/${id}`), nullResponse);
+        expect(response).toEqual(result);
+        expect(verifyFileJobMock.verify).toHaveBeenCalledWith(id);
+    });
+
+    it('rejects invalid verify file ids', async () => {
+        await expect(HttpMgmt.handle(20, createRequest('POST', '/$/verify-file/not-hex'), nullResponse))
+            .rejects.toBeInstanceOf(HttpBadRequestError);
+    });
+
+    it('maps verify file ENOENT to HttpNotFoundError', async () => {
+        verifyFileJobMock.verify.mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }));
+        await expect(HttpMgmt.handle(21, createRequest('POST', '/$/verify-file/aaaaaaaaaaaaaaaaaaaaaaaa'), nullResponse))
+            .rejects.toBeInstanceOf(HttpNotFoundError);
+    });
+
+    it('maps verify file ENOTFILE to HttpBadRequestError', async () => {
+        verifyFileJobMock.verify.mockRejectedValue(Object.assign(new Error('bad'), { code: 'ENOTFILE' }));
+        await expect(HttpMgmt.handle(22, createRequest('POST', '/$/verify-file/aaaaaaaaaaaaaaaaaaaaaaaa'), nullResponse))
+            .rejects.toBeInstanceOf(HttpBadRequestError);
     });
 
     it('soft deletes volumes via DELETE', async () => {

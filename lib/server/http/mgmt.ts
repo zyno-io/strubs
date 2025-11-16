@@ -4,6 +4,7 @@ import { ioManager } from '../../io/manager';
 import { deviceProvisioner } from '../../io/device-provisioner';
 import { listRawBlockDevices, type RawBlockDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
+import { verifyFileJob } from '../../jobs/verify-file-job';
 import { database } from '../../database';
 import type { HttpRequest, HttpResponse } from './server';
 import type { Volume } from '../../io/volume';
@@ -41,6 +42,7 @@ type VolumeDetail = VolumeStatus & {
 
 type RouteParams = Record<string, unknown>;
 type FileInfoRouteParams = RouteParams & { normalizedPath: string };
+type VerifyFileRouteParams = RouteParams & { objectId: string };
 type RouteHandler = (req: HttpRequest, params: RouteParams) => Promise<unknown>;
 type RouteDefinition = {
     method: string;
@@ -133,6 +135,21 @@ export class HttpMgmt {
 
     private static async handleVerifyVolumesJobStatusRequest(): Promise<{ running: boolean; startedAt: string | null; objectsVerified: number; errors: { total: number; volumes: Record<string, number> }; concurrency: number }> {
         return verifyVolumesJob.getStatus();
+    }
+
+    private static async handleVerifyFileRequest(_req: HttpRequest, params: VerifyFileRouteParams): Promise<unknown> {
+        const objectId = this.parseObjectId(params);
+        try {
+            return await verifyFileJob.verify(objectId);
+        }
+        catch (err) {
+            const code = (err as { code?: string })?.code;
+            if (code === 'ENOENT')
+                throw new HttpNotFoundError();
+            if (code === 'ENOTFILE')
+                throw new HttpBadRequestError('object is not a file');
+            throw err;
+        }
     }
 
     private static async handleStatusRequest(): Promise<StatusResponse> {
@@ -427,6 +444,11 @@ export class HttpMgmt {
                 handler: async () => this.handleVerifyVolumesJobStopRequest()
             },
             {
+                method: 'POST',
+                match: url => this.matchVerifyFileRoute(url),
+                handler: async (req, params) => this.handleVerifyFileRequest(req, params as VerifyFileRouteParams)
+            },
+            {
                 method: 'GET',
                 match: url => this.matchFileInfoRoute(url),
                 handler: async (_req, params) => this.handleFileInfoRequest(params as FileInfoRouteParams)
@@ -466,6 +488,13 @@ export class HttpMgmt {
         return id;
     }
 
+    private static parseObjectId(params: VerifyFileRouteParams): string {
+        const value = params.objectId;
+        if (typeof value !== 'string' || !/^[0-9a-fA-F]{24}$/.test(value))
+            throw new HttpBadRequestError('invalid object id');
+        return value;
+    }
+
     private static matchFileInfoRoute(url: string): FileInfoRouteParams | null {
         const prefix = '/$/fileinfo/';
         if (!url.toLowerCase().startsWith(prefix))
@@ -480,6 +509,13 @@ export class HttpMgmt {
         if (!match)
             return null;
         return { id: match[1] };
+    }
+
+    private static matchVerifyFileRoute(url: string): VerifyFileRouteParams | null {
+        const match = /^\/\$\/verify-file\/([^/]+)$/.exec(url);
+        if (!match)
+            return null;
+        return { objectId: match[1] };
     }
 
     private static async parseJsonBody<T>(req: HttpRequest): Promise<T> {
