@@ -10,6 +10,7 @@ const showModal = ref<boolean>(false);
 const selectedDevices = ref<Set<string>>(new Set());
 const wipeDevices = ref<Set<string>>(new Set());
 const creatingVolumes = ref<boolean>(false);
+const sortBy = ref<'volumeLabel' | 'volumeId' | 'name' | 'path'>('volumeLabel');
 
 // Context menu state
 const contextMenu = ref<{ x: number; y: number; volumeId: number | null }>({ x: 0, y: 0, volumeId: null });
@@ -95,6 +96,53 @@ const offlineVolumes = computed<VolumeStatus[]>(() => {
 // Get block devices without volume IDs (available for provisioning)
 const availableDevices = computed<BlockDevice[]>(() => {
   return blockDevices.value.filter(bd => !bd.volumeId);
+});
+
+// Sort block devices based on selected sort option
+const sortedBlockDevices = computed<BlockDevice[]>(() => {
+  const devices = [...blockDevices.value];
+
+  return devices.sort((a, b) => {
+    let aValue: string | number | null;
+    let bValue: string | number | null;
+
+    switch (sortBy.value) {
+      case 'volumeLabel':
+        aValue = a.volumeLabel ?? '';
+        bValue = b.volumeLabel ?? '';
+        break;
+      case 'volumeId':
+        aValue = a.volumeId ?? null;
+        bValue = b.volumeId ?? null;
+        // Special handling for volumeId: null values go to the end
+        if (aValue === null && bValue === null) return 0;
+        if (aValue === null) return 1;
+        if (bValue === null) return -1;
+        // Both have values, compare them
+        if (aValue < bValue) return -1;
+        if (aValue > bValue) return 1;
+        return 0;
+      case 'name':
+        aValue = a.name;
+        bValue = b.name;
+        break;
+      case 'path':
+        aValue = a.path;
+        bValue = b.path;
+        break;
+      default:
+        return 0;
+    }
+
+    // Handle null/empty values - push them to the end
+    if (!aValue && aValue !== 0) return 1;
+    if (!bValue && bValue !== 0) return -1;
+
+    // Compare values
+    if (aValue < bValue) return -1;
+    if (aValue > bValue) return 1;
+    return 0;
+  });
 });
 
 // Check if a device has any mounted partitions
@@ -348,14 +396,10 @@ async function deleteVolume(): Promise<void> {
 
 onMounted(() => {
   fetchData();
-  // Refresh every 10 seconds
-  setInterval(fetchData, 10000);
-
   // Close context menu on click anywhere
   document.addEventListener('click', hideContextMenu);
 });
 
-import { onUnmounted } from 'vue';
 onUnmounted(() => {
   document.removeEventListener('click', hideContextMenu);
 });
@@ -382,10 +426,21 @@ onUnmounted(() => {
     <div v-else-if="!loading || blockDevices.length > 0">
       <!-- Block Devices Section -->
       <section class="section">
-        <h2>Block Devices</h2>
+        <div class="section-header">
+          <h2>Block Devices</h2>
+          <div class="sort-controls">
+            <label for="sort-select" class="sort-label">Sort by:</label>
+            <select id="sort-select" v-model="sortBy" class="sort-select">
+              <option value="volumeLabel">Volume Label</option>
+              <option value="volumeId">Volume ID</option>
+              <option value="name">Device Name</option>
+              <option value="path">Device Path</option>
+            </select>
+          </div>
+        </div>
         <div class="devices-list">
           <div
-            v-for="device in blockDevices"
+            v-for="device in sortedBlockDevices"
             :key="device.sysfsPath"
             class="device-card"
             :style="{ opacity: device.volumeId ? 1 : 0.5 }"
@@ -677,6 +732,51 @@ h2 {
 .section {
   margin-bottom: 40px;
   width: 100%;
+}
+
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 15px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.section-header h2 {
+  margin-bottom: 0;
+}
+
+.sort-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sort-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: #666;
+}
+
+.sort-select {
+  padding: 6px 12px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+  background-color: white;
+  cursor: pointer;
+  color: #333;
+  font-family: inherit;
+}
+
+.sort-select:focus {
+  outline: none;
+  border-color: #2196F3;
+}
+
+.sort-select:hover {
+  border-color: #bbb;
 }
 
 .error {

@@ -3,9 +3,9 @@ import vue from '@vitejs/plugin-vue'
 import path from 'path'
 
 // https://vite.dev/config/
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   plugins: [vue()],
-  base: '/$/ui/',
+  base: mode === 'production' ? '/$/ui/' : '/',
   server: {
     proxy: {
       '/$/': {
@@ -20,4 +20,4 @@ export default defineConfig({
       '@strubs': path.resolve(__dirname, '../lib')
     }
   }
-})
+}))
