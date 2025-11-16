@@ -208,9 +208,7 @@ export class FileObjectReader extends Base {
         this.logger('closing slices');
         this._hasReadSegment = true;
 
-        setTimeout(() => {
-            void this._closeSlices();
-        }, 1000);
+        await this._closeSlices();
     }
 
     private async _closeSlices(): Promise<void> {

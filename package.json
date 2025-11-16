@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "STRUBS (Striping & Redundancy using Basic Disks): A single-host fault-tolerant mass-storage service for providing a scalable storage system for small scale operations.",
   "main": "dist/service.js",
+  "workspaces": [
+    "ui"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "sudo bash -c 'source /root/.asdf/asdf.sh && yarn dev:root'",

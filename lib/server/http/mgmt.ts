@@ -1,3 +1,5 @@
+import { promises as fs } from 'fs';
+import path from 'path';
 import { HttpHelpers } from './helpers';
 import { HttpBadRequestError, HttpNotFoundError } from './errors';
 import { ioManager } from '../../io/manager';
@@ -6,12 +8,11 @@ import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import { verifyFileJob } from '../../jobs/verify-file-job';
 import { database } from '../../database';
-import type { HttpRequest, HttpResponse } from './server';
+import type { HttpRequest, HttpResponse, HttpContentPayload } from './server';
 import type { Volume } from '../../io/volume';
-import path from 'path';
 import { volumeSmartMonitor, type VolumeSmartInfo, type VolumeSmartSummary } from '../../io/volume-smart-monitor';
 
-type VolumeStatus = {
+export type VolumeStatus = {
     id: number;
     uuid: string;
     blockPath: string | null;
@@ -37,13 +38,41 @@ type VolumeStatus = {
     smartInfoSummary: VolumeSmartSummary | null;
 };
 
-type VolumeDetail = VolumeStatus & {
+export type VolumeDetail = VolumeStatus & {
     smartInfo: VolumeSmartInfo | null;
+};
+
+export type BlockDevicePartition = {
+    type: 'part';
+    name: string;
+    path?: string;
+    uuid: string | null;
+    size: number;
+    fstype: string | null;
+    mountpoint: string | null;
+};
+
+export type BlockDevice = {
+    name: string;
+    path: string;
+    type: 'disk';
+    size: number;
+    model: string | null;
+    vendor: string | null;
+    serial: string | null;
+    ptuuid?: string;
+    pttype?: string;
+    sysfsPath: string;
+    busGroup: number | null;
+    volumeId?: number;
+    volumeLabel?: string | null;
+    children: BlockDevicePartition[];
 };
 
 type RouteParams = Record<string, unknown>;
 type FileInfoRouteParams = RouteParams & { normalizedPath: string };
 type VerifyFileRouteParams = RouteParams & { objectId: string };
+type UiRouteParams = RouteParams & { assetPath?: string };
 type RouteHandler = (req: HttpRequest, params: RouteParams) => Promise<unknown>;
 type RouteDefinition = {
     method: string;
@@ -84,18 +113,39 @@ export class HttpMgmt {
         return this.getVolumeStatus(includeDeleted);
     }
 
-    private static async handleBlockDevicesRequest(req: HttpRequest): Promise<Array<Record<string, unknown>>> {
+    private static async handleBlockDevicesRequest(req: HttpRequest): Promise<BlockDevice[]> {
         const devices = ioManager.getCachedDevices();
         const sortParam = this.resolveSortParam(req.params);
         return this.serializeBlockDevices(devices, sortParam);
     }
 
-    private static async handleBlockDevicesReloadRequest(req: HttpRequest): Promise<Array<Record<string, unknown>>> {
+    private static async handleBlockDevicesReloadRequest(req: HttpRequest): Promise<BlockDevice[]> {
         await ioManager.reloadBlockDevices();
         return this.handleBlockDevicesRequest(req);
     }
 
-    private static serializeBlockDevices(devices: CachedDevice[], sortParam: 'name' | 'sysfsPath' | 'size' | 'volumeId' | 'volumeLabel'): Array<Record<string, unknown>> {
+    private static async handleUiRequest(_req: HttpRequest, params: UiRouteParams): Promise<HttpContentPayload> {
+        const assetPath = typeof params.assetPath === 'string' ? params.assetPath : '';
+        const resolvedPath = this.resolveUiAssetPath(assetPath);
+        try {
+            const body = await fs.readFile(resolvedPath);
+            const contentType = this.resolveUiContentType(resolvedPath);
+            return {
+                body,
+                headers: {
+                    'content-type': contentType,
+                    'cache-control': assetPath ? 'public, max-age=300' : 'no-store'
+                }
+            };
+        }
+        catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+                throw new HttpNotFoundError('UI bundle not found');
+            throw err;
+        }
+    }
+
+    private static serializeBlockDevices(devices: CachedDevice[], sortParam: 'name' | 'sysfsPath' | 'size' | 'volumeId' | 'volumeLabel'): BlockDevice[] {
         const volumes = new Map<number, Volume>();
         for (const [id, volume] of ioManager.getVolumeEntries())
             volumes.set(id, volume);
@@ -114,10 +164,10 @@ export class HttpMgmt {
         return enriched;
     }
 
-    private static serializeCachedDevice(device: CachedDevice, volumes: Map<number, Volume>): Record<string, unknown> {
+    private static serializeCachedDevice(device: CachedDevice, volumes: Map<number, Volume>): BlockDevice {
         const sysfsResolved = path.resolve(`/sys/block/${device.name}`, device.sysfsPath);
-        const children = device.partitions.map(partition => ({
-            type: 'part',
+        const children: BlockDevicePartition[] = device.partitions.map(partition => ({
+            type: 'part' as const,
             name: partition.name,
             path: partition.path ?? (partition.name ? `/dev/${partition.name}` : undefined),
             uuid: partition.uuid,
@@ -125,10 +175,10 @@ export class HttpMgmt {
             fstype: partition.fsType,
             mountpoint: partition.mountPoint ?? null
         }));
-        const serialized: Record<string, unknown> = {
+        const serialized: BlockDevice = {
             name: device.name,
             path: `/dev/${device.name}`,
-            type: 'disk',
+            type: 'disk' as const,
             size: device.size,
             model: device.model,
             vendor: device.vendor,
@@ -454,6 +504,16 @@ export class HttpMgmt {
             },
             {
                 method: 'GET',
+                match: url => this.matchUiRoute(url),
+                handler: async (req, params) => this.handleUiRequest(req, params as UiRouteParams)
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/ui' ? {} : null,
+                handler: async () => this.handleUiRequest()
+            },
+            {
+                method: 'GET',
                 match: url => this.matchVolumeIdRoute(url),
                 handler: async (_req, params) => this.handleVolumeDetailRequest(params)
             },
@@ -552,6 +612,50 @@ export class HttpMgmt {
         if (typeof value !== 'string' || !/^[0-9a-fA-F]{24}$/.test(value))
             throw new HttpBadRequestError('invalid object id');
         return value;
+    }
+
+    private static resolveUiAssetPath(rawPath: string): string {
+        const uiRoot = this.getUiRootPath();
+        const normalized = path.normalize(rawPath || '');
+        const relative = !normalized || normalized === '.' ? 'index.html' : normalized;
+        const resolved = path.resolve(uiRoot, relative);
+        if (!resolved.startsWith(uiRoot + path.sep))
+            throw new HttpNotFoundError();
+        return resolved;
+    }
+
+    private static resolveUiContentType(filePath: string): string {
+        const ext = path.extname(filePath).toLowerCase();
+        switch (ext) {
+        case '.html': return 'text/html; charset=utf-8';
+        case '.css': return 'text/css; charset=utf-8';
+        case '.js': return 'application/javascript; charset=utf-8';
+        case '.json': return 'application/json; charset=utf-8';
+        case '.svg': return 'image/svg+xml';
+        case '.png': return 'image/png';
+        case '.jpg':
+        case '.jpeg': return 'image/jpeg';
+        case '.gif': return 'image/gif';
+        case '.ico': return 'image/x-icon';
+        default: return 'application/octet-stream';
+        }
+    }
+
+    private static getUiRootPath(): string {
+        return path.resolve(process.cwd(), 'ui', 'dist');
+    }
+
+    private static matchUiRoute(url: string): RouteParams | null {
+        const prefix = '/$/ui';
+        if (!url.startsWith(prefix))
+            return null;
+        const remainder = url.slice(prefix.length);
+        if (!remainder || remainder === '/')
+            return { assetPath: '' };
+        if (!remainder.startsWith('/'))
+            return null;
+        const assetPath = remainder.slice(1);
+        return { assetPath };
     }
 
     private static matchFileInfoRoute(url: string): FileInfoRouteParams | null {

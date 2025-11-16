@@ -22,6 +22,12 @@ type HttpRequest = http.IncomingMessage & {
 };
 
 type HttpResponse = http.ServerResponse;
+export type HttpContentPayload = {
+    body: unknown;
+    headers?: Record<string, string>;
+    statusCode?: number;
+    contentType?: string;
+};
 type RouteHandler = (requestId: number, req: HttpRequest, res: HttpResponse) => Promise<void>;
 type HttpServerDependencies = {
     ObjectGetRequest: typeof ObjectGetRequest;
@@ -227,6 +233,11 @@ export class HttpServer {
     }
 
     private _outputHttpContent(content: unknown, req: http.IncomingMessage, res: HttpResponse): void {
+        if (this._isHttpContentPayload(content)) {
+            this._sendCustomContent(content, res);
+            return;
+        }
+
         if (!content) {
             res.writeHead(204);
             res.end();
@@ -247,6 +258,48 @@ export class HttpServer {
 
         res.writeHead(200, 'OK', { 'content-type': 'text/plain' });
         res.end(String(content));
+    }
+
+    private _sendCustomContent(payload: HttpContentPayload, res: HttpResponse): void {
+        const headers = payload.headers ?? {};
+        const hasBody = payload.body !== undefined && payload.body !== null;
+        if (payload.contentType && !headers['content-type'])
+            headers['content-type'] = payload.contentType;
+        for (const [key, value] of Object.entries(headers))
+            res.setHeader(key, value);
+
+        const status = payload.statusCode ?? (hasBody ? 200 : 204);
+        res.statusCode = status;
+
+        if (!hasBody) {
+            res.end();
+            return;
+        }
+
+        const body = payload.body;
+        if (Buffer.isBuffer(body)) {
+            if (!res.hasHeader('content-type'))
+                res.setHeader('content-type', payload.contentType ?? 'application/octet-stream');
+            res.end(body);
+            return;
+        }
+
+        if (typeof body === 'object') {
+            if (!res.hasHeader('content-type'))
+                res.setHeader('content-type', payload.contentType ?? 'application/json');
+            res.end(JSON.stringify(body));
+            return;
+        }
+
+        if (!res.hasHeader('content-type'))
+            res.setHeader('content-type', payload.contentType ?? 'text/plain');
+        res.end(String(body));
+    }
+
+    private _isHttpContentPayload(content: unknown): content is HttpContentPayload {
+        if (!content || typeof content !== 'object')
+            return false;
+        return Object.prototype.hasOwnProperty.call(content, 'body');
     }
 
     private _outputHttpNotFound(req: http.IncomingMessage, res: HttpResponse): void {

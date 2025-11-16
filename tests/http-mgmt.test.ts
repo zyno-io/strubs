@@ -1,4 +1,6 @@
 import { EventEmitter } from 'events';
+import { promises as fs } from 'fs';
+import path from 'path';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HttpRequest, HttpResponse } from '../lib/server/http/server';
 
@@ -797,6 +799,43 @@ describe('HttpMgmt.handle', () => {
         await HttpMgmt.handle(7, createRequest('GET', '/$/fileInfo///logs/system.log'), nullResponse);
 
         expect(httpHelpersMock.getObjectMeta).toHaveBeenLastCalledWith('//logs/system.log');
+    });
+
+    describe('ui routes', () => {
+        it('serves the ui index document', async () => {
+            const html = Buffer.from('<html></html>');
+            const readSpy = vi.spyOn(fs, 'readFile').mockResolvedValueOnce(html);
+            const response = await HttpMgmt.handle(30, createRequest('GET', '/$/ui'), nullResponse);
+            expect(readSpy).toHaveBeenCalledWith(path.resolve(process.cwd(), 'ui', 'dist', 'index.html'));
+            expect(response).toEqual({
+                body: html,
+                headers: {
+                    'content-type': 'text/html; charset=utf-8',
+                    'cache-control': 'no-store'
+                }
+            });
+            readSpy.mockRestore();
+        });
+
+        it('serves nested assets with appropriate content type', async () => {
+            const script = Buffer.from('console.log("hi")');
+            const readSpy = vi.spyOn(fs, 'readFile').mockResolvedValueOnce(script);
+            const response = await HttpMgmt.handle(31, createRequest('GET', '/$/ui/assets/app.js'), nullResponse);
+            expect(readSpy).toHaveBeenCalledWith(path.resolve(process.cwd(), 'ui', 'dist', 'assets', 'app.js'));
+            expect(response).toEqual({
+                body: script,
+                headers: {
+                    'content-type': 'application/javascript; charset=utf-8',
+                    'cache-control': 'public, max-age=300'
+                }
+            });
+            readSpy.mockRestore();
+        });
+
+        it('rejects attempts to traverse outside the ui directory', async () => {
+            await expect(HttpMgmt.handle(32, createRequest('GET', '/$/ui/../../etc/passwd'), nullResponse))
+                .rejects.toThrow(HttpNotFoundError);
+        });
     });
 
     it('throws HttpNotFoundError for unknown management routes', async () => {

@@ -310,31 +310,20 @@ describe('FileObjectWriter/Reader/Destroyer internals', () => {
             expect(chunk.length).toBe(end - offset);
         });
 
-        it('closes active slices asynchronously', async () => {
-            vi.useFakeTimers();
+        it('closes active slices when requested', async () => {
             const fileObject = createFileObjectStub({ size: 16 });
             const reader = new FileObjectReader(fileObject);
             await reader.prepare();
             await reader.close();
-            expect(MockSlice.instances.filter(slice => slice.opened).every(slice => slice.closed)).toBe(false);
-            await vi.advanceTimersByTimeAsync(1000);
-            await vi.runOnlyPendingTimersAsync();
-            await Promise.resolve();
             expect(MockSlice.instances.filter(slice => slice.opened).every(slice => slice.closed)).toBe(true);
-            vi.useRealTimers();
         });
 
         it('logs and ignores close failures from individual slices', async () => {
-            vi.useFakeTimers();
             const fileObject = createFileObjectStub({ size: 8 });
             const reader = new FileObjectReader(fileObject);
             await reader.prepare();
             MockSlice.closeErrorIndex = 0;
             await reader.close();
-            await vi.advanceTimersByTimeAsync(1000);
-            await vi.runOnlyPendingTimersAsync();
-            await Promise.resolve();
-            vi.useRealTimers();
             MockSlice.closeErrorIndex = null;
         });
     });

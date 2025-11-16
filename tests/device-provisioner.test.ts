@@ -31,7 +31,7 @@ const baseDevice: RawBlockDevice = {
     children: []
 };
 
-const deviceWithPartition = (uuid: string | null): RawBlockDevice => ({
+const deviceWithPartition = (uuid: string | null, mountpoint: string | null = null): RawBlockDevice => ({
     ...baseDevice,
     pttype: 'gpt',
     ptuuid: 'PT-NEW',
@@ -42,7 +42,7 @@ const deviceWithPartition = (uuid: string | null): RawBlockDevice => ({
             size: 2048,
             uuid,
             fstype: uuid ? 'ext4' : null,
-            mountpoint: null
+            mountpoint
         }
     ]
 });
@@ -140,5 +140,13 @@ describe('DeviceProvisioner', () => {
         await provisioner.provision({ blockPath: '/dev/sdb', wipe: true });
 
         expect(deps.spawnHelper).toHaveBeenCalledWith('parted', ['-s', '/dev/sdb', 'mklabel', 'gpt']);
+    });
+
+    it('rejects wipe attempts when partitions are mounted', async () => {
+        deps.listRawBlockDevices.mockResolvedValueOnce([deviceWithPartition('OLD-UUID', '/mnt/data')]);
+
+        const provisioner = new DeviceProvisioner(deps);
+        await expect(provisioner.provision({ blockPath: '/dev/sdb', wipe: true })).rejects.toThrow('block device has mounted partitions');
+        expect(deps.spawnHelper).not.toHaveBeenCalled();
     });
 });

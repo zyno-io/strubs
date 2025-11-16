@@ -42,6 +42,8 @@ export class DeviceProvisioner {
             throw new HttpBadRequestError('block device not found');
 
         if (wipe === true) {
+            if (this.deviceHasMountedPartitions(targetDevice))
+                throw new HttpBadRequestError('block device has mounted partitions');
             await this.wipeDevice(blockPath);
             await this.deps.sleepSecs(1);
             devices = await this.deps.listRawBlockDevices();
@@ -83,6 +85,13 @@ export class DeviceProvisioner {
 
     private findDeviceByPath(devices: RawBlockDevice[], blockPath: string): RawBlockDevice | undefined {
         return devices.find(device => device.path === blockPath);
+    }
+
+    private deviceHasMountedPartitions(device: RawBlockDevice): boolean {
+        return Boolean(device.children?.some(child => {
+            const mountPoint = child.mountpoint;
+            return typeof mountPoint === 'string' && mountPoint.length > 0;
+        }));
     }
 
     private validateWipeOption(wipe?: boolean): void {
