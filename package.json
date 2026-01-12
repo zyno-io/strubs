@@ -24,18 +24,18 @@
     "fuse-native": "^2.2.6",
     "lodash": "^4.17.21",
     "mongodb": "^7.0.0",
-    "p-queue": "^8.0.2",
+    "p-queue": "^9.1.0",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
-    "@tsconfig/node24": "^24.0.2",
-    "@types/lodash": "^4.17.20",
-    "@types/node": "^24.10.1",
+    "@tsconfig/node24": "^24.0.3",
+    "@types/lodash": "^4.17.23",
+    "@types/node": "^25.0.6",
     "@types/ronomon__crypto-async": "^5.0.3",
-    "@vitest/coverage-v8": "^4.0.8",
+    "@vitest/coverage-v8": "^4.0.16",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.8"
+    "vitest": "^4.0.16"
   },
   "packageManager": "yarn@4.11.0"
 }

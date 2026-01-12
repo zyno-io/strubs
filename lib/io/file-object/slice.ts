@@ -83,7 +83,12 @@ export class Slice {
 
         try {
             this._outputFh = await this._volume.createTemporaryFh(this._fileName);
-            ioShutdown.throwIfAborted();
+
+            // Check for shutdown after opening - if aborted, clean up the handle
+            if (ioShutdown.isAborted()) {
+                await this._cleanupOutputHandle();
+                ioShutdown.throwIfAborted();
+            }
 
             /* 00-03 */ writeBuf.write('\x01\xfb\x02\xfb', 0); // magic header
             /* 04-04 */ writeBuf.writeUInt8(1, 4); // version
@@ -165,9 +170,16 @@ export class Slice {
             this._inputFh = await this._withTimeout(
                 () => this._volume.openCommittedFh(this._fileName),
                 30000,
-                'open slice file'
+                'open slice file',
+                // If timeout occurs, close the orphaned file handle when it eventually opens
+                fh => fh.close().catch(() => {})
             );
-            ioShutdown.throwIfAborted();
+
+            // Check for shutdown after opening - if aborted, clean up the handle
+            if (ioShutdown.isAborted()) {
+                await this._cleanupInputHandle();
+                ioShutdown.throwIfAborted();
+            }
 
             const inputFh = this._inputFh;
             if (!inputFh)
@@ -258,22 +270,49 @@ export class Slice {
         }
     }
 
-    private async _withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, context: string): Promise<T> {
+    private async _withTimeout<T>(
+        fn: () => Promise<T>,
+        timeoutMs: number,
+        context: string,
+        cleanupOnTimeout?: (result: T) => Promise<void> | void
+    ): Promise<T> {
         let timer: NodeJS.Timeout | null = null;
+        let timedOut = false;
+        const fnPromise = fn();
+
         try {
             const timeoutPromise = new Promise<never>((_resolve, reject) => {
                 timer = setTimeout(() => {
+                    timedOut = true;
                     const err = new Error(`slice ${context} timed out after ${timeoutMs}ms`) as Error & { code?: string; volumeId?: number };
                     err.code = 'ETIMEOUT';
                     err.volumeId = this._volumeId;
                     reject(err);
                 }, timeoutMs);
             });
-            return await Promise.race([fn(), timeoutPromise]);
+            return await Promise.race([fnPromise, timeoutPromise]);
         }
         finally {
             if (timer)
                 clearTimeout(timer);
+
+            // If we timed out and there's a cleanup function, handle the orphaned result
+            if (timedOut && cleanupOnTimeout) {
+                fnPromise.then(
+                    result => {
+                        // Operation completed after timeout - clean up the result
+                        try {
+                            cleanupOnTimeout(result);
+                        }
+                        catch {
+                            // Ignore cleanup errors
+                        }
+                    },
+                    () => {
+                        // Operation failed after timeout - nothing to clean up
+                    }
+                );
+            }
         }
     }
 
@@ -284,26 +323,28 @@ export class Slice {
     async close(): Promise<void> {
         await this._waitForIdle('close');
 
+        if (this._mode === null)
+            throw new Error('slice is not open');
+
         this._isPerformingIO = true;
 
-        if (this._mode === 'write' && this._outputFh) {
-            await this._outputFh.sync();
-            await this._outputFh.close();
-            this._outputFh = null;
+        try {
+            if (this._mode === 'write' && this._outputFh) {
+                await this._outputFh.sync();
+                await this._outputFh.close();
+                this._outputFh = null;
+            }
+            else if (this._mode === 'read' && this._inputFh) {
+                await this._inputFh.close();
+                this._inputFh = null;
+            }
+
+            this._releasePriorityHold();
+            this._mode = null;
         }
-        else if (this._mode === 'read' && this._inputFh) {
-            await this._inputFh.close();
-            this._inputFh = null;
-        }
-        else if (this._mode === null) {
+        finally {
             this._isPerformingIO = false;
-            throw new Error('slice is not open');
         }
-
-        this._releasePriorityHold();
-
-        this._mode = null;
-        this._isPerformingIO = false;
     }
 
     async commit(): Promise<void> {
@@ -311,13 +352,18 @@ export class Slice {
             throw new Error('slice busy');
 
         this._isPerformingIO = true;
-        await this._volume.commitTemporaryFile(this._fileName);
-        if (this._hasReservation)
-            this._volume.applyCommittedBytes(this._reservedBytes, this._size, this.sliceIndex < this.fileObject.dataSliceCount ? 'data' : 'parity');
-        this._isPerformingIO = false;
 
-        this._isCommitted = true;
-        this._mode = null;
+        try {
+            await this._volume.commitTemporaryFile(this._fileName);
+            if (this._hasReservation)
+                this._volume.applyCommittedBytes(this._reservedBytes, this._size, this.sliceIndex < this.fileObject.dataSliceCount ? 'data' : 'parity');
+
+            this._isCommitted = true;
+            this._mode = null;
+        }
+        finally {
+            this._isPerformingIO = false;
+        }
     }
 
     async delete(): Promise<void> {
@@ -327,27 +373,28 @@ export class Slice {
             await this._outputFh.close();
             this._outputFh = null;
         }
-        else if (this._mode === 'read') {
-            // nothing to do
-        }
 
         this._isPerformingIO = true;
-        const sliceType: 'data' | 'parity' = this.sliceIndex < this.fileObject.dataSliceCount ? 'data' : 'parity';
 
-        if (this._isCommitted) {
-            await this._volume.deleteCommittedFile(this._fileName);
-            this._volume.releaseCommittedBytes(this._size, sliceType);
+        try {
+            const sliceType: 'data' | 'parity' = this.sliceIndex < this.fileObject.dataSliceCount ? 'data' : 'parity';
+
+            if (this._isCommitted) {
+                await this._volume.deleteCommittedFile(this._fileName);
+                this._volume.releaseCommittedBytes(this._size, sliceType);
+            }
+            else {
+                await this._volume.deleteTemporaryFile(this._fileName);
+                if (this._hasReservation)
+                    this._volume.releaseReservation(this._reservedBytes);
+            }
+
+            this._releasePriorityHold();
+            this._mode = null;
         }
-        else {
-            await this._volume.deleteTemporaryFile(this._fileName);
-            if (this._hasReservation)
-                this._volume.releaseReservation(this._reservedBytes);
+        finally {
+            this._isPerformingIO = false;
         }
-        this._isPerformingIO = false;
-
-        this._releasePriorityHold();
-
-        this._mode = null;
     }
 
     markAsCommitted(): void {

@@ -340,4 +340,210 @@ describe('FuseServer', () => {
 
         expect(cb).toHaveBeenCalledWith(FUSE_ERRORS.EIO);
     });
+
+    it('serializes concurrent reads on the same file descriptor', async () => {
+        const server = await importServer();
+        const record = createFileRecord();
+        record.size = 16;
+        databaseMock.getObjectByPath.mockResolvedValue(record);
+        const openCb = vi.fn();
+        await server.fuse_open('/object', 0, openCb);
+        const fd = openCb.mock.calls[0][1] as number;
+        const fileObject = fileObjectInstances[0];
+
+        // Track the order of setReadRange calls to verify serialization
+        const setReadRangeCalls: Array<[number, number]> = [];
+        fileObject.setReadRange.mockImplementation((start: number, end: number) => {
+            setReadRangeCalls.push([start, end]);
+        });
+
+        // Implement a proper lock that actually serializes
+        let lockResolvers: Array<() => void> = [];
+        let lockHeld = false;
+        fileObject.acquireIOLock.mockImplementation(() => {
+            return new Promise<void>(resolve => {
+                if (!lockHeld) {
+                    lockHeld = true;
+                    resolve();
+                } else {
+                    lockResolvers.push(() => {
+                        lockHeld = true;
+                        resolve();
+                    });
+                }
+            });
+        });
+        fileObject.releaseIOLock.mockImplementation(() => {
+            lockHeld = false;
+            const next = lockResolvers.shift();
+            if (next) next();
+        });
+
+        const buffer1 = Buffer.alloc(8);
+        const buffer2 = Buffer.alloc(8);
+        const readCb1 = vi.fn();
+        const readCb2 = vi.fn();
+
+        // Start two concurrent reads
+        const read1Promise = server.fuse_read('/object', fd, buffer1, 8, 0, readCb1);
+        const read2Promise = server.fuse_read('/object', fd, buffer2, 8, 8, readCb2);
+
+        // First read should acquire lock immediately, second should wait
+        await new Promise(resolve => setImmediate(resolve));
+        expect(fileObject.acquireIOLock).toHaveBeenCalledTimes(2);
+        expect(setReadRangeCalls).toEqual([[0, 8]]); // Only first read's range set
+
+        // Complete first read - this releases lock and allows second read to proceed
+        fileObject.emit('data', Buffer.from('11111111'));
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Now second read should have proceeded
+        await new Promise(resolve => setImmediate(resolve));
+        expect(setReadRangeCalls).toEqual([[0, 8], [8, 16]]); // Second read's range now set
+
+        // Complete second read
+        fileObject.emit('data', Buffer.from('22222222'));
+        await Promise.all([read1Promise, read2Promise]);
+
+        expect(readCb1).toHaveBeenCalledWith(8);
+        expect(readCb2).toHaveBeenCalledWith(8);
+        expect(buffer1.toString()).toBe('11111111');
+        expect(buffer2.toString()).toBe('22222222');
+    });
+
+    it('does not remove other reads listeners when one read completes', async () => {
+        const server = await importServer();
+        const record = createFileRecord();
+        record.size = 16;
+        databaseMock.getObjectByPath.mockResolvedValue(record);
+        const openCb = vi.fn();
+        await server.fuse_open('/object', 0, openCb);
+        const fd = openCb.mock.calls[0][1] as number;
+        const fileObject = fileObjectInstances[0];
+
+        // Make acquireIOLock resolve immediately (no actual locking)
+        // This simulates what would happen if the lock wasn't working
+        let lockResolvers: Array<() => void> = [];
+        fileObject.acquireIOLock.mockImplementation(() => {
+            return new Promise<void>(resolve => {
+                lockResolvers.push(resolve);
+                // Resolve immediately to simulate concurrent access
+                resolve();
+            });
+        });
+
+        const buffer1 = Buffer.alloc(4);
+        const readCb1 = vi.fn();
+
+        // Start a read
+        server.fuse_read('/object', fd, buffer1, 4, 0, readCb1);
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Track listeners before and after
+        const listenerCountBefore = fileObject.listenerCount('data');
+        expect(listenerCountBefore).toBe(1);
+
+        // Complete the read
+        fileObject.emit('data', Buffer.from('1234'));
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Listener should be removed for this specific read
+        expect(fileObject.listenerCount('data')).toBe(0);
+        expect(readCb1).toHaveBeenCalledWith(4);
+    });
+
+    it('handles read errors without affecting other pending reads', async () => {
+        const server = await importServer();
+        const record = createFileRecord();
+        record.size = 16;
+        databaseMock.getObjectByPath.mockResolvedValue(record);
+        const openCb = vi.fn();
+        await server.fuse_open('/object', 0, openCb);
+        const fd = openCb.mock.calls[0][1] as number;
+        const fileObject = fileObjectInstances[0];
+
+        const buffer1 = Buffer.alloc(8);
+        const buffer2 = Buffer.alloc(8);
+        const readCb1 = vi.fn();
+        const readCb2 = vi.fn();
+
+        // Start first read
+        const read1Promise = server.fuse_read('/object', fd, buffer1, 8, 0, readCb1);
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Error on first read
+        fileObject.emit('error', new Error('read error'));
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(readCb1).toHaveBeenCalledWith(FUSE_ERRORS.EREMOTEIO);
+        expect(fileObject.releaseIOLock).toHaveBeenCalledTimes(1);
+
+        // Second read should still work (lock released, can acquire again)
+        const read2Promise = server.fuse_read('/object', fd, buffer2, 8, 8, readCb2);
+        await new Promise(resolve => setImmediate(resolve));
+
+        fileObject.emit('data', Buffer.from('22222222'));
+        await Promise.all([read1Promise, read2Promise]);
+
+        expect(readCb2).toHaveBeenCalledWith(8);
+        expect(buffer2.toString()).toBe('22222222');
+    });
+
+    it('does not double-callback if data arrives after completion', async () => {
+        const server = await importServer();
+        const record = createFileRecord();
+        record.size = 8;
+        databaseMock.getObjectByPath.mockResolvedValue(record);
+        const openCb = vi.fn();
+        await server.fuse_open('/object', 0, openCb);
+        const fd = openCb.mock.calls[0][1] as number;
+        const fileObject = fileObjectInstances[0];
+
+        const buffer = Buffer.alloc(8);
+        const readCb = vi.fn();
+
+        server.fuse_read('/object', fd, buffer, 8, 0, readCb);
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Complete the read
+        fileObject.emit('data', Buffer.from('12345678'));
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Callback should be called once
+        expect(readCb).toHaveBeenCalledTimes(1);
+        expect(readCb).toHaveBeenCalledWith(8);
+
+        // Listeners should be removed after completion
+        expect(fileObject.listenerCount('data')).toBe(0);
+        expect(fileObject.listenerCount('error')).toBe(0);
+    });
+
+    it('cleans up listeners on read error', async () => {
+        const server = await importServer();
+        const record = createFileRecord();
+        record.size = 8;
+        databaseMock.getObjectByPath.mockResolvedValue(record);
+        const openCb = vi.fn();
+        await server.fuse_open('/object', 0, openCb);
+        const fd = openCb.mock.calls[0][1] as number;
+        const fileObject = fileObjectInstances[0];
+
+        const buffer = Buffer.alloc(8);
+        const readCb = vi.fn();
+
+        server.fuse_read('/object', fd, buffer, 8, 0, readCb);
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(fileObject.listenerCount('data')).toBe(1);
+        expect(fileObject.listenerCount('error')).toBe(1);
+
+        // Emit error
+        fileObject.emit('error', new Error('boom'));
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Listeners should be cleaned up
+        expect(fileObject.listenerCount('data')).toBe(0);
+        expect(fileObject.listenerCount('error')).toBe(0);
+        expect(readCb).toHaveBeenCalledWith(FUSE_ERRORS.EREMOTEIO);
+    });
 });

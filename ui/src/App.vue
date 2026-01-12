@@ -410,7 +410,7 @@ onUnmounted(() => {
 <template>
   <div class="container">
     <header>
-      <h1>STRUBS Volumes</h1>
+      <h1>STRUBS</h1>
     </header>
     <div class="controls">
       <button @click="refreshDevices" :disabled="loading" class="refresh-btn">

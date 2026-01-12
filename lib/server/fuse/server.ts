@@ -79,6 +79,17 @@ export class FuseServer {
         if (!this.fuse)
             return;
 
+        // Close all open file objects before unmounting
+        for (const [fd, object] of Object.entries(this._fdCache)) {
+            try {
+                await object.close();
+            }
+            catch (err) {
+                log.error('failed to close file object during shutdown:', err);
+            }
+            delete this._fdCache[Number(fd)];
+        }
+
         await new Promise<void>((resolve, reject) => {
             this.fuse?.unmount(err => {
                 if (err) {
@@ -291,45 +302,58 @@ export class FuseServer {
 
         let isLocked = false;
         try {
+            // Hold the lock for the ENTIRE duration of the read operation
+            // This prevents concurrent reads from overwriting setReadRange
             await object.acquireIOLock();
             isLocked = true;
             object.setReadRange(position, endPosition);
 
-            let bufferOffset = 0;
-            let bytesRemaining = endPosition - position;
+            const bytesRead = await new Promise<number>((resolve, reject) => {
+                let bufferOffset = 0;
+                let bytesRemaining = endPosition - position;
+                let resolved = false;
 
-            const handleData = (data: Buffer): void => {
-                data.copy(buffer, bufferOffset, 0, data.length);
-                bufferOffset += data.length;
-                bytesRemaining -= data.length;
+                const handleData = (data: Buffer): void => {
+                    if (resolved) return;
+                    data.copy(buffer, bufferOffset, 0, data.length);
+                    bufferOffset += data.length;
+                    bytesRemaining -= data.length;
 
-                if (bytesRemaining <= 0) {
-                    object.removeAllListeners();
-                    if (isLocked)
-                        object.releaseIOLock();
-                    cb(bufferOffset);
-                }
-            };
+                    if (bytesRemaining <= 0) {
+                        resolved = true;
+                        cleanup();
+                        resolve(bufferOffset);
+                    }
+                };
 
-            const handleError = (err: Error): void => {
-                log('read error', path, fd, `@${position}`, `+${length}`, err);
-                object.removeAllListeners();
-                if (isLocked)
-                    object.releaseIOLock();
-                cb(Fuse.EREMOTEIO);
-            };
+                const handleError = (err: Error): void => {
+                    if (resolved) return;
+                    resolved = true;
+                    log('read error', path, fd, `@${position}`, `+${length}`, err);
+                    cleanup();
+                    reject(err);
+                };
 
-            object.on('data', handleData);
-            object.on('error', handleError);
+                // Use removeListener instead of removeAllListeners to only
+                // remove THIS read's handlers, not handlers from other reads
+                const cleanup = (): void => {
+                    object.removeListener('data', handleData);
+                    object.removeListener('error', handleError);
+                };
+
+                object.on('data', handleData);
+                object.on('error', handleError);
+            });
+
+            object.releaseIOLock();
+            cb(bytesRead);
         }
         catch (err) {
-            object.removeAllListeners();
             if (isLocked)
                 object.releaseIOLock();
-            cb(this._translateError(err));
+            // If lock acquisition failed, translate the error; otherwise return EREMOTEIO for read errors
+            cb(isLocked ? Fuse.EREMOTEIO : this._translateError(err));
         }
-
-        // cb(Fuse.EOPNOTSUPP);
     }
 
     // async fuse_write(path, fd, buffer, length, position, cb) {
@@ -341,13 +365,18 @@ export class FuseServer {
         log('release', path, fd);
 
         const object = this._fdCache[fd];
-        if (object)
-            await object.close();
-
         delete this._fdCache[fd];
 
+        if (object) {
+            try {
+                await object.close();
+            }
+            catch (err) {
+                log.error('failed to close file object:', err);
+            }
+        }
+
         cb(0);
-        // cb(Fuse.EOPNOTSUPP);
     }
 
     // async fuse_releasedir(path, fd, cb) {
