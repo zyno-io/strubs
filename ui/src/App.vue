@@ -29,6 +29,86 @@ const getApiBaseUrl = (): string => {
 
 const apiBaseUrl = getApiBaseUrl();
 
+// Verify job state
+interface VerifyStatus {
+  running: boolean;
+  startedAt: string | null;
+  objectsVerified: number;
+  errors: { total: number; volumes: Record<string, number> };
+  concurrency: number;
+}
+const verifyStatus = ref<VerifyStatus | null>(null);
+const verifyActionPending = ref<boolean>(false);
+const stopRequested = ref<boolean>(false);
+let verifyPollTimer: ReturnType<typeof setInterval> | null = null;
+
+// Poll the verify job status; tolerant of transient errors so polling continues
+async function fetchVerifyStatus(): Promise<void> {
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/verify-volumes`);
+    if (!res.ok) return;
+    verifyStatus.value = await res.json();
+    if (!verifyStatus.value?.running) stopRequested.value = false;
+  } catch {
+    // Ignore transient polling errors
+  }
+}
+
+// Start a full verify run
+async function startVerify(): Promise<void> {
+  if (verifyActionPending.value) return;
+  verifyActionPending.value = true;
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/verify-volumes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    if (!res.ok) {
+      let msg = `Failed to start verify (HTTP ${res.status})`;
+      try {
+        const text = await res.text();
+        if (text) msg += `: ${text}`;
+      } catch {
+        // Ignore error reading response body
+      }
+      throw new Error(msg);
+    }
+    await fetchVerifyStatus();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to start verify';
+  } finally {
+    verifyActionPending.value = false;
+  }
+}
+
+// Request the verify job to stop. The DELETE can be slow (or hang) while the
+// job drains in-flight I/O, so we don't block the UI on it — status polling
+// reflects the real running state. Button stays in "Stopping..." meanwhile.
+async function stopVerify(): Promise<void> {
+  if (stopRequested.value) return;
+  if (!confirm('Stop the running verify job?')) return;
+  stopRequested.value = true;
+  fetch(`${apiBaseUrl}/$/verify-volumes`, { method: 'DELETE' }).catch(() => {});
+}
+
+// Format an ISO timestamp for display
+function formatDateTime(iso: string | null): string {
+  if (!iso) return 'N/A';
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString();
+}
+
+// Per-volume verify error entries, sorted by descending count
+const verifyVolumeErrors = computed<Array<{ volumeId: string; count: number }>>(() => {
+  const volumes = verifyStatus.value?.errors?.volumes;
+  if (!volumes) return [];
+  return Object.entries(volumes)
+    .map(([volumeId, count]) => ({ volumeId, count }))
+    .filter(entry => entry.count > 0)
+    .sort((a, b) => b.count - a.count);
+});
+
 // Fetch data from APIs
 async function fetchData(): Promise<void> {
   try {
@@ -441,11 +521,15 @@ async function deleteVolume(): Promise<void> {
 
 onMounted(() => {
   fetchData();
+  fetchVerifyStatus();
+  // Keep the verify panel live without a manual refresh
+  verifyPollTimer = setInterval(fetchVerifyStatus, 3000);
   // Close context menu on click anywhere
   document.addEventListener('click', hideContextMenu);
 });
 
 onUnmounted(() => {
+  if (verifyPollTimer !== null) clearInterval(verifyPollTimer);
   document.removeEventListener('click', hideContextMenu);
 });
 </script>
@@ -463,6 +547,67 @@ onUnmounted(() => {
         + Add Volume
       </button>
     </div>
+
+    <!-- Verify Job Panel -->
+    <section class="section verify-panel">
+      <div class="verify-header">
+        <div class="verify-title">
+          <h2>Verify</h2>
+          <span
+            class="verify-state"
+            :class="verifyStatus?.running ? 'running' : 'idle'"
+          >
+            {{ verifyStatus?.running ? 'Running' : 'Idle' }}
+          </span>
+        </div>
+        <div class="verify-actions">
+          <button
+            @click="startVerify"
+            :disabled="verifyStatus?.running || verifyActionPending"
+            class="verify-start-btn"
+          >
+            {{ verifyActionPending ? 'Starting...' : 'Start Verify' }}
+          </button>
+          <button
+            @click="stopVerify"
+            :disabled="!verifyStatus?.running || stopRequested"
+            class="verify-stop-btn"
+          >
+            {{ stopRequested ? 'Stopping...' : 'Stop' }}
+          </button>
+        </div>
+      </div>
+      <div class="verify-stats">
+        <div class="verify-stat">
+          <span class="verify-stat-label">Started</span>
+          <span class="verify-stat-value">{{ formatDateTime(verifyStatus?.startedAt ?? null) }}</span>
+        </div>
+        <div class="verify-stat">
+          <span class="verify-stat-label">Objects Verified</span>
+          <span class="verify-stat-value">{{ (verifyStatus?.objectsVerified ?? 0).toLocaleString() }}</span>
+        </div>
+        <div class="verify-stat">
+          <span class="verify-stat-label">Total Errors</span>
+          <span class="verify-stat-value" :class="{ 'error-text': (verifyStatus?.errors?.total ?? 0) > 0 }">
+            {{ (verifyStatus?.errors?.total ?? 0).toLocaleString() }}
+          </span>
+        </div>
+        <div class="verify-stat">
+          <span class="verify-stat-label">Concurrency</span>
+          <span class="verify-stat-value">{{ verifyStatus?.concurrency ?? 0 }}</span>
+        </div>
+      </div>
+      <div v-if="verifyVolumeErrors.length > 0" class="verify-volume-errors">
+        <span class="verify-stat-label">Errors by volume:</span>
+        <span
+          v-for="entry in verifyVolumeErrors"
+          :key="entry.volumeId"
+          class="verify-volume-badge"
+        >
+          vol {{ entry.volumeId }}: {{ entry.count.toLocaleString() }}
+        </span>
+      </div>
+    </section>
 
     <div v-if="error" class="error">
       Error: {{ error }}
@@ -950,6 +1095,131 @@ h2 {
 .error-text {
   color: #f44336;
   font-weight: 700;
+}
+
+/* Verify Panel */
+.verify-panel {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 20px;
+  background-color: #fafafa;
+  box-sizing: border-box;
+}
+
+.verify-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.verify-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.verify-title h2 {
+  margin-bottom: 0;
+}
+
+.verify-state {
+  padding: 3px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 700;
+  color: white;
+}
+
+.verify-state.running {
+  background-color: #4caf50;
+}
+
+.verify-state.idle {
+  background-color: #9e9e9e;
+}
+
+.verify-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.verify-start-btn, .verify-stop-btn {
+  padding: 6px 14px;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.verify-start-btn {
+  background-color: #4caf50;
+}
+
+.verify-start-btn:hover:not(:disabled) {
+  background-color: #45a049;
+}
+
+.verify-stop-btn {
+  background-color: #f44336;
+}
+
+.verify-stop-btn:hover:not(:disabled) {
+  background-color: #d32f2f;
+}
+
+.verify-start-btn:disabled, .verify-stop-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.verify-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.verify-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.verify-stat-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.verify-stat-value {
+  font-size: 16px;
+  color: #333;
+  font-weight: 600;
+}
+
+.verify-volume-errors {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #eee;
+}
+
+.verify-volume-badge {
+  background-color: #ffebee;
+  color: #c62828;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 /* Modal Styles */

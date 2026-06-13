@@ -50,6 +50,21 @@ const defaultDeps: VerifyVolumesJobDeps = {
 
 const VERIFY_BATCH_SIZE = 25;
 const VERIFY_VOLUME_IDS_KEY = 'verifyVolumeIds';
+// How long stop() waits for the run to drain in-flight work before giving up.
+// A read against a failing drive can wedge in the kernel (its libuv threadpool
+// thread never returns), so a cooperative cancel may never complete. After this
+// we abandon the run so the API responds and a fresh run can start.
+const STOP_DRAIN_TIMEOUT_MS = 10000;
+
+// Per-run mutable state. Holding cancellation, the volume read coordinator and
+// run identity on a handle (rather than on the job) means an abandoned/"zombie"
+// run that is still blocked on stuck disk I/O cannot interfere with a later run
+// that reuses the same job instance.
+interface ActiveRun {
+    token: number;
+    cancelled: boolean;
+    coordinator: VolumeReadCoordinator;
+}
 const envConcurrency = process.env.STRUBS_VERIFY_PARALLEL ? Number.parseInt(process.env.STRUBS_VERIFY_PARALLEL, 10) : NaN;
 const cpuCount = os.cpus?.().length ?? 1;
 
@@ -123,9 +138,9 @@ class LaneAllocator {
 export class VerifyVolumesJob {
     private readonly deps: VerifyVolumesJobDeps;
     private readonly log: ReturnType<typeof createLogger>;
-    private readonly volumeCoordinator = new VolumeReadCoordinator();
     private running: Promise<void> | null = null;
-    private cancelRequested = false;
+    private activeRun: ActiveRun | null = null;
+    private runToken = 0;
     private startedAt: string | null = null;
     private volumeFilter: Set<number> | null = null;
     private targetedCursor: string | null = null;
@@ -196,15 +211,59 @@ export class VerifyVolumesJob {
 
     async stop(options?: { preserveState?: boolean }): Promise<void> {
         const running = this.running;
-        if (!running)
+        const run = this.activeRun;
+        if (!running || !run)
             return;
         this.log('stop requested');
-        this.cancelRequested = true;
-        await running;
+        run.cancelled = true;
+
+        const drained = await this.awaitWithTimeout(running, STOP_DRAIN_TIMEOUT_MS);
+        if (!drained && this.activeRun === run) {
+            // The run is wedged — almost certainly an in-flight read against a
+            // failing drive that won't return (its libuv threadpool thread is
+            // stuck in the kernel; the slice-level read timeout rejects the JS
+            // promise but cannot cancel the syscall). Abandon it so the API
+            // returns and a new run can start. The zombie keeps its own
+            // ActiveRun handle, so when its stuck I/O eventually returns it
+            // exits quietly without touching this job's state.
+            this.log.error(
+                'verify job did not drain within %dms after stop; abandoning wedged run (in-flight disk I/O may still be pending)',
+                STOP_DRAIN_TIMEOUT_MS
+            );
+            this.stopProgressLogger();
+            this.activeRun = null;
+            this.running = null;
+            this.startedAt = null;
+            this.currentConcurrency = 0;
+            this.volumeFilter = null;
+            this.targetedCursor = null;
+        }
+
         if (!options?.preserveState) {
             await this.deps.runtimeConfig.delete('verifyStartedAt');
             await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
         }
+    }
+
+    // Resolve true if the promise settles within the window, false on timeout.
+    private awaitWithTimeout(promise: Promise<void>, ms: number): Promise<boolean> {
+        return new Promise<boolean>(resolve => {
+            let settled = false;
+            const timer = setTimeout(() => {
+                if (settled)
+                    return;
+                settled = true;
+                resolve(false);
+            }, ms);
+            timer.unref?.();
+            promise.then(() => undefined, () => undefined).then(() => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(true);
+            });
+        });
     }
 
     isRunning(): boolean {
@@ -234,19 +293,24 @@ export class VerifyVolumesJob {
             this.log('starting verification (resume) at %s', startedAt);
         else
             this.log('starting verification at %s', startedAt);
-        this.cancelRequested = false;
+        const run: ActiveRun = { token: ++this.runToken, cancelled: false, coordinator: new VolumeReadCoordinator() };
+        this.activeRun = run;
         this.progress.objectsVerified = initialObjectsVerified;
         this.progress.errors = { total: 0, volumes: {} };
         this.startProgressLogger();
-        this.running = this.execute(startedAt, isResume, concurrency)
+        this.running = this.execute(run, startedAt, isResume, concurrency)
             .catch(err => {
                 this.log.error('verify job failed', err);
             })
             .finally(() => {
+                // If this run was abandoned (stop() timed out) or superseded,
+                // another run now owns the job state — don't clobber it.
+                if (this.activeRun !== run)
+                    return;
                 this.stopProgressLogger();
                 this.startedAt = null;
                 this.running = null;
-                this.cancelRequested = false;
+                this.activeRun = null;
                 this.currentConcurrency = 0;
                 this.volumeFilter = null;
                 this.targetedCursor = null;
@@ -275,7 +339,7 @@ export class VerifyVolumesJob {
         }
     }
 
-    private async execute(startedAt: string, isResume: boolean, concurrency: number): Promise<void> {
+    private async execute(run: ActiveRun, startedAt: string, isResume: boolean, concurrency: number): Promise<void> {
         const startedAtDate = new Date(startedAt);
         if (!Number.isFinite(startedAtDate.getTime()))
             throw new Error('invalid verify start time');
@@ -288,7 +352,7 @@ export class VerifyVolumesJob {
         let completed = false;
 
         try {
-            while (!this.cancelRequested) {
+            while (!run.cancelled) {
                 const batch = await this.fetchBatch(startedAtDate);
                 if (!batch.length) {
                     completed = true;
@@ -300,21 +364,25 @@ export class VerifyVolumesJob {
                 const laneAllocator = new LaneAllocator(concurrency);
 
                 const taskPromises = batch.map(record => queue.add(async () => {
-                    if (this.cancelRequested || interrupted)
+                    if (run.cancelled || interrupted)
                         return;
                     const lane = await laneAllocator.acquire();
                     try {
-                        const result = await this.verifyObject(record, startedAtDate, lane);
+                        const result = await this.verifyObject(run, record, startedAtDate, lane);
                         if (!result) {
                             interrupted = true;
                             queue.clear();
                             return;
                         }
-                        this.progress.objectsVerified++;
                         checksumErrors += result.checksumErrors;
                         totalErrors += result.totalErrors;
                         await this.mergeVolumeResults(volumeCounts, result.volumeImpacts);
-                        this.logProgress(totalErrors, volumeCounts);
+                        // Only publish to the shared status if we still own the
+                        // job — a zombie task must not bump a later run's counter.
+                        if (this.activeRun === run) {
+                            this.progress.objectsVerified++;
+                            this.logProgress(totalErrors, volumeCounts);
+                        }
                     }
                     finally {
                         laneAllocator.release(lane);
@@ -326,13 +394,15 @@ export class VerifyVolumesJob {
                 if (rejectedTask?.status === 'rejected')
                     throw rejectedTask.reason;
 
-                if (this.cancelRequested || interrupted)
+                if (run.cancelled || interrupted)
                     break;
             }
         }
         finally {
-            this.currentConcurrency = 0;
-            const shouldFinalize = completed && !this.cancelRequested;
+            // A superseded/abandoned run must not touch shared state or persisted config.
+            if (this.activeRun === run)
+                this.currentConcurrency = 0;
+            const shouldFinalize = completed && !run.cancelled && this.activeRun === run;
             if (shouldFinalize) {
                 await this.deps.runtimeConfig.delete('verifyStartedAt');
                 await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
@@ -383,9 +453,9 @@ export class VerifyVolumesJob {
         return objects as StoredObjectRecord[];
     }
 
-    private async verifyObject(record: StoredObjectRecord, startedAt: Date, lane?: number): Promise<VerifyVolumesObjectResult | null> {
+    private async verifyObject(run: ActiveRun, record: StoredObjectRecord, startedAt: Date, lane?: number): Promise<VerifyVolumesObjectResult | null> {
         try {
-            if (this.cancelRequested)
+            if (run.cancelled)
                 return null;
 
             const requestId = typeof lane === 'number' ? `verify:${lane}` : 'verify';
@@ -401,13 +471,13 @@ export class VerifyVolumesJob {
             const processedSliceKeys = new Set<string>();
 
             for (let sliceIndex = 0; sliceIndex < totalSlices; sliceIndex++) {
-                if (this.cancelRequested)
+                if (run.cancelled)
                     return null;
                 const descriptor = this.describeSlice(record, sliceIndex);
                 if (!this.shouldVerifyVolume(descriptor.volumeId))
                     continue;
-                const releaseLock = await this.acquireVolumeLock(descriptor.volumeId);
-                if (this.cancelRequested) {
+                const releaseLock = await this.acquireVolumeLock(run, descriptor.volumeId);
+                if (run.cancelled) {
                     releaseLock?.();
                     return null;
                 }
@@ -418,7 +488,7 @@ export class VerifyVolumesJob {
                 }
                 catch (err) {
                     if (this.isIOAbortError(err)) {
-                        this.cancelRequested = true;
+                        run.cancelled = true;
                         this.log('object %s verification aborted due to I/O shutdown', record.id);
                         return null;
                     }
@@ -456,7 +526,7 @@ export class VerifyVolumesJob {
                 }
             }
 
-            if (this.cancelRequested)
+            if (run.cancelled)
                 return null;
             if (!processedSlices)
                 return {
@@ -478,7 +548,7 @@ export class VerifyVolumesJob {
         }
         catch (err) {
             if (this.isIOAbortError(err)) {
-                this.cancelRequested = true;
+                run.cancelled = true;
                 this.log('object %s verification aborted due to I/O shutdown', record.id);
                 return null;
             }
@@ -585,15 +655,25 @@ export class VerifyVolumesJob {
         });
     }
 
-    private async acquireVolumeLock(volumeId: number | null | undefined): Promise<(() => void) | null> {
+    private async acquireVolumeLock(run: ActiveRun, volumeId: number | null | undefined): Promise<(() => void) | null> {
         if (volumeId === null || volumeId === undefined)
             return null;
-        if (this.cancelRequested)
+        if (run.cancelled)
             return null;
-        return this.volumeCoordinator.acquire(volumeId);
+        return run.coordinator.acquire(volumeId);
     }
 
     private shouldVerifyVolume(volumeId: number | null | undefined): boolean {
+        // Never issue reads to a drive the system has taken out of service or
+        // flagged unhealthy. Reads against a failing drive can wedge in the
+        // kernel and exhaust the libuv threadpool, freezing the whole job (and
+        // its stop()). The health monitor degrades bad drives to
+        // isHealthy=false (and read-only); skip those here.
+        if (typeof volumeId === 'number') {
+            const volume = this.deps.ioManager.getVolume(volumeId) as Volume | undefined;
+            if (volume && (volume.isReadable === false || volume.isHealthy === false))
+                return false;
+        }
         if (!this.volumeFilter)
             return true;
         if (volumeId === null || volumeId === undefined)
