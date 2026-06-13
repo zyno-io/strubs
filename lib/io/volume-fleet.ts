@@ -216,7 +216,7 @@ export class VolumeFleet {
         return volume;
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; label?: string | null }, devices: CachedDevice[]): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null }, devices: CachedDevice[]): Promise<void> {
         const config = this._volumeConfig.find(cfg => cfg.id === id);
         if (!config)
             throw new Error('volume configuration not found');
@@ -235,6 +235,11 @@ export class VolumeFleet {
         if (changes.isReadOnly !== undefined) {
             config.read_only = changes.isReadOnly;
             volume?.setReadOnly(changes.isReadOnly);
+        }
+
+        if (changes.isHealthy !== undefined) {
+            config.healthy = changes.isHealthy;
+            volume?.setHealthy(changes.isHealthy);
         }
 
         if (changes.label !== undefined) {

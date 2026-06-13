@@ -19,6 +19,14 @@ interface SliceChecksumError extends Error {
     volumeId: number;
 }
 
+interface SliceErrorContext {
+    code?: string;
+    objectId?: string;
+    sliceIndex?: number;
+    volumeId?: number;
+    fileName?: string;
+}
+
 export class Slice {
     private readonly fileObject: FileObject;
     private readonly ioClass: Base;
@@ -189,26 +197,33 @@ export class Slice {
 
             try {
                 await this._ensurePriorityWindow();
-                await this._withTimeout(
+                const headerRead = await this._withTimeout(
                     () => inputFh.read(this._readBuf as Buffer, 0, constants.FILE_HEADER_SIZE),
                     30000,
                     'read slice header'
                 );
+                if (headerRead.bytesRead !== constants.FILE_HEADER_SIZE)
+                    throw new Error(`short read on slice header: ${headerRead.bytesRead}/${constants.FILE_HEADER_SIZE}`);
+                this._validateHeader(this._readBuf as Buffer);
             } catch (err) {
                 // Release priority hold on error to prevent deadlock
                 this._releasePriorityHold();
                 await this._cleanupInputHandle();
 
-                const throwErr = new Error('failed to read slice header') as Error & { cause?: unknown; fileName?: string; volumeId?: number };
+                const throwErr = new Error('failed to read slice header') as Error & { cause?: unknown };
                 throwErr.cause = err;
-                throwErr.fileName = this._fileName;
-                throwErr.volumeId = this._volumeId;
-                throw throwErr;
+                const code = (err as { code?: string } | undefined)?.code ?? 'EOPEN';
+                throw this._decorateError(throwErr, code);
             }
 
             this._cursorOffset = constants.FILE_HEADER_SIZE;
             this._mode = 'read';
             this._isCommitted = true;
+        }
+        catch (err) {
+            // Covers raw openCommittedFh() rejections that bypass the inner
+            // header-read catch; existing codes (ETIMEOUT/IOABORT/native) win.
+            throw this._decorateError(err, 'EOPEN');
         }
         finally {
             this._isPerformingIO = false;
@@ -250,11 +265,16 @@ export class Slice {
                 throw new Error('input file handle is not initialized');
 
             await this._ensurePriorityWindow();
-            await this._withTimeout(
+            const chunkRead = await this._withTimeout(
                 () => inputFh.read(readBuf, 0, readLen, this._cursorOffset),
                 30000,
                 'read slice chunk'
             );
+            // A short read would leave stale bytes from a prior chunk in the
+            // reused buffer, which could pass the checksum and return wrong data
+            // (and silently corrupt RS reconstruction). Treat it as an I/O error.
+            if (chunkRead.bytesRead !== readLen)
+                throw new Error(`short read on slice chunk: ${chunkRead.bytesRead}/${readLen}`);
 
             await hash(constants.CHUNK_HEADER_ALGO, readBuf, constants.CHUNK_HEADER_SIZE, readDataLen, hashBuf, 0);
 
@@ -264,6 +284,9 @@ export class Slice {
             this._cursorOffset += readLen;
 
             return readBuf.slice(constants.CHUNK_HEADER_SIZE, readLen);
+        }
+        catch (err) {
+            throw this._decorateError(err, 'EIO');
         }
         finally {
             this._isPerformingIO = false;
@@ -284,9 +307,12 @@ export class Slice {
             const timeoutPromise = new Promise<never>((_resolve, reject) => {
                 timer = setTimeout(() => {
                     timedOut = true;
-                    const err = new Error(`slice ${context} timed out after ${timeoutMs}ms`) as Error & { code?: string; volumeId?: number };
+                    const err = new Error(`slice ${context} timed out after ${timeoutMs}ms`) as Error & SliceErrorContext;
                     err.code = 'ETIMEOUT';
+                    err.objectId = this.fileObject.id ?? undefined;
+                    err.sliceIndex = this.sliceIndex;
                     err.volumeId = this._volumeId;
+                    err.fileName = this._fileName;
                     reject(err);
                 }, timeoutMs);
             });
@@ -475,6 +501,42 @@ export class Slice {
             if (waited >= maxWaitMs)
                 throw new Error(`slice timeout waiting for idle during ${context}`);
         }
+    }
+
+    // Ensure every error leaving a slice carries enough context for the
+    // remediation pipeline to attribute it to a specific object/slice/volume.
+    // Existing fields are preserved; only missing fields (and a fallback code)
+    // are filled in, so this is safe to apply more than once.
+    private _decorateError(err: unknown, fallbackCode?: string): Error & SliceErrorContext {
+        const error = (err instanceof Error ? err : new Error(String(err))) as Error & SliceErrorContext;
+        if (error.objectId === undefined && this.fileObject.id)
+            error.objectId = this.fileObject.id;
+        if (error.sliceIndex === undefined)
+            error.sliceIndex = this.sliceIndex;
+        if (error.volumeId === undefined)
+            error.volumeId = this._volumeId;
+        if (error.fileName === undefined)
+            error.fileName = this._fileName;
+        if (error.code === undefined && fallbackCode !== undefined)
+            error.code = fallbackCode;
+        return error;
+    }
+
+    // Validate the on-disk slice header against this object/slice so a stale or
+    // misplaced slice file can never be accepted as a (silently wrong) source
+    // for reconstruction. Field offsets mirror create().
+    private _validateHeader(buf: Buffer): void {
+        const idBuf = this.fileObject.idBuf;
+        if (!idBuf || !buf.subarray(23, 35).equals(idBuf))
+            throw new Error('slice header object id mismatch');
+        if (buf.readUInt8(40) !== this.fileObject.dataSliceCount)
+            throw new Error('slice header data slice count mismatch');
+        if (buf.readUInt8(41) !== this.fileObject.paritySliceCount)
+            throw new Error('slice header parity slice count mismatch');
+        if (buf.readUInt8(42) !== this.sliceIndex)
+            throw new Error('slice header slice index mismatch');
+        if (buf.readIntLE(43, 3) !== this.fileObject.chunkSize)
+            throw new Error('slice header chunk size mismatch');
     }
 
     private throwChecksumError(): never {

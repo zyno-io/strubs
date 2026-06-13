@@ -18,6 +18,7 @@ const createLoggerFactory = () => {
 const createDeps = () => {
     const database = {
         findObjectsNeedingVerification: vi.fn(),
+        findObjectsOnVolumes: vi.fn().mockResolvedValue([]),
         updateObjectVerificationState: vi.fn().mockResolvedValue(undefined),
         setVolumeVerifyErrors: vi.fn().mockResolvedValue(undefined),
         countObjectsVerifiedSince: vi.fn().mockResolvedValue(0)
@@ -37,13 +38,18 @@ const createDeps = () => {
         getVolume: vi.fn((id: number) => (id === 1 ? volumeStub1 : volumeStub2))
     };
 
+    const remediationService = {
+        reportSliceFault: vi.fn()
+    };
+
     return {
         database,
         runtimeConfig,
         fileObjectService,
         ioManager,
         createLogger: createLoggerFactory(),
-        createSliceVerifier: vi.fn()
+        createSliceVerifier: vi.fn(),
+        remediationService
     };
 };
 
@@ -226,6 +232,53 @@ describe('VerifyVolumesJob', () => {
         }));
     });
 
+    it('reports detected slice faults to the remediation pipeline', async () => {
+        const deps = createDeps();
+        const record = {
+            id: 'fault-obj',
+            size: 1,
+            dataVolumes: [1],
+            parityVolumes: [],
+            chunkSize: 1,
+            dataSliceVolumeIds: [1],
+            paritySliceVolumeIds: [],
+            unavailableSlices: [],
+            damagedSlices: [],
+            isFile: true,
+            name: 'file',
+            md5: null
+        };
+
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+        deps.database.findObjectsNeedingVerification
+            .mockResolvedValueOnce([record])
+            .mockResolvedValueOnce([]);
+
+        const checksumError = Object.assign(new Error('checksum mismatch'), {
+            code: 'ECHECKSUM',
+            sliceIndex: 0,
+            volumeId: 1
+        });
+        deps.fileObjectService.load.mockResolvedValue({} as any);
+        deps.createSliceVerifier.mockReturnValue({ verifySlice: vi.fn().mockRejectedValue(checksumError) });
+
+        const job = new VerifyVolumesJob(deps);
+        await job.start();
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        expect(deps.remediationService.reportSliceFault).toHaveBeenCalledTimes(1);
+        expect(deps.remediationService.reportSliceFault).toHaveBeenCalledWith(expect.objectContaining({
+            objectId: 'fault-obj',
+            sliceIndex: 0,
+            volumeId: 1,
+            source: 'verify',
+            code: 'ECHECKSUM',
+            isChecksum: true
+        }));
+    });
+
     it('continues verifying remaining slices and parity volumes', async () => {
         const deps = createDeps();
         const record = {
@@ -330,6 +383,75 @@ describe('VerifyVolumesJob', () => {
         expect(deleteKeys).toContain('verifyVolumeIds');
     });
 
+    it('preserves pending resume state when fetching a batch fails', async () => {
+        const deps = createDeps();
+        const fetchFailure = new Error('database unavailable');
+
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+        deps.database.findObjectsNeedingVerification.mockRejectedValueOnce(fetchFailure);
+
+        const job = new VerifyVolumesJob(deps);
+        const { startedAt } = await job.start();
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('verifyStartedAt', startedAt);
+        expect(deps.runtimeConfig.set).not.toHaveBeenCalledWith('lastVerify', expect.anything());
+        const deleteKeys = deps.runtimeConfig.delete.mock.calls.map(call => call[0]);
+        expect(deleteKeys).not.toContain('verifyStartedAt');
+    });
+
+    it('preserves pending resume state when a verification task fails outside object verification', async () => {
+        const deps = createDeps();
+        const record = {
+            id: 'counter-fail',
+            size: 1,
+            dataVolumes: [1],
+            parityVolumes: [],
+            chunkSize: 1,
+            dataSliceVolumeIds: [1],
+            paritySliceVolumeIds: [],
+            unavailableSlices: [],
+            damagedSlices: [],
+            isFile: true,
+            name: 'file',
+            md5: null
+        };
+
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+        deps.database.findObjectsNeedingVerification
+            .mockResolvedValueOnce([record])
+            .mockResolvedValueOnce([]);
+        deps.database.setVolumeVerifyErrors
+            .mockResolvedValueOnce(undefined)
+            .mockResolvedValueOnce(undefined)
+            .mockRejectedValueOnce(new Error('counter write failed'));
+
+        const checksumError = Object.assign(new Error('checksum mismatch'), {
+            code: 'ECHECKSUM',
+            sliceIndex: 0,
+            volumeId: 1
+        });
+        deps.fileObjectService.load.mockResolvedValue({} as any);
+        deps.createSliceVerifier.mockReturnValue({ verifySlice: vi.fn().mockRejectedValue(checksumError) });
+
+        const job = new VerifyVolumesJob(deps);
+        const { startedAt } = await job.start();
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
+            lastVerifiedAt: new Date(startedAt),
+            sliceErrors: { '0': { checksum: true, type: 'data' } }
+        });
+        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('verifyStartedAt', startedAt);
+        expect(deps.runtimeConfig.set).not.toHaveBeenCalledWith('lastVerify', expect.anything());
+        const deleteKeys = deps.runtimeConfig.delete.mock.calls.map(call => call[0]);
+        expect(deleteKeys).not.toContain('verifyStartedAt');
+    });
+
     it('cleans up pending resume state when the job is stopped', async () => {
         const deps = createDeps();
         deps.runtimeConfig.get.mockResolvedValueOnce(null);
@@ -393,7 +515,7 @@ describe('VerifyVolumesJob', () => {
         };
 
         deps.runtimeConfig.get.mockResolvedValueOnce(null);
-        deps.database.findObjectsNeedingVerification
+        deps.database.findObjectsOnVolumes
             .mockResolvedValueOnce([record])
             .mockResolvedValueOnce([]);
 
@@ -410,16 +532,65 @@ describe('VerifyVolumesJob', () => {
         expect(verifySlice).toHaveBeenCalledTimes(2);
         expect(verifySlice).toHaveBeenNthCalledWith(1, 1);
         expect(verifySlice).toHaveBeenNthCalledWith(2, 2);
+        // Targeted runs record slice errors but must NOT advance the rolling
+        // scrub watermark (lastVerifiedAt), so the scrub still covers all slices.
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
-            lastVerifiedAt: new Date(startedAt),
             sliceErrors: null
         });
-        expect(deps.database.findObjectsNeedingVerification).toHaveBeenNthCalledWith(1, expect.any(Date), 25, [2]);
+        expect(deps.database.updateObjectVerificationState).not.toHaveBeenCalledWith(record.id, expect.objectContaining({
+            lastVerifiedAt: expect.anything()
+        }));
+        // Targeted runs paginate by _id cursor, not the lastVerifiedAt watermark.
+        expect(deps.database.findObjectsOnVolumes).toHaveBeenNthCalledWith(1, null, 25, [2]);
+        expect(deps.database.findObjectsOnVolumes).toHaveBeenNthCalledWith(2, 'vol-filter', 25, [2]);
+        expect(deps.database.findObjectsNeedingVerification).not.toHaveBeenCalled();
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenCalledTimes(1);
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(1, 2, { checksum: 0, total: 0 });
         expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(1, 'verifyVolumeIds', [2]);
         expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(2, 'verifyStartedAt', startedAt);
+        expect(deps.runtimeConfig.set).not.toHaveBeenCalledWith('lastVerify', expect.anything());
         expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds']));
+    });
+
+    it('preserves unrelated slice errors during targeted verification', async () => {
+        const deps = createDeps();
+        const existingError = { err: 'existing failure on another volume', type: 'data' as const };
+        const record = {
+            id: 'target-preserve',
+            size: 1,
+            dataVolumes: [1, 2],
+            parityVolumes: [3],
+            chunkSize: 1,
+            dataSliceVolumeIds: [1, 2],
+            paritySliceVolumeIds: [3],
+            unavailableSlices: [],
+            damagedSlices: [],
+            sliceErrors: {
+                '0': existingError,
+                '1': { err: 'old error on target volume', type: 'data' as const }
+            },
+            isFile: true,
+            name: 'file',
+            md5: null
+        };
+
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+        deps.database.findObjectsOnVolumes
+            .mockResolvedValueOnce([record])
+            .mockResolvedValueOnce([]);
+
+        deps.fileObjectService.load.mockResolvedValue({} as any);
+        deps.createSliceVerifier.mockReturnValue({ verifySlice: vi.fn().mockResolvedValue(undefined) });
+
+        const job = new VerifyVolumesJob(deps);
+        await job.start({ volumeIds: [2] });
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
+            sliceErrors: { '0': existingError }
+        });
     });
 
     it('reports current concurrency via status', async () => {

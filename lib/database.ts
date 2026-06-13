@@ -7,8 +7,10 @@ import { ContainerCache } from './database/container-cache';
 import { ContentRepository } from './database/content-repository';
 import { VolumeRepository, type VolumeVerifyErrors } from './database/volume-repository';
 import { RuntimeConfigRepository } from './database/runtime-config';
+import { FaultRepository, type FaultDocument, type FaultUpsert } from './database/fault-repository';
 import type { ContainerPath, ContentDocument, ObjectIdentifier, SliceErrorInfo } from './database/types';
 export type { ContentDocument, SliceErrorInfo } from './database/types';
+export type { FaultDocument, FaultUpsert } from './database/fault-repository';
 
 const log = createLogger('database');
 
@@ -19,20 +21,24 @@ export class Database {
         volumes: Collection<any> | null;
         content: Collection<ContentDocument> | null;
         runtimeConfig: Collection<{ key: string; value: unknown }> | null;
+        faults: Collection<FaultDocument> | null;
     } = {
         volumes: null,
         content: null,
-        runtimeConfig: null
+        runtimeConfig: null,
+        faults: null
     };
     private readonly _containerCache = new ContainerCache();
     private _repositories: {
         volumes: VolumeRepository | null;
         content: ContentRepository | null;
         runtimeConfig: RuntimeConfigRepository | null;
+        faults: FaultRepository | null;
     } = {
         volumes: null,
         content: null,
-        runtimeConfig: null
+        runtimeConfig: null,
+        faults: null
     };
 
     constructor() {
@@ -50,6 +56,7 @@ export class Database {
             this._collections.volumes = this._db.collection('volumes');
             this._collections.content = this._db.collection('content');
             this._collections.runtimeConfig = this._db.collection('runtimeConfig');
+            this._collections.faults = this._db.collection('faults');
             this._repositories = {
                 volumes: new VolumeRepository(this._collections.volumes),
                 content: new ContentRepository(
@@ -58,9 +65,11 @@ export class Database {
                     this._normalizeObject.bind(this),
                     this.getMongoId.bind(this)
                 ),
-                runtimeConfig: new RuntimeConfigRepository(this._collections.runtimeConfig)
+                runtimeConfig: new RuntimeConfigRepository(this._collections.runtimeConfig),
+                faults: new FaultRepository(this._collections.faults)
             };
             await this.ensureContentIndexes();
+            await this.ensureFaultIndexes();
 
             log('connected');
         }
@@ -81,7 +90,7 @@ export class Database {
         await this.volumeRepository.softDeleteVolume(id);
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; label?: string | null }): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null }): Promise<void> {
         await this.volumeRepository.updateVolumeFlags(id, changes);
     }
 
@@ -131,6 +140,10 @@ export class Database {
         return this.contentRepository.findObjectsNeedingVerification(startedAt, limit, volumeIds);
     }
 
+    async findObjectsOnVolumes(afterId: ObjectIdentifier, limit: number, volumeIds: number[]): Promise<ContentDocument[]> {
+        return this.contentRepository.findObjectsOnVolumes(afterId, limit, volumeIds);
+    }
+
     async countObjectsVerifiedSince(startedAt: Date, volumeIds?: number[]): Promise<number> {
         return this.contentRepository.countObjectsVerifiedSince(startedAt, volumeIds);
     }
@@ -140,6 +153,18 @@ export class Database {
         updates: { lastVerifiedAt?: Date; sliceErrors?: Record<string, SliceErrorInfo> | null }
     ): Promise<void> {
         await this.contentRepository.updateObjectVerificationState(id, updates);
+    }
+
+    async upsertFault(fault: FaultUpsert): Promise<void> {
+        await this.faultRepository.upsert(fault);
+    }
+
+    async listFaults(): Promise<FaultDocument[]> {
+        return this.faultRepository.list();
+    }
+
+    async deleteFault(key: string): Promise<void> {
+        await this.faultRepository.delete(key);
     }
 
     async getContainer(path: ContainerPath, shouldCreateIfNotExists = false): Promise<string | null> {
@@ -179,11 +204,26 @@ export class Database {
                 { key: { containerId: 1, name: 1 }, name: 'containerContents', unique: true },
                 { key: { containerId: 1 }, name: 'containerId' },
                 { key: { lastVerifiedAt: 1 }, name: 'lastVerifiedAt' },
-                { key: { sliceErrors: 1 }, name: 'sliceErrors', sparse: true }
+                { key: { sliceErrors: 1 }, name: 'sliceErrors', sparse: true },
+                { key: { dataVolumes: 1 }, name: 'dataVolumes', sparse: true },
+                { key: { parityVolumes: 1 }, name: 'parityVolumes', sparse: true }
             ]);
         }
         catch (err) {
             log.error('failed to ensure content indexes', err);
+            throw err;
+        }
+    }
+
+    private async ensureFaultIndexes(): Promise<void> {
+        try {
+            await this.faultsCollection.createIndexes([
+                { key: { lastSeen: 1 }, name: 'lastSeen' },
+                { key: { volumeId: 1 }, name: 'volumeId' }
+            ]);
+        }
+        catch (err) {
+            log.error('failed to ensure fault indexes', err);
             throw err;
         }
     }
@@ -237,6 +277,12 @@ export class Database {
         return this._collections.runtimeConfig;
     }
 
+    private get faultsCollection(): Collection<FaultDocument> {
+        if (!this._collections.faults)
+            throw new Error('database not initialized');
+        return this._collections.faults;
+    }
+
     private get volumeRepository(): VolumeRepository {
         if (!this._repositories.volumes) {
             this._repositories.volumes = new VolumeRepository(this.volumesCollection);
@@ -254,6 +300,13 @@ export class Database {
             );
         }
         return this._repositories.content;
+    }
+
+    private get faultRepository(): FaultRepository {
+        if (!this._repositories.faults) {
+            this._repositories.faults = new FaultRepository(this.faultsCollection);
+        }
+        return this._repositories.faults;
     }
 
     private get runtimeConfigRepository(): RuntimeConfigRepository {

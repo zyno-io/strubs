@@ -5,8 +5,14 @@ import { database } from './database';
 import { ioManager } from './io/manager';
 import { serverManager } from './server/manager';
 import { verifyVolumesJob } from './jobs/verify-volumes-job';
+import { verifyScheduler } from './jobs/verify-scheduler';
 import { createLogger } from './log';
 import { volumeSmartMonitor } from './io/volume-smart-monitor';
+import { systemLogWatcher } from './io/system-log-watcher';
+import { volumeHealthMonitor } from './io/volume-health-monitor';
+import { configureNotifications } from './notify/bootstrap';
+import { remediationService } from './remediation/service';
+import { repairWorker } from './remediation/repair-worker';
 
 const log = createLogger('core');
 
@@ -49,12 +55,20 @@ export class Core {
             log('starting up STRUBS...');
 
             await config.loadIdentity();
+            configureNotifications(config);
             await this.createRunDirectory();
             await database.connect();
+            await remediationService.hydrate();
             await ioManager.init();
             await volumeSmartMonitor.start();
-            await serverManager.start();
+            // Resume any pending verify run before exposing HTTP, so an inbound
+            // verify/scrub request can't race the resume for job state.
             await verifyVolumesJob.resumePendingJob();
+            await serverManager.start();
+            verifyScheduler.start(config.scrubIntervalMs);
+            systemLogWatcher.start(config.systemLogWatchIntervalMs);
+            repairWorker.start(config.repairIntervalMs);
+            volumeHealthMonitor.start(config.volumeHealthIntervalMs, config.volumeFaultThreshold);
 
             this.started = true;
             log('STRUBS started.');
@@ -76,6 +90,11 @@ export class Core {
 
         this.stopPromise = (async () => {
             let stopError: unknown = null;
+
+            verifyScheduler.stop();
+            systemLogWatcher.stop();
+            repairWorker.stop();
+            volumeHealthMonitor.stop();
 
             try {
                 await this.deps.serverManager.stop();

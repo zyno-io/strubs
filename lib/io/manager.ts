@@ -104,7 +104,7 @@ export class IOManager {
         await this.deps.volumeFleet.softDeleteVolume(id);
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; label?: string | null }): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null }): Promise<void> {
         await this.reloadBlockDevices();
         await this.deps.volumeFleet.updateVolumeFlags(id, changes, this._onlineDevices);
     }

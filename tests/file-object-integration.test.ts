@@ -179,7 +179,12 @@ const fakeManager = {
 
 const databaseMock = {
     createObjectRecord: vi.fn(),
-    deleteObjectById: vi.fn()
+    deleteObjectById: vi.fn(),
+    // Exercised when a corrupted slice is detected during read and reported to
+    // the remediation pipeline (best-effort persistence).
+    upsertFault: vi.fn(),
+    listFaults: vi.fn().mockResolvedValue([]),
+    deleteFault: vi.fn()
 };
 
 const planConfig = {
@@ -330,6 +335,23 @@ describe('FileObject integration', () => {
         }
     });
 
+    it('streams zero-byte objects without touching chunk data', async () => {
+        const object = new FileObject();
+        await object.createWithSize(0);
+        object.name = 'empty.bin';
+        await writeToObject(object, Buffer.alloc(0));
+        await object.commit();
+        const storedRecord = databaseMock.createObjectRecord.mock.calls[0][0];
+
+        const reader = new FileObject();
+        await reader.loadFromRecord(storedRecord);
+        await reader.prepareForRead();
+        reader.setReadRange(0, 0, true);
+        const data = await readFromObject(reader);
+        expect(data).toEqual(Buffer.alloc(0));
+        await reader.close();
+    });
+
     it('supports partial range reads and EOF tracking', async () => {
         const payload = Buffer.from('ABCDEFGH12345678');
         const object = new FileObject();
@@ -370,7 +392,7 @@ describe('FileObject integration', () => {
         expect(data).toEqual(payload);
     });
 
-    it('errors when a chunk checksum mismatches', async () => {
+    it('recovers from a chunk checksum mismatch by reconstructing from parity', async () => {
         const payload = Buffer.from('checksum validation buffer');
         const object = new FileObject();
         await object.createWithSize(payload.length);
@@ -387,7 +409,44 @@ describe('FileObject integration', () => {
         await reader.loadFromRecord(storedRecord);
         await reader.prepareForRead();
         reader.setReadRange(0, payload.length, true);
-        await expect(readFromObject(reader)).rejects.toThrow('checksum mismatch');
+        // A single corrupted slice is detected (checksum mismatch) and rebuilt
+        // from the surviving data + parity slices, so the read still succeeds.
+        const data = await readFromObject(reader);
+        expect(data).toEqual(payload);
+        await reader.close();
+    });
+
+    it('rebuilds a damaged slice in place via SliceRepairer', async () => {
+        const { SliceRepairer } = await import('../lib/io/file-object/slice-repairer');
+        const payload = Buffer.from('repair me from parity please!!');
+        const object = new FileObject();
+        await object.createWithSize(payload.length);
+        await writeToObject(object, payload);
+        await object.commit();
+        const storedRecord = databaseMock.createObjectRecord.mock.calls[0][0];
+
+        const sliceFile = path.join(fakeVolumes.get(1)!.committedPath, `${storedRecord.id}.0`);
+        const corruptionOffset = constants.FILE_HEADER_SIZE + constants.CHUNK_HEADER_SIZE;
+        const fh = await fs.open(sliceFile, 'r+');
+        await fh.write(Buffer.from([0xff]), 0, 1, corruptionOffset);
+        await fh.close();
+
+        const repairObject = new FileObject();
+        await repairObject.loadFromRecord(storedRecord);
+        await new SliceRepairer().repair(repairObject, 0);
+
+        // The on-disk slice was rewritten: the corrupted byte is gone...
+        const after = await fs.readFile(sliceFile);
+        expect(after[corruptionOffset]).not.toBe(0xff);
+
+        // ...and the object reads back correctly straight from the repaired slice.
+        const reader = new FileObject();
+        await reader.loadFromRecord(storedRecord);
+        await reader.prepareForRead();
+        reader.setReadRange(0, payload.length, true);
+        const data = await readFromObject(reader);
+        expect(data).toEqual(payload);
+        await reader.close();
     });
 
     it('cleans up temporary slices when deleted before commit', async () => {

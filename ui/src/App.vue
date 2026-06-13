@@ -304,6 +304,12 @@ async function createVolumes(): Promise<void> {
   }
 }
 
+// Resolve the volume the context menu is currently targeting
+const contextMenuVolume = computed<VolumeStatus | null>(() => {
+  if (contextMenu.value.volumeId === null) return null;
+  return volumes.value.find(v => v.id === contextMenu.value.volumeId) ?? null;
+});
+
 // Show context menu on right-click
 function showContextMenu(event: MouseEvent, volumeId: number): void {
   event.preventDefault();
@@ -363,6 +369,43 @@ async function saveLabel(): Promise<void> {
     error.value = err instanceof Error ? err.message : 'Failed to update label';
   } finally {
     savingLabel.value = false;
+  }
+}
+
+// Enable or disable the volume targeted by the context menu
+async function toggleVolumeEnabled(): Promise<void> {
+  const volume = contextMenuVolume.value;
+  if (volume === null) return;
+
+  const volumeId = volume.id;
+  const nextEnabled = !volume.isEnabled;
+  hideContextMenu();
+
+  if (!nextEnabled && !confirm(`Disable volume ${volumeId}? It will stop serving reads and writes.`)) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`${apiBaseUrl}/$/volumes/${volumeId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isEnabled: nextEnabled })
+    });
+
+    if (!response.ok) {
+      let errorMessage = `Failed to ${nextEnabled ? 'enable' : 'disable'} volume (HTTP ${response.status})`;
+      try {
+        const text = await response.text();
+        if (text) errorMessage += `: ${text}`;
+      } catch {
+        // Ignore error reading response body
+      }
+      throw new Error(errorMessage);
+    }
+
+    await fetchData();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to update volume';
   }
 }
 
@@ -634,6 +677,13 @@ onUnmounted(() => {
       @click.stop
     >
       <div class="context-menu-item" @click="openEditLabelModal">Edit Label</div>
+      <div
+        v-if="contextMenuVolume"
+        class="context-menu-item"
+        @click="toggleVolumeEnabled"
+      >
+        {{ contextMenuVolume.isEnabled ? 'Disable' : 'Enable' }}
+      </div>
       <div class="context-menu-item delete" @click="deleteVolume">Delete</div>
     </div>
 

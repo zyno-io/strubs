@@ -45,7 +45,7 @@ export class Volume extends EventEmitter {
     public isVerified = false;
     public isStarted = false;
     public isEnabled: boolean;
-    public readonly isHealthy: boolean;
+    public isHealthy: boolean;
     public isReadOnly: boolean;
     public isDeleted: boolean;
     public deviceSerial: string | null;
@@ -104,6 +104,10 @@ export class Volume extends EventEmitter {
 
     setReadOnly(flag: boolean): void {
         this.isReadOnly = flag;
+    }
+
+    setHealthy(flag: boolean): void {
+        this.isHealthy = flag;
     }
 
     setEnabled(flag: boolean): void {

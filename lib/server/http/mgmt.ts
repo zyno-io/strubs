@@ -12,6 +12,10 @@ import type { HttpRequest, HttpResponse, HttpContentPayload } from './server';
 import type { Volume } from '../../io/volume';
 import { volumeSmartMonitor, type VolumeSmartInfo, type VolumeSmartSummary } from '../../io/volume-smart-monitor';
 import { volumePriorityManager } from '../../io/volume-priority-manager';
+import { notificationService } from '../../notify/service';
+import type { Severity } from '../../notify/notifier';
+import { remediationService } from '../../remediation/service';
+import type { SliceFault } from '../../remediation/fault';
 
 export type VolumeStatus = {
     id: number;
@@ -222,6 +226,35 @@ export class HttpMgmt {
         return serialized;
     }
 
+    private static async handleNotifyTestRequest(req: HttpRequest): Promise<{ delivered: string[]; failed: { transport: string; error: string }[]; suppressed: boolean; transports: string[] }> {
+        const payload = await this.parseJsonBody<{ severity?: unknown; title?: unknown; body?: unknown }>(req);
+        // Default to 'warning' so an empty test request exercises Slack, whose
+        // default minimum severity is 'warning'.
+        const severity = this.normalizeSeverity(payload.severity, 'warning');
+        const title = typeof payload.title === 'string' && payload.title.length ? payload.title : 'STRUBS notification test';
+        const body = typeof payload.body === 'string' && payload.body.length ? payload.body : 'This is a test notification from STRUBS.';
+        const result = await notificationService.notify(
+            { severity, title, body, context: { test: true } },
+            { bypassCooldown: true }
+        );
+        return {
+            delivered: result.delivered,
+            failed: result.failed,
+            suppressed: result.suppressed,
+            transports: notificationService.listTransports()
+        };
+    }
+
+    private static async handleFaultsRequest(): Promise<{ faults: SliceFault[] }> {
+        return { faults: remediationService.listFaults() };
+    }
+
+    private static normalizeSeverity(raw: unknown, fallback: Severity = 'info'): Severity {
+        if (raw === 'info' || raw === 'warning' || raw === 'critical')
+            return raw;
+        return fallback;
+    }
+
     private static async handleVerifyVolumesJobStartRequest(req: HttpRequest): Promise<{ startedAt: string }> {
         const payload = await this.parseJsonBody<{ volumeIds?: unknown }>(req);
         const volumeIds = this.normalizeVolumeIdFilter(payload.volumeIds);
@@ -373,10 +406,10 @@ export class HttpMgmt {
     }
 
     private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
-        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; label?: unknown }>(req);
+        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; label?: unknown }>(req);
         const id = this.parseVolumeId(params);
 
-        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; label?: string | null } = {};
+        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null } = {};
         let shouldSoftDelete = false;
 
         if (payload.isEnabled !== undefined) {
@@ -389,6 +422,12 @@ export class HttpMgmt {
             if (typeof payload.isReadOnly !== 'boolean')
                 throw new HttpBadRequestError('isReadOnly must be a boolean');
             updates.isReadOnly = payload.isReadOnly;
+        }
+
+        if (payload.isHealthy !== undefined) {
+            if (typeof payload.isHealthy !== 'boolean')
+                throw new HttpBadRequestError('isHealthy must be a boolean');
+            updates.isHealthy = payload.isHealthy;
         }
 
         if (payload.isDeleted !== undefined) {
@@ -576,6 +615,16 @@ export class HttpMgmt {
                 method: 'DELETE',
                 match: url => this.matchVolumeIdRoute(url),
                 handler: async (_req, params) => this.handleVolumeDeleteRequest(params)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/notify/test' ? {} : null,
+                handler: async req => this.handleNotifyTestRequest(req)
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/faults' ? {} : null,
+                handler: async () => this.handleFaultsRequest()
             },
             {
                 method: 'POST',

@@ -8,6 +8,7 @@ import { ioManager } from '../io/manager';
 import { createLogger } from '../log';
 import type { Volume } from '../io/volume';
 import { FileObjectSliceVerifier } from '../io/file-object/slice-verifier';
+import { remediationService } from '../remediation/service';
 
 type VolumeErrorCounters = {
     checksum: number;
@@ -21,6 +22,7 @@ type VerifyVolumesJobDeps = {
     ioManager: typeof ioManager;
     createLogger: typeof createLogger;
     createSliceVerifier: (object: FileObject) => { verifySlice: (sliceIndex: number) => Promise<void> };
+    remediationService: typeof remediationService;
 };
 
 type VerifyVolumesErrorSnapshot = {
@@ -34,13 +36,16 @@ type VerifyVolumesObjectResult = {
     volumeImpacts: Map<number, VolumeErrorCounters>;
 };
 
+type VerifyStartResult = { startedAt: string; accepted: boolean };
+
 const defaultDeps: VerifyVolumesJobDeps = {
     database,
     runtimeConfig,
     fileObjectService,
     ioManager,
     createLogger,
-    createSliceVerifier: (object: FileObject) => new FileObjectSliceVerifier(object)
+    createSliceVerifier: (object: FileObject) => new FileObjectSliceVerifier(object),
+    remediationService
 };
 
 const VERIFY_BATCH_SIZE = 25;
@@ -123,6 +128,8 @@ export class VerifyVolumesJob {
     private cancelRequested = false;
     private startedAt: string | null = null;
     private volumeFilter: Set<number> | null = null;
+    private targetedCursor: string | null = null;
+    private startGuard = false;
     private progress = {
         objectsVerified: 0,
         errors: {
@@ -138,37 +145,53 @@ export class VerifyVolumesJob {
         this.log = this.deps.createLogger('verify-job');
     }
 
-    async start(options?: { volumeIds?: number[] }): Promise<{ startedAt: string }> {
+    async start(options?: { volumeIds?: number[] }): Promise<VerifyStartResult> {
+        const requestedFilter = this.normalizeVolumeIds(options?.volumeIds);
         if (this.running)
-            return { startedAt: this.startedAt as string };
+            return { startedAt: this.startedAt as string, accepted: this.activeRunCoversRequest(requestedFilter) };
+        // Synchronous guard: start() awaits runtime-config/persistence before
+        // launch() sets `running`, so without this two overlapping callers
+        // (scheduler tick, HTTP, resume) could both proceed and corrupt state.
+        if (this.startGuard)
+            return { startedAt: this.startedAt ?? '', accepted: false };
+        this.startGuard = true;
+        try {
+            const existing = await this.deps.runtimeConfig.get('verifyStartedAt');
+            if (typeof existing === 'string' && existing.length) {
+                const persistedFilter = await this.loadPersistedVolumeFilter();
+                const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
+                this.launch(existing, true, persistedFilter, restoredCount);
+                return { startedAt: existing, accepted: this.filterCoversRequest(persistedFilter, requestedFilter) };
+            }
 
-        const existing = await this.deps.runtimeConfig.get('verifyStartedAt');
-        if (typeof existing === 'string' && existing.length) {
-            const persistedFilter = await this.loadPersistedVolumeFilter();
-            const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
-            this.launch(existing, true, persistedFilter, restoredCount);
-            return { startedAt: existing };
+            await this.persistVolumeFilter(requestedFilter);
+
+            const startedAt = new Date().toISOString();
+            await this.deps.runtimeConfig.set('verifyStartedAt', startedAt);
+            this.launch(startedAt, false, requestedFilter, 0);
+            return { startedAt, accepted: true };
         }
-
-        const normalizedFilter = this.normalizeVolumeIds(options?.volumeIds);
-        await this.persistVolumeFilter(normalizedFilter);
-
-        const startedAt = new Date().toISOString();
-        await this.deps.runtimeConfig.set('verifyStartedAt', startedAt);
-        this.launch(startedAt, false, normalizedFilter, 0);
-        return { startedAt };
+        finally {
+            this.startGuard = false;
+        }
     }
 
     async resumePendingJob(): Promise<void> {
-        if (this.running)
+        if (this.running || this.startGuard)
             return;
-        const existing = await this.deps.runtimeConfig.get('verifyStartedAt');
-        if (typeof existing !== 'string' || !existing.length)
-            return;
-        this.log('resuming verify job started at %s', existing);
-        const persistedFilter = await this.loadPersistedVolumeFilter();
-        const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
-        this.launch(existing, true, persistedFilter, restoredCount);
+        this.startGuard = true;
+        try {
+            const existing = await this.deps.runtimeConfig.get('verifyStartedAt');
+            if (typeof existing !== 'string' || !existing.length)
+                return;
+            this.log('resuming verify job started at %s', existing);
+            const persistedFilter = await this.loadPersistedVolumeFilter();
+            const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
+            this.launch(existing, true, persistedFilter, restoredCount);
+        }
+        finally {
+            this.startGuard = false;
+        }
     }
 
     async stop(options?: { preserveState?: boolean }): Promise<void> {
@@ -204,6 +227,7 @@ export class VerifyVolumesJob {
 
         this.startedAt = startedAt;
         this.applyVolumeFilter(volumeIds);
+        this.targetedCursor = null;
         const concurrency = this.resolveConcurrency();
         this.currentConcurrency = concurrency;
         if (isResume)
@@ -225,7 +249,15 @@ export class VerifyVolumesJob {
                 this.cancelRequested = false;
                 this.currentConcurrency = 0;
                 this.volumeFilter = null;
+                this.targetedCursor = null;
             });
+    }
+
+    // A run is "targeted" when scoped to specific volumes (fault-driven). A
+    // targeted run is a single _id-paginated pass that records slice errors only;
+    // it must not advance the rolling scrub watermark (`lastVerifiedAt`).
+    private get isTargetedRun(): boolean {
+        return this.volumeFilter !== null;
     }
 
     private async getResumedObjectsVerified(startedAt: string, volumeIds: number[] | null): Promise<number> {
@@ -253,12 +285,15 @@ export class VerifyVolumesJob {
             await this.resetVolumeCounters(volumeCounts);
         let checksumErrors = 0;
         let totalErrors = 0;
+        let completed = false;
 
         try {
             while (!this.cancelRequested) {
                 const batch = await this.fetchBatch(startedAtDate);
-                if (!batch.length)
+                if (!batch.length) {
+                    completed = true;
                     break;
+                }
 
                 let interrupted = false;
                 const queue = new PQueue({ concurrency });
@@ -286,7 +321,10 @@ export class VerifyVolumesJob {
                     }
                 }));
 
-                await Promise.allSettled(taskPromises);
+                const taskResults = await Promise.allSettled(taskPromises);
+                const rejectedTask = taskResults.find(result => result.status === 'rejected');
+                if (rejectedTask?.status === 'rejected')
+                    throw rejectedTask.reason;
 
                 if (this.cancelRequested || interrupted)
                     break;
@@ -294,11 +332,12 @@ export class VerifyVolumesJob {
         }
         finally {
             this.currentConcurrency = 0;
-            if (!this.cancelRequested) {
+            const shouldFinalize = completed && !this.cancelRequested;
+            if (shouldFinalize) {
                 await this.deps.runtimeConfig.delete('verifyStartedAt');
                 await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
             }
-            if (!this.cancelRequested) {
+            if (shouldFinalize && !this.isTargetedRun) {
                 const finishedAt = new Date().toISOString();
                 await this.deps.runtimeConfig.set('lastVerify', {
                     startedAt,
@@ -330,8 +369,17 @@ export class VerifyVolumesJob {
     }
 
     private async fetchBatch(startedAt: Date): Promise<StoredObjectRecord[]> {
-        const filter = this.volumeFilter ? Array.from(this.volumeFilter.values()) : undefined;
-        const objects = await this.deps.database.findObjectsNeedingVerification(startedAt, VERIFY_BATCH_SIZE, filter);
+        if (this.isTargetedRun) {
+            const volumeIds = Array.from((this.volumeFilter as Set<number>).values());
+            const objects = await this.deps.database.findObjectsOnVolumes(this.targetedCursor, VERIFY_BATCH_SIZE, volumeIds);
+            if (objects.length) {
+                const lastId = (objects[objects.length - 1] as StoredObjectRecord).id;
+                if (lastId)
+                    this.targetedCursor = lastId;
+            }
+            return objects as StoredObjectRecord[];
+        }
+        const objects = await this.deps.database.findObjectsNeedingVerification(startedAt, VERIFY_BATCH_SIZE);
         return objects as StoredObjectRecord[];
     }
 
@@ -350,6 +398,7 @@ export class VerifyVolumesJob {
             let checksumErrors = 0;
             let totalErrors = 0;
             let processedSlices = 0;
+            const processedSliceKeys = new Set<string>();
 
             for (let sliceIndex = 0; sliceIndex < totalSlices; sliceIndex++) {
                 if (this.cancelRequested)
@@ -364,6 +413,7 @@ export class VerifyVolumesJob {
                 }
                 try {
                     processedSlices++;
+                    processedSliceKeys.add(descriptor.key);
                     await verifier.verifySlice(sliceIndex);
                 }
                 catch (err) {
@@ -383,6 +433,7 @@ export class VerifyVolumesJob {
                     totalErrors++;
                     if (normalized.isChecksum)
                         checksumErrors++;
+                    this.reportFault(record, normalized);
 
                     if (normalized.volumeId !== null && normalized.volumeId !== undefined) {
                         const entry = volumeImpacts.get(normalized.volumeId) ?? { checksum: 0, total: 0 };
@@ -414,10 +465,10 @@ export class VerifyVolumesJob {
                     volumeImpacts
                 };
 
-            await this.deps.database.updateObjectVerificationState(record.id, {
-                lastVerifiedAt: startedAt,
-                sliceErrors: Object.keys(sliceErrors).length ? sliceErrors : null
-            });
+            await this.deps.database.updateObjectVerificationState(
+                record.id,
+                this.buildVerificationUpdate(record, startedAt, sliceErrors, processedSliceKeys)
+            );
 
             return {
                 checksumErrors,
@@ -432,11 +483,12 @@ export class VerifyVolumesJob {
                 return null;
             }
             const normalized = this.normalizeSliceError(record, err);
-            const sliceErrors = normalized ? { [normalized.sliceKey]: normalized.info } : null;
-            await this.deps.database.updateObjectVerificationState(record.id, {
-                lastVerifiedAt: startedAt,
-                sliceErrors
-            });
+            const sliceErrors = normalized ? { [normalized.sliceKey]: normalized.info } : {};
+            const processedSliceKeys = normalized ? new Set([normalized.sliceKey]) : new Set<string>();
+            await this.deps.database.updateObjectVerificationState(
+                record.id,
+                this.buildVerificationUpdate(record, startedAt, sliceErrors, processedSliceKeys)
+            );
 
             const volumeImpacts = new Map<number, VolumeErrorCounters>();
             if (normalized?.volumeId !== null && normalized?.volumeId !== undefined) {
@@ -448,6 +500,7 @@ export class VerifyVolumesJob {
 
             const message = err instanceof Error ? err.message : String(err);
             if (normalized) {
+                this.reportFault(record, normalized);
                 this.log.error(
                     'object %s %s slice %s verification failed: %s',
                     record.id,
@@ -492,7 +545,7 @@ export class VerifyVolumesJob {
     private normalizeSliceError(
         record: StoredObjectRecord,
         err: unknown
-    ): { sliceKey: string; sliceType: 'data' | 'parity' | 'unknown'; info: SliceErrorInfo; volumeId: number | null; isChecksum: boolean } | null {
+    ): { sliceKey: string; sliceType: 'data' | 'parity' | 'unknown'; info: SliceErrorInfo; volumeId: number | null; sliceIndex: number | null; code: string | undefined; isChecksum: boolean } | null {
         const errorObj = err as Error & { code?: string; sliceIndex?: number; volumeId?: number };
         const sliceIndex = typeof errorObj.sliceIndex === 'number' ? errorObj.sliceIndex : null;
         const descriptor = this.describeSlice(record, sliceIndex);
@@ -508,8 +561,28 @@ export class VerifyVolumesJob {
             sliceType: descriptor.type,
             info,
             volumeId,
+            sliceIndex,
+            code: errorObj.code,
             isChecksum
         };
+    }
+
+    // Surface a verify-detected slice fault into the remediation pipeline.
+    // Fire-and-forget; reportSliceFault never throws.
+    private reportFault(
+        record: StoredObjectRecord,
+        normalized: { sliceKey: string; volumeId: number | null; sliceIndex: number | null; code: string | undefined; isChecksum: boolean; info: SliceErrorInfo }
+    ): void {
+        const sliceIndex = normalized.sliceIndex ?? Number.parseInt(normalized.sliceKey, 10);
+        this.deps.remediationService.reportSliceFault({
+            objectId: record.id,
+            sliceIndex: Number.isFinite(sliceIndex) ? sliceIndex : -1,
+            volumeId: normalized.volumeId ?? null,
+            source: 'verify',
+            code: normalized.code,
+            isChecksum: normalized.isChecksum,
+            message: normalized.info.err
+        });
     }
 
     private async acquireVolumeLock(volumeId: number | null | undefined): Promise<(() => void) | null> {
@@ -526,6 +599,29 @@ export class VerifyVolumesJob {
         if (volumeId === null || volumeId === undefined)
             return false;
         return this.volumeFilter.has(volumeId);
+    }
+
+    private buildVerificationUpdate(
+        record: StoredObjectRecord,
+        startedAt: Date,
+        sliceErrors: Record<string, SliceErrorInfo>,
+        processedSliceKeys: Set<string>
+    ): { lastVerifiedAt?: Date; sliceErrors?: Record<string, SliceErrorInfo> | null } {
+        if (!this.isTargetedRun) {
+            return {
+                lastVerifiedAt: startedAt,
+                sliceErrors: Object.keys(sliceErrors).length ? sliceErrors : null
+            };
+        }
+
+        const mergedErrors: Record<string, SliceErrorInfo> = { ...(record.sliceErrors ?? {}) };
+        for (const key of processedSliceKeys)
+            delete mergedErrors[key];
+        Object.assign(mergedErrors, sliceErrors);
+
+        return {
+            sliceErrors: Object.keys(mergedErrors).length ? mergedErrors : null
+        };
     }
 
     private async loadPersistedVolumeFilter(): Promise<number[] | null> {
@@ -545,6 +641,20 @@ export class VerifyVolumesJob {
             this.volumeFilter = new Set(volumeIds);
         else
             this.volumeFilter = null;
+    }
+
+    private activeRunCoversRequest(requestedFilter: number[] | null): boolean {
+        const activeFilter = this.volumeFilter ? Array.from(this.volumeFilter.values()) : null;
+        return this.filterCoversRequest(activeFilter, requestedFilter);
+    }
+
+    private filterCoversRequest(activeFilter: number[] | null, requestedFilter: number[] | null): boolean {
+        if (requestedFilter === null)
+            return activeFilter === null;
+        if (activeFilter === null)
+            return false;
+        const active = new Set(activeFilter);
+        return requestedFilter.every(id => active.has(id));
     }
 
     private normalizeVolumeIds(value: unknown): number[] | null {

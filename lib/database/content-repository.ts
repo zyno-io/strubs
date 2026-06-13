@@ -110,6 +110,34 @@ export class ContentRepository {
         return objects.map(object => this.normalize(object));
     }
 
+    // Targeted verification: a single forward pass over every object that has a
+    // slice on the given volumes, paginated by _id. Unlike the rolling scrub this
+    // does NOT depend on or mutate `lastVerifiedAt`, so a targeted run can never
+    // advance the rolling watermark and cause the scrub to skip unverified slices.
+    async findObjectsOnVolumes(afterId: ObjectIdentifier, limit: number, volumeIds: number[]): Promise<ContentDocument[]> {
+        const conditions: Filter<ContentDocument>[] = [
+            {
+                $or: [
+                    { dataVolumes: { $in: volumeIds } },
+                    { parityVolumes: { $in: volumeIds } }
+                ]
+            }
+        ];
+        const afterObjectId = afterId ? this.toMongoId(afterId) : null;
+        if (afterObjectId)
+            conditions.push({ _id: { $gt: afterObjectId } });
+        const query: Filter<ContentDocument> = {
+            isFile: true,
+            $and: conditions
+        };
+        const cursor = this.collection.find<ContentDocument>(query, {
+            sort: { _id: 1 },
+            limit
+        });
+        const objects = await cursor.toArray();
+        return objects.map(object => this.normalize(object));
+    }
+
     async countObjectsVerifiedSince(startedAt: Date, volumeIds?: number[]): Promise<number> {
         const conditions: Filter<ContentDocument>[] = [
             {

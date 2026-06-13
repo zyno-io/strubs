@@ -144,6 +144,25 @@ const createRequest = (method: string, url: string, body?: unknown): HttpRequest
 const nullResponse = {} as HttpResponse;
 
 describe('HttpMgmt.handle', () => {
+    it('POST /$/notify/test delivers a test notification and reports transports', async () => {
+        const response = await HttpMgmt.handle(
+            99,
+            createRequest('POST', '/$/notify/test', { severity: 'warning', title: 'hello' }),
+            nullResponse
+        ) as { delivered: string[]; failed: unknown[]; suppressed: boolean; transports: string[] };
+
+        // No transports are registered in the unit-test process, so nothing is
+        // delivered, but the route must resolve and return the expected shape.
+        expect(response).toMatchObject({ delivered: [], failed: [], suppressed: false });
+        expect(Array.isArray(response.transports)).toBe(true);
+    });
+
+    it('GET /$/faults returns the current fault list', async () => {
+        const response = await HttpMgmt.handle(98, createRequest('GET', '/$/faults'), nullResponse) as { faults: unknown[] };
+        expect(response).toHaveProperty('faults');
+        expect(Array.isArray(response.faults)).toBe(true);
+    });
+
     it('returns serialized volume status', async () => {
         const volume = {
             uuid: 'vol-1',
@@ -943,15 +962,15 @@ describe('HttpMgmt.handle', () => {
     });
 
     it('updates volume flags via PUT', async () => {
-        const req = createRequest('PUT', '/$/volumes/4', { isEnabled: false, isReadOnly: true });
+        const req = createRequest('PUT', '/$/volumes/4', { isEnabled: false, isReadOnly: true, isHealthy: false });
         databaseUpdateFlagsMock.mockResolvedValue(undefined);
         ioManagerMock.updateVolumeFlags.mockResolvedValue(undefined);
 
         const response = await HttpMgmt.handle(16, req, nullResponse);
 
         expect(response).toEqual({ updated: true });
-        expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(4, { isEnabled: false, isReadOnly: true });
-        expect(ioManagerMock.updateVolumeFlags).toHaveBeenCalledWith(4, { isEnabled: false, isReadOnly: true });
+        expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(4, { isEnabled: false, isReadOnly: true, isHealthy: false });
+        expect(ioManagerMock.updateVolumeFlags).toHaveBeenCalledWith(4, { isEnabled: false, isReadOnly: true, isHealthy: false });
     });
 
     it('updates volume labels via PUT', async () => {
