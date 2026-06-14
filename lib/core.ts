@@ -69,7 +69,8 @@ export class Core {
             systemLogWatcher.start(config.systemLogWatchIntervalMs);
             repairWorker.start(config.repairIntervalMs, {
                 batchSize: config.repairBatchSize,
-                backlogDelayMs: config.repairBacklogDelayMs
+                backlogDelayMs: config.repairBacklogDelayMs,
+                blockedRetryMs: config.repairBlockedRetryMs
             });
             volumeHealthMonitor.start(config.volumeHealthIntervalMs, config.volumeFaultThreshold);
 

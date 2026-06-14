@@ -6,6 +6,7 @@ import { beforeAll, afterAll, afterEach, describe, expect, it, vi } from 'vitest
 import { hydratePlan } from './helpers/plan';
 
 import { constants } from '../lib/constants';
+import { volumePriorityManager } from '../lib/io/volume-priority-manager';
 
 vi.mock('@ronomon/reed-solomon', () => {
     const create = (dataSliceCount: number, paritySliceCount: number) => ({ dataSliceCount, paritySliceCount });
@@ -280,6 +281,12 @@ describe('FileObject integration', () => {
         databaseMock.createObjectRecord.mockReset();
         databaseMock.deleteObjectById.mockReset();
         for (const volume of fakeVolumes.values()) {
+            volume.isReadable = true;
+            volume.isWritable = true;
+            volume.isStarted = true;
+            volume.isEnabled = true;
+            volume.isHealthy = true;
+            volume.isReadOnly = false;
             await fs.rm(volume.tempPath, { recursive: true, force: true });
             await fs.rm(volume.committedPath, { recursive: true, force: true });
             await volume.init();
@@ -447,6 +454,59 @@ describe('FileObject integration', () => {
         const data = await readFromObject(reader);
         expect(data).toEqual(payload);
         await reader.close();
+    });
+
+    it('does not open source slices when the repair target is not writable', async () => {
+        const { SliceRepairer } = await import('../lib/io/file-object/slice-repairer');
+        const payload = Buffer.from('do not open sources');
+        const object = new FileObject();
+        await object.createWithSize(payload.length);
+        await writeToObject(object, payload);
+        await object.commit();
+        const storedRecord = databaseMock.createObjectRecord.mock.calls[0][0];
+
+        const openSpies = Array.from(fakeVolumes.values()).map(volume => vi.spyOn(volume, 'openCommittedFh'));
+        fakeVolumes.get(1)!.isWritable = false;
+
+        const repairObject = new FileObject();
+        await repairObject.loadFromRecord(storedRecord);
+
+        try {
+            await expect(new SliceRepairer().repair(repairObject, 0)).rejects.toMatchObject({
+                code: 'EVOLUMEUNWRITABLE',
+                repairDetails: { targetVolumeId: 1 }
+            });
+            for (const spy of openSpies)
+                expect(spy).not.toHaveBeenCalled();
+        }
+        finally {
+            openSpies.forEach(spy => spy.mockRestore());
+        }
+    });
+
+    it('closes source slices when target creation fails after reader prepare', async () => {
+        const { SliceRepairer } = await import('../lib/io/file-object/slice-repairer');
+        const payload = Buffer.from('close opened sources');
+        const object = new FileObject();
+        await object.createWithSize(payload.length);
+        await writeToObject(object, payload);
+        await object.commit();
+        const storedRecord = databaseMock.createObjectRecord.mock.calls[0][0];
+
+        const targetVolume = fakeVolumes.get(1)!;
+        const createSpy = vi.spyOn(targetVolume, 'createTemporaryFh').mockRejectedValue(new Error('target create failed'));
+
+        const repairObject = new FileObject();
+        await repairObject.loadFromRecord(storedRecord);
+        const priorityStatsBefore = volumePriorityManager.getStats();
+
+        try {
+            await expect(new SliceRepairer().repair(repairObject, 0)).rejects.toThrow('target create failed');
+            expect(volumePriorityManager.getStats()).toEqual(priorityStatsBefore);
+        }
+        finally {
+            createSpy.mockRestore();
+        }
     });
 
     it('cleans up temporary slices when deleted before commit', async () => {

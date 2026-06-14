@@ -4,7 +4,7 @@
 
 export type FaultSource = 'read' | 'verify' | 'syslog' | 'smart';
 export type RepairStatus = 'pending' | 'blocked';
-export type RepairBlockedReason = 'insufficient-slices';
+export type RepairBlockedReason = 'insufficient-slices' | 'target-unwritable';
 
 export interface RepairBlockDetails {
     requiredSlices?: number;
@@ -16,6 +16,7 @@ export interface RepairBlockDetails {
     failedSliceIndexes?: number[];
     missingVolumeIds?: number[];
     failedVolumeIds?: number[];
+    targetVolumeId?: number;
     message?: string;
 }
 

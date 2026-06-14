@@ -1,5 +1,6 @@
 import { createLogger } from '../log';
 import { database } from '../database';
+import { ioManager } from '../io/manager';
 import type { Severity } from '../notify/notifier';
 import { notificationService, NotificationService } from '../notify/service';
 import { remediationService, RemediationService } from './service';
@@ -11,10 +12,12 @@ type LoadedObject = { id?: string | null; size: number };
 type VerifyFileJobModule = typeof import('../jobs/verify-file-job');
 type FileObjectModule = typeof import('../io/file-object');
 type SliceRepairerModule = typeof import('../io/file-object/slice-repairer');
+type RepairPassContext = { verifications: Map<string, VerifyResult> };
 type RepairFaultResult = 'processed' | 'skipped' | 'cancelled';
 type RepairWorkerStartOptions = {
     batchSize?: number;
     backlogDelayMs?: number;
+    blockedRetryMs?: number;
 };
 
 type RepairWorkerDeps = {
@@ -28,11 +31,15 @@ type RepairWorkerDeps = {
     verifyObject: (objectId: string) => Promise<VerifyResult>;
     loadObject: (record: unknown) => Promise<LoadedObject>;
     repairSlice: (object: LoadedObject, sliceIndex: number) => Promise<void>;
+    isVolumeWritable: (volumeId: number) => boolean;
     createLogger: typeof createLogger;
+    now: () => number;
+    blockedRetryMs: number;
 };
 
 const DEFAULT_BATCH_SIZE = 25;
 const DEFAULT_BACKLOG_DELAY_MS = 10 * 1000;
+const DEFAULT_BLOCKED_RETRY_MS = 60 * 60 * 1000;
 
 const defaultDeps: RepairWorkerDeps = {
     database,
@@ -54,7 +61,17 @@ const defaultDeps: RepairWorkerDeps = {
         const { sliceRepairer } = require('../io/file-object/slice-repairer') as SliceRepairerModule;
         await sliceRepairer.repair(object as never, sliceIndex);
     },
-    createLogger
+    isVolumeWritable: (volumeId: number) => {
+        try {
+            return Boolean(ioManager.getVolume(volumeId)?.isWritable);
+        }
+        catch {
+            return false;
+        }
+    },
+    createLogger,
+    now: () => Date.now(),
+    blockedRetryMs: DEFAULT_BLOCKED_RETRY_MS
 };
 
 // Closed-loop repair: for each open fault, re-verify the slice. A clean result
@@ -73,14 +90,18 @@ export class RepairWorker {
     private started = false;
     private stopping = false;
     private rerunRequested = false;
+    private activePassKeys = new Set<string>();
+    private loggedUnwritableTargetVolumes = new Set<number>();
     private batchSize: number;
     private backlogDelayMs: number;
+    private blockedRetryMs: number;
 
     constructor(deps?: Partial<RepairWorkerDeps>) {
         this.deps = { ...defaultDeps, ...deps };
         this.log = this.deps.createLogger('repair-worker');
         this.batchSize = this.normalizeBatchSize(this.deps.batchSize);
         this.backlogDelayMs = this.normalizeBacklogDelayMs(this.deps.backlogDelayMs);
+        this.blockedRetryMs = this.normalizeBlockedRetryMs(this.deps.blockedRetryMs);
     }
 
     start(intervalMs: number, options?: RepairWorkerStartOptions): void {
@@ -90,8 +111,11 @@ export class RepairWorker {
         this.stopping = false;
         this.batchSize = this.normalizeBatchSize(options?.batchSize ?? this.deps.batchSize);
         this.backlogDelayMs = this.normalizeBacklogDelayMs(options?.backlogDelayMs ?? this.deps.backlogDelayMs);
+        this.blockedRetryMs = this.normalizeBlockedRetryMs(options?.blockedRetryMs ?? this.deps.blockedRetryMs);
 
         this.unsubscribeFaults = this.deps.remediationService.onSliceFault(fault => {
+            if (!this.shouldWakeForFault(fault))
+                return;
             this.scheduleProcess(`fault ${fault.key}`);
         });
 
@@ -127,6 +151,7 @@ export class RepairWorker {
         this.unsubscribeFaults = null;
         this.started = false;
         this.rerunRequested = false;
+        this.activePassKeys.clear();
     }
 
     isScheduled(): boolean {
@@ -148,15 +173,17 @@ export class RepairWorker {
         try {
             do {
                 this.rerunRequested = false;
-                const faults = this.deps.remediationService.listFaults();
+                const faults = this.deps.remediationService.listFaults().filter(fault => this.shouldAttemptFault(fault));
+                const context: RepairPassContext = { verifications: new Map() };
                 let visited = 0;
                 let hitBatchLimit = false;
 
+                this.activePassKeys = new Set(faults.map(fault => fault.key));
                 for (const fault of faults) {
                     if (this.stopping)
                         return;
 
-                    const result = await this.repairFault(fault);
+                    const result = await this.repairFault(fault, context);
                     visited++;
 
                     if (result === 'cancelled' || this.stopping)
@@ -175,6 +202,7 @@ export class RepairWorker {
             } while (this.rerunRequested);
         }
         finally {
+            this.activePassKeys.clear();
             this.running = false;
         }
     }
@@ -220,7 +248,29 @@ export class RepairWorker {
         this.wakeHandle.unref?.();
     }
 
-    async repairFault(fault: SliceFault): Promise<RepairFaultResult> {
+    private shouldWakeForFault(fault: SliceFault): boolean {
+        if (this.running && (this.leases.has(fault.key) || this.activePassKeys.has(fault.key)))
+            return false;
+        return this.shouldAttemptFault(fault);
+    }
+
+    private shouldAttemptFault(fault: SliceFault): boolean {
+        if (fault.repairStatus !== 'blocked')
+            return true;
+
+        if (fault.repairBlockedReason === 'target-unwritable'
+            && typeof fault.volumeId === 'number'
+            && this.deps.isVolumeWritable(fault.volumeId))
+            return true;
+
+        if (this.blockedRetryMs <= 0)
+            return true;
+
+        const lastAttempt = fault.lastRepairAttemptAt ?? fault.repairBlockedAt ?? fault.lastSeen;
+        return this.deps.now() - lastAttempt >= this.blockedRetryMs;
+    }
+
+    async repairFault(fault: SliceFault, context: RepairPassContext = { verifications: new Map() }): Promise<RepairFaultResult> {
         if (this.stopping)
             return 'cancelled';
         if (this.leases.has(fault.key))
@@ -245,10 +295,13 @@ export class RepairWorker {
             if (this.stopping)
                 return 'cancelled';
 
+            if (await this.blockIfTargetUnwritable(fault))
+                return 'processed';
+
             await this.deps.remediationService.markRepairAttempted(fault.key);
 
             // Classify: re-verify the slice. A clean result => transient.
-            const before = await this.deps.verifyObject(fault.objectId);
+            const before = await this.verifyObject(fault.objectId, context);
             if (before[String(fault.sliceIndex)]?.ok) {
                 await this.clear(fault, 'verified clean (transient)');
                 await this.notify('info', `Transient fault on object ${fault.objectId} slice ${fault.sliceIndex} cleared`, fault);
@@ -261,6 +314,7 @@ export class RepairWorker {
             await this.deps.repairSlice(object, fault.sliceIndex);
 
             const after = await this.deps.verifyObject(fault.objectId);
+            context.verifications.set(fault.objectId, after);
             if (after[String(fault.sliceIndex)]?.ok) {
                 await this.clear(fault, 'repaired');
                 await this.notify('info', `Repaired slice ${fault.sliceIndex} of object ${fault.objectId} on volume ${fault.volumeId ?? 'unknown'}`, fault);
@@ -287,6 +341,9 @@ export class RepairWorker {
                 );
                 await this.notify('critical', `Cannot repair object ${fault.objectId} slice ${fault.sliceIndex}: insufficient redundancy (data at risk)`, fault);
             }
+            else if (code === 'EVOLUMEUNWRITABLE') {
+                await this.markTargetUnwritable(fault, this.repairBlockDetails(err, message, { targetVolumeId: fault.volumeId ?? undefined }));
+            }
             else {
                 this.log.error('repair failed for %s slice %d: %s', fault.objectId, fault.sliceIndex, message);
                 await this.deps.remediationService.markRepairFailed(fault.key, message);
@@ -299,8 +356,40 @@ export class RepairWorker {
         }
     }
 
-    private repairBlockDetails(err: unknown, message: string): RepairBlockDetails {
+    private async verifyObject(objectId: string, context: RepairPassContext): Promise<VerifyResult> {
+        const cached = context.verifications.get(objectId);
+        if (cached)
+            return cached;
+
+        const result = await this.deps.verifyObject(objectId);
+        context.verifications.set(objectId, result);
+        return result;
+    }
+
+    private async blockIfTargetUnwritable(fault: SliceFault): Promise<boolean> {
+        if (typeof fault.volumeId !== 'number')
+            return false;
+        if (this.deps.isVolumeWritable(fault.volumeId))
+            return false;
+
+        await this.markTargetUnwritable(fault, {
+            targetVolumeId: fault.volumeId,
+            message: 'target volume is not writable'
+        });
+        return true;
+    }
+
+    private async markTargetUnwritable(fault: SliceFault, details: RepairBlockDetails): Promise<void> {
+        if (typeof fault.volumeId === 'number' && !this.loggedUnwritableTargetVolumes.has(fault.volumeId)) {
+            this.loggedUnwritableTargetVolumes.add(fault.volumeId);
+            this.log('deferring slice repairs targeting volume %d while it is not writable', fault.volumeId);
+        }
+        await this.deps.remediationService.markRepairBlocked(fault.key, 'target-unwritable', details);
+    }
+
+    private repairBlockDetails(err: unknown, message: string, defaults?: RepairBlockDetails): RepairBlockDetails {
         const details = { ...((err as { repairDetails?: RepairBlockDetails } | undefined)?.repairDetails ?? {}) };
+        details.targetVolumeId ??= defaults?.targetVolumeId;
         details.message ??= message;
         return details;
     }
@@ -330,6 +419,11 @@ export class RepairWorker {
     private normalizeBacklogDelayMs(value: number): number {
         const normalized = Math.floor(value);
         return Number.isFinite(normalized) && normalized >= 0 ? normalized : DEFAULT_BACKLOG_DELAY_MS;
+    }
+
+    private normalizeBlockedRetryMs(value: number): number {
+        const normalized = Math.floor(value);
+        return Number.isFinite(normalized) && normalized >= 0 ? normalized : DEFAULT_BLOCKED_RETRY_MS;
     }
 }
 

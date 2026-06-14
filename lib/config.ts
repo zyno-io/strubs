@@ -14,6 +14,7 @@ const DEFAULT_SYSLOG_WATCH_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_REPAIR_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_REPAIR_BATCH_SIZE = 25;
 const DEFAULT_REPAIR_BACKLOG_DELAY_MS = 10 * 1000;
+const DEFAULT_REPAIR_BLOCKED_RETRY_MS = 60 * 60 * 1000;
 const DEFAULT_VOLUME_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
 
 function parseSeverity(value: string | undefined, fallback: Severity): Severity {
@@ -62,6 +63,7 @@ export class Config {
     repairIntervalMs: number;
     repairBatchSize: number;
     repairBacklogDelayMs: number;
+    repairBlockedRetryMs: number;
 
     // Volume health monitor (auto read-only degradation) cadence + threshold.
     // Set the interval to 0 to disable it.
@@ -88,6 +90,7 @@ export class Config {
             : DEFAULT_REPAIR_INTERVAL_MS;
         this.repairBatchSize = parsePositiveInt(process.env.STRUBS_REPAIR_BATCH_SIZE, DEFAULT_REPAIR_BATCH_SIZE);
         this.repairBacklogDelayMs = parseNonNegativeInt(process.env.STRUBS_REPAIR_BACKLOG_DELAY_MS, DEFAULT_REPAIR_BACKLOG_DELAY_MS);
+        this.repairBlockedRetryMs = parseNonNegativeInt(process.env.STRUBS_REPAIR_BLOCKED_RETRY_MS, DEFAULT_REPAIR_BLOCKED_RETRY_MS);
         this.volumeHealthIntervalMs = process.env.STRUBS_VOLUME_HEALTH_INTERVAL_MS
             ? parseInt(process.env.STRUBS_VOLUME_HEALTH_INTERVAL_MS, 10)
             : DEFAULT_VOLUME_HEALTH_INTERVAL_MS;

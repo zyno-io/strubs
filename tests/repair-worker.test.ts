@@ -41,7 +41,10 @@ const makeWorker = (overrides?: any) => {
         verifyObject: vi.fn(),
         loadObject: vi.fn().mockResolvedValue({ id: 'obj1', size: 10 }),
         repairSlice: vi.fn().mockResolvedValue(undefined),
+        isVolumeWritable: vi.fn().mockReturnValue(true),
         createLogger: loggerFactory(),
+        now: vi.fn(() => 1000),
+        blockedRetryMs: 60 * 60 * 1000,
         ...overrides
     };
     return { worker: new RepairWorker(deps), deps, faultListeners, unsubscribe };
@@ -118,6 +121,42 @@ describe('RepairWorker', () => {
         expect(deps.notificationService.notify).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }));
     });
 
+    it('blocks repair without verifying when the target volume is not writable', async () => {
+        const { worker, deps } = makeWorker({
+            isVolumeWritable: vi.fn().mockReturnValue(false)
+        });
+        await worker.processFaults();
+
+        expect(deps.verifyObject).not.toHaveBeenCalled();
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairAttempted).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairBlocked).toHaveBeenCalledWith(
+            '1:obj1:0',
+            'target-unwritable',
+            { targetVolumeId: 1, message: 'target volume is not writable' }
+        );
+        expect(deps.notificationService.notify).not.toHaveBeenCalled();
+    });
+
+    it('marks target-unwritable repair errors as blocked instead of failed', async () => {
+        const error = Object.assign(new Error('volume is not writable'), {
+            code: 'EVOLUMEUNWRITABLE',
+            repairDetails: { targetVolumeId: 1 }
+        });
+        const { worker, deps } = makeWorker({
+            verifyObject: vi.fn().mockResolvedValue({ '0': { ok: false, volumeId: 1 } }),
+            repairSlice: vi.fn().mockRejectedValue(error)
+        });
+        await worker.processFaults();
+
+        expect(deps.remediationService.markRepairBlocked).toHaveBeenCalledWith(
+            '1:obj1:0',
+            'target-unwritable',
+            { targetVolumeId: 1, message: 'volume is not writable' }
+        );
+        expect(deps.remediationService.markRepairFailed).not.toHaveBeenCalled();
+    });
+
     it('records non-quorum repair failures without marking the fault blocked', async () => {
         const failure = new Error('write failed');
         const { worker, deps } = makeWorker({
@@ -155,6 +194,48 @@ describe('RepairWorker', () => {
         await worker.processFaults();
 
         expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.remediationService.clearFault).toHaveBeenCalledWith('1:obj1:0');
+    });
+
+    it('skips blocked faults until their retry window expires', async () => {
+        const blocked = fault({
+            key: '1:blocked:0',
+            objectId: 'blocked',
+            repairStatus: 'blocked',
+            repairBlockedReason: 'insufficient-slices',
+            lastRepairAttemptAt: 900
+        });
+        const pending = fault({ key: '1:pending:1', objectId: 'pending', sliceIndex: 1 });
+        const { worker, deps } = makeWorker({
+            blockedRetryMs: 500,
+            verifyObject: vi.fn().mockResolvedValue({ '1': { ok: true, volumeId: 1 } })
+        });
+        deps.remediationService.listFaults.mockReturnValue([blocked, pending]);
+
+        await worker.processFaults();
+
+        expect(deps.database.getObjectById).toHaveBeenCalledTimes(1);
+        expect(deps.database.getObjectById).toHaveBeenCalledWith('pending');
+        expect(deps.remediationService.markRepairAttempted).toHaveBeenCalledWith('1:pending:1');
+        expect(deps.remediationService.markRepairAttempted).not.toHaveBeenCalledWith('1:blocked:0');
+    });
+
+    it('retries a target-unwritable blocked fault as soon as the target volume is writable', async () => {
+        const blocked = fault({
+            repairStatus: 'blocked',
+            repairBlockedReason: 'target-unwritable',
+            lastRepairAttemptAt: 999
+        });
+        const { worker, deps } = makeWorker({
+            blockedRetryMs: 500,
+            isVolumeWritable: vi.fn().mockReturnValue(true),
+            verifyObject: vi.fn().mockResolvedValue({ '0': { ok: true, volumeId: 1 } })
+        });
+        deps.remediationService.listFaults.mockReturnValue([blocked]);
+
+        await worker.processFaults();
+
+        expect(deps.verifyObject).toHaveBeenCalledTimes(1);
         expect(deps.remediationService.clearFault).toHaveBeenCalledWith('1:obj1:0');
     });
 
@@ -225,6 +306,42 @@ describe('RepairWorker', () => {
 
         expect(repairFault).toHaveBeenCalledTimes(3);
         worker.stop();
+    });
+
+    it('ignores self-wake events for faults already in the active pass', async () => {
+        const { worker, faultListeners } = makeWorker();
+        const repairFault = vi.spyOn(worker, 'repairFault').mockImplementation(async current => {
+            for (const listener of faultListeners)
+                listener(current);
+            return 'processed' as never;
+        });
+
+        worker.start(0);
+        await flushImmediate();
+        await Promise.resolve();
+
+        expect(repairFault).toHaveBeenCalledTimes(1);
+        worker.stop();
+    });
+
+    it('reuses one pre-repair verification for multiple faults on the same object in a pass', async () => {
+        const equorum = Object.assign(new Error('insufficient slices'), { code: 'EQUORUM' });
+        const { worker, deps } = makeWorker({
+            verifyObject: vi.fn().mockResolvedValue({
+                '0': { ok: false, volumeId: 1 },
+                '1': { ok: false, volumeId: 1 }
+            }),
+            repairSlice: vi.fn().mockRejectedValue(equorum)
+        });
+        deps.remediationService.listFaults.mockReturnValue([
+            fault(),
+            fault({ key: '1:obj1:1', sliceIndex: 1 })
+        ]);
+
+        await worker.processFaults();
+
+        expect(deps.verifyObject).toHaveBeenCalledTimes(1);
+        expect(deps.repairSlice).toHaveBeenCalledTimes(2);
     });
 
     it('coalesces overlapping repair passes instead of running them in parallel', async () => {
