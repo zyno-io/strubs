@@ -4,6 +4,7 @@ import { RepairWorker } from '../lib/remediation/repair-worker';
 import type { SliceFault } from '../lib/remediation/fault';
 
 const loggerFactory = () => vi.fn(() => Object.assign(vi.fn(), { error: vi.fn() })) as any;
+const flushImmediate = () => new Promise(resolve => setImmediate(resolve));
 
 const fault = (overrides?: Partial<SliceFault>): SliceFault => ({
     key: '1:obj1:0',
@@ -18,9 +19,21 @@ const fault = (overrides?: Partial<SliceFault>): SliceFault => ({
 });
 
 const makeWorker = (overrides?: any) => {
+    const faultListeners = new Set<(fault: SliceFault) => void>();
+    const unsubscribe = vi.fn();
     const deps = {
         database: { getObjectById: vi.fn().mockResolvedValue({ id: 'obj1', size: 10 }) },
-        remediationService: { listFaults: vi.fn(() => [fault()]), clearFault: vi.fn().mockResolvedValue(true) },
+        remediationService: {
+            listFaults: vi.fn(() => [fault()]),
+            clearFault: vi.fn().mockResolvedValue(true),
+            onSliceFault: vi.fn((listener: (fault: SliceFault) => void) => {
+                faultListeners.add(listener);
+                return () => {
+                    faultListeners.delete(listener);
+                    unsubscribe();
+                };
+            })
+        },
         notificationService: { notify: vi.fn().mockResolvedValue({ delivered: [], failed: [], suppressed: false }) },
         verifyObject: vi.fn(),
         loadObject: vi.fn().mockResolvedValue({ id: 'obj1', size: 10 }),
@@ -28,7 +41,7 @@ const makeWorker = (overrides?: any) => {
         createLogger: loggerFactory(),
         ...overrides
     };
-    return { worker: new RepairWorker(deps), deps };
+    return { worker: new RepairWorker(deps), deps, faultListeners, unsubscribe };
 };
 
 describe('RepairWorker', () => {
@@ -105,5 +118,60 @@ describe('RepairWorker', () => {
 
         expect(deps.repairSlice).not.toHaveBeenCalled();
         expect(deps.remediationService.clearFault).not.toHaveBeenCalled();
+    });
+
+    it('wakes a repair pass when a fault is reported even with periodic polling disabled', async () => {
+        const { worker, deps, faultListeners } = makeWorker();
+        const processFaults = vi.spyOn(worker, 'processFaults').mockResolvedValue(undefined);
+
+        worker.start(0);
+        expect(deps.remediationService.onSliceFault).toHaveBeenCalledTimes(1);
+
+        for (const listener of faultListeners)
+            listener(fault());
+        await flushImmediate();
+
+        expect(processFaults).toHaveBeenCalledTimes(1);
+        worker.stop();
+    });
+
+    it('coalesces overlapping repair passes instead of running them in parallel', async () => {
+        const { worker } = makeWorker();
+        let releaseFirst: () => void = () => {};
+        let enteredFirst: () => void = () => {};
+        let active = 0;
+        let maxActive = 0;
+        const firstEntered = new Promise<void>(resolve => {
+            enteredFirst = resolve;
+        });
+        const firstRelease = new Promise<void>(resolve => {
+            releaseFirst = resolve;
+        });
+
+        const repairFault = vi.spyOn(worker, 'repairFault')
+            .mockImplementationOnce(async () => {
+                active++;
+                maxActive = Math.max(maxActive, active);
+                enteredFirst();
+                await firstRelease;
+                active--;
+            })
+            .mockImplementationOnce(async () => {
+                active++;
+                maxActive = Math.max(maxActive, active);
+                active--;
+            });
+
+        const firstRun = worker.processFaults();
+        await firstEntered;
+        const secondRun = worker.processFaults();
+
+        expect(repairFault).toHaveBeenCalledTimes(1);
+        releaseFirst();
+        await firstRun;
+        await secondRun;
+
+        expect(repairFault).toHaveBeenCalledTimes(2);
+        expect(maxActive).toBe(1);
     });
 });

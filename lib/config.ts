@@ -9,6 +9,10 @@ dotenv.config();
 const log = createLogger('config');
 
 const VALID_SEVERITIES: Severity[] = ['info', 'warning', 'critical'];
+const DEFAULT_SCRUB_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_SYSLOG_WATCH_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_REPAIR_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_VOLUME_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
 
 function parseSeverity(value: string | undefined, fallback: Severity): Severity {
     if (value && (VALID_SEVERITIES as string[]).includes(value))
@@ -30,17 +34,19 @@ export class Config {
     slackMinSeverity: Severity;
     notifyCooldownMs: number;
 
-    // Rolling background scrub cadence. 0 (default) disables the scheduler;
+    // Rolling background scrub cadence. Set to 0 to disable the scheduler;
     // verification can still be triggered manually via the HTTP API.
     scrubIntervalMs: number;
 
-    // smartd/kernel log watcher cadence. 0 (default) disables it.
+    // smartd/kernel log watcher cadence. Set to 0 to disable it.
     systemLogWatchIntervalMs: number;
 
-    // Closed-loop slice repair worker cadence. 0 (default) disables it.
+    // Closed-loop slice repair worker safety-net cadence. Set to 0 to disable
+    // periodic polling; newly reported faults still wake a repair pass.
     repairIntervalMs: number;
 
     // Volume health monitor (auto read-only degradation) cadence + threshold.
+    // Set the interval to 0 to disable it.
     volumeHealthIntervalMs: number;
     volumeFaultThreshold: number;
 
@@ -55,16 +61,16 @@ export class Config {
             : 5 * 60 * 1000;
         this.scrubIntervalMs = process.env.STRUBS_SCRUB_INTERVAL_MS
             ? parseInt(process.env.STRUBS_SCRUB_INTERVAL_MS, 10)
-            : 0;
+            : DEFAULT_SCRUB_INTERVAL_MS;
         this.systemLogWatchIntervalMs = process.env.STRUBS_SYSLOG_WATCH_INTERVAL_MS
             ? parseInt(process.env.STRUBS_SYSLOG_WATCH_INTERVAL_MS, 10)
-            : 0;
+            : DEFAULT_SYSLOG_WATCH_INTERVAL_MS;
         this.repairIntervalMs = process.env.STRUBS_REPAIR_INTERVAL_MS
             ? parseInt(process.env.STRUBS_REPAIR_INTERVAL_MS, 10)
-            : 0;
+            : DEFAULT_REPAIR_INTERVAL_MS;
         this.volumeHealthIntervalMs = process.env.STRUBS_VOLUME_HEALTH_INTERVAL_MS
             ? parseInt(process.env.STRUBS_VOLUME_HEALTH_INTERVAL_MS, 10)
-            : 0;
+            : DEFAULT_VOLUME_HEALTH_INTERVAL_MS;
         this.volumeFaultThreshold = process.env.STRUBS_VOLUME_FAULT_THRESHOLD
             ? parseInt(process.env.STRUBS_VOLUME_FAULT_THRESHOLD, 10)
             : 10;

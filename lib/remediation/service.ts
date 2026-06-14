@@ -18,6 +18,8 @@ type RemediationServiceDeps = {
     now: () => number;
 };
 
+export type SliceFaultListener = (fault: SliceFault) => void;
+
 const defaultDeps: RemediationServiceDeps = {
     notificationService,
     faultStore: database,
@@ -25,15 +27,15 @@ const defaultDeps: RemediationServiceDeps = {
     now: () => Date.now()
 };
 
-// Minimal "detect & tell" pipeline: ingest slice faults from any detector,
-// coalesce repeats, classify a severity, and surface a notification. Durable
-// persistence and automated repair are deferred to later phases; the ingest
-// surface (reportSliceFault) is intentionally fire-and-forget so detectors on
-// the hot read path never block or throw.
+// Ingest slice faults from any detector, coalesce repeats, persist them,
+// notify operators, and wake any remediation subscribers. The ingest surface
+// (reportSliceFault) is intentionally fire-and-forget so detectors on the hot
+// read path never block or throw.
 export class RemediationService {
     private readonly deps: RemediationServiceDeps;
     private readonly log: ReturnType<typeof createLogger>;
     private readonly faults = new Map<string, SliceFault>();
+    private readonly faultListeners = new Set<SliceFaultListener>();
     // Per-key promise chain so persistence writes for a given fault are ordered
     // (an out-of-order upsert can't overwrite a newer count, and a clear can't
     // be overtaken by a still-pending upsert that resurrects the row).
@@ -48,6 +50,7 @@ export class RemediationService {
         try {
             const fault = this.record(input);
             this.persist(fault);
+            this.emitFault(fault);
             void this.announce(fault).catch(err => {
                 this.log.error('failed to announce fault %s: %s', fault.key, err instanceof Error ? err.message : String(err));
             });
@@ -56,6 +59,13 @@ export class RemediationService {
             // Never let fault reporting break the caller (read path / verify job).
             this.log.error('failed to record slice fault: %s', err instanceof Error ? err.message : String(err));
         }
+    }
+
+    onSliceFault(listener: SliceFaultListener): () => void {
+        this.faultListeners.add(listener);
+        return () => {
+            this.faultListeners.delete(listener);
+        };
     }
 
     // Load previously-persisted faults into memory at startup so counts and
@@ -160,6 +170,18 @@ export class RemediationService {
         this.faults.set(key, fault);
         this.log('new slice fault %s source=%s code=%s', key, fault.source, fault.code ?? 'n/a');
         return fault;
+    }
+
+    private emitFault(fault: SliceFault): void {
+        const snapshot = { ...fault };
+        for (const listener of this.faultListeners) {
+            try {
+                listener(snapshot);
+            }
+            catch (err) {
+                this.log.error('fault listener failed for %s: %s', fault.key, err instanceof Error ? err.message : String(err));
+            }
+        }
     }
 
     private async announce(fault: SliceFault): Promise<void> {

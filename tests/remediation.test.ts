@@ -53,6 +53,27 @@ describe('RemediationService', () => {
         expect(faults[0].code).toBe('EIO');
     });
 
+    it('notifies subscribers when a slice fault is reported', () => {
+        const { service } = makeService();
+        const listener = vi.fn();
+        const unsubscribe = service.onSliceFault(listener);
+
+        service.reportSliceFault({ objectId: 'obj1', sliceIndex: 0, volumeId: 7, source: 'read', code: 'EIO' });
+
+        expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+            key: '7:obj1:0',
+            objectId: 'obj1',
+            sliceIndex: 0,
+            volumeId: 7,
+            source: 'read',
+            code: 'EIO'
+        }));
+
+        unsubscribe();
+        service.reportSliceFault({ objectId: 'obj1', sliceIndex: 0, volumeId: 7, source: 'read', code: 'EIO' });
+        expect(listener).toHaveBeenCalledTimes(1);
+    });
+
     it('never throws into the caller when notification fails', async () => {
         const notify = vi.fn().mockRejectedValue(new Error('transport down'));
         const { service } = makeService(notify);

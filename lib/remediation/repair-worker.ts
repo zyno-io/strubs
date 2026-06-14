@@ -14,7 +14,7 @@ type SliceRepairerModule = typeof import('../io/file-object/slice-repairer');
 
 type RepairWorkerDeps = {
     database: Pick<typeof database, 'getObjectById'>;
-    remediationService: RemediationService;
+    remediationService: Pick<RemediationService, 'listFaults' | 'clearFault' | 'onSliceFault'>;
     notificationService: NotificationService;
     // Lazily imported so this module (and core) never pulls the native
     // reed-solomon binding unless a repair actually runs.
@@ -54,7 +54,11 @@ export class RepairWorker {
     private readonly log: ReturnType<typeof createLogger>;
     private readonly leases = new Set<string>();
     private timer: NodeJS.Timeout | null = null;
+    private wakeHandle: NodeJS.Immediate | null = null;
+    private unsubscribeFaults: (() => void) | null = null;
     private running = false;
+    private started = false;
+    private rerunRequested = false;
 
     constructor(deps?: Partial<RepairWorkerDeps>) {
         this.deps = { ...defaultDeps, ...deps };
@@ -62,15 +66,25 @@ export class RepairWorker {
     }
 
     start(intervalMs: number): void {
-        if (this.timer)
+        if (this.started)
             return;
+        this.started = true;
+
+        this.unsubscribeFaults = this.deps.remediationService.onSliceFault(fault => {
+            this.scheduleProcess(`fault ${fault.key}`);
+        });
+
         if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
-            this.log('repair worker disabled (no interval configured)');
-            return;
+            this.log('repair worker waiting for reported faults (periodic polling disabled)');
         }
-        this.log('repair worker polling every %dms', intervalMs);
-        this.timer = setInterval(() => void this.processFaults(), intervalMs);
-        this.timer.unref?.();
+        else {
+            this.log('repair worker polling every %dms', intervalMs);
+            this.timer = setInterval(() => void this.processFaults(), intervalMs);
+            this.timer.unref?.();
+        }
+
+        if (this.deps.remediationService.listFaults().length > 0)
+            this.scheduleProcess('startup faults');
     }
 
     stop(): void {
@@ -78,23 +92,56 @@ export class RepairWorker {
             clearInterval(this.timer);
             this.timer = null;
         }
+        if (this.wakeHandle) {
+            clearImmediate(this.wakeHandle);
+            this.wakeHandle = null;
+        }
+        this.unsubscribeFaults?.();
+        this.unsubscribeFaults = null;
+        this.started = false;
+        this.rerunRequested = false;
     }
 
     isScheduled(): boolean {
-        return this.timer !== null;
+        return this.started;
     }
 
     async processFaults(): Promise<void> {
-        if (this.running)
+        if (this.running) {
+            this.rerunRequested = true;
             return;
+        }
         this.running = true;
         try {
-            for (const fault of this.deps.remediationService.listFaults())
-                await this.repairFault(fault);
+            do {
+                this.rerunRequested = false;
+                for (const fault of this.deps.remediationService.listFaults())
+                    await this.repairFault(fault);
+            } while (this.rerunRequested);
         }
         finally {
             this.running = false;
         }
+    }
+
+    private scheduleProcess(reason: string): void {
+        if (!this.started)
+            return;
+        if (this.running) {
+            this.rerunRequested = true;
+            return;
+        }
+        if (this.wakeHandle)
+            return;
+
+        this.log('scheduling repair pass for %s', reason);
+        this.wakeHandle = setImmediate(() => {
+            this.wakeHandle = null;
+            void this.processFaults().catch(err => {
+                this.log.error('scheduled repair pass failed: %s', err instanceof Error ? err.message : String(err));
+            });
+        });
+        this.wakeHandle.unref?.();
     }
 
     async repairFault(fault: SliceFault): Promise<void> {
