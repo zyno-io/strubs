@@ -229,14 +229,14 @@ export class Database {
 
     private async ensureContentIndexes(): Promise<void> {
         try {
+            await this.dropInvalidSliceVerificationIndexes();
             await this.contentCollection.createIndexes([
                 { key: { containerId: 1, name: 1 }, name: 'containerContents', unique: true },
                 { key: { containerId: 1 }, name: 'containerId' },
                 { key: { lastVerifiedAt: 1 }, name: 'lastVerifiedAt' },
                 { key: { sliceErrors: 1 }, name: 'sliceErrors', sparse: true },
                 { key: { dataVolumes: 1 }, name: 'dataVolumes', sparse: true },
-                { key: { parityVolumes: 1 }, name: 'parityVolumes', sparse: true },
-                ...this.createSliceVerificationIndexes()
+                { key: { parityVolumes: 1 }, name: 'parityVolumes', sparse: true }
             ]);
         }
         catch (err) {
@@ -245,29 +245,16 @@ export class Database {
         }
     }
 
-    private createSliceVerificationIndexes(): Parameters<Collection<ContentDocument>['createIndexes']>[0] {
-        const indexes: Parameters<Collection<ContentDocument>['createIndexes']>[0] = [];
-        for (let index = 0; index < config.dataSliceCount; index++) {
-            indexes.push({
-                key: {
-                    [`dataVolumes.${index}`]: 1,
-                    [`sliceVerificationTimes.data.${index}`]: 1
-                },
-                name: `dataVolume${index}Verification`,
-                sparse: true
-            });
+    private async dropInvalidSliceVerificationIndexes(): Promise<void> {
+        const indexes = await this.contentCollection.indexes();
+        const invalidNames = indexes
+            .map(index => index.name)
+            .filter((name): name is string => typeof name === 'string'
+                && /^(data|parity)Volume\d+Verification$/.test(name));
+        for (const name of invalidNames) {
+            log('dropping invalid content index %s', name);
+            await this.contentCollection.dropIndex(name);
         }
-        for (let index = 0; index < config.paritySliceCount; index++) {
-            indexes.push({
-                key: {
-                    [`parityVolumes.${index}`]: 1,
-                    [`sliceVerificationTimes.parity.${index}`]: 1
-                },
-                name: `parityVolume${index}Verification`,
-                sparse: true
-            });
-        }
-        return indexes;
     }
 
     private async ensureFaultIndexes(): Promise<void> {

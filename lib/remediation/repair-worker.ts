@@ -12,7 +12,11 @@ type LoadedObject = { id?: string | null; size: number };
 type VerifyFileJobModule = typeof import('../jobs/verify-file-job');
 type FileObjectModule = typeof import('../io/file-object');
 type SliceRepairerModule = typeof import('../io/file-object/slice-repairer');
-type RepairPassContext = { verifications: Map<string, VerifyResult> };
+type RepairPassContext = {
+    verifications: Map<string, VerifyResult>;
+    insufficientObjects: Map<string, RepairBlockDetails | undefined>;
+    notifiedInsufficientObjects: Set<string>;
+};
 type RepairFaultResult = 'processed' | 'skipped' | 'cancelled';
 type RepairWorkerStartOptions = {
     batchSize?: number;
@@ -173,8 +177,13 @@ export class RepairWorker {
         try {
             do {
                 this.rerunRequested = false;
-                const faults = this.deps.remediationService.listFaults().filter(fault => this.shouldAttemptFault(fault));
-                const context: RepairPassContext = { verifications: new Map() };
+                const allFaults = this.deps.remediationService.listFaults();
+                const faults = allFaults.filter(fault => this.shouldAttemptFault(fault));
+                const context: RepairPassContext = {
+                    verifications: new Map(),
+                    insufficientObjects: this.currentInsufficientBlocks(allFaults),
+                    notifiedInsufficientObjects: new Set()
+                };
                 let visited = 0;
                 let hitBatchLimit = false;
 
@@ -258,10 +267,10 @@ export class RepairWorker {
         if (fault.repairStatus !== 'blocked')
             return true;
 
-        if (fault.repairBlockedReason === 'target-unwritable'
-            && typeof fault.volumeId === 'number'
-            && this.deps.isVolumeWritable(fault.volumeId))
-            return true;
+        if (fault.repairBlockedReason === 'target-unwritable') {
+            return typeof fault.volumeId === 'number'
+                && this.deps.isVolumeWritable(fault.volumeId);
+        }
 
         if (this.blockedRetryMs <= 0)
             return true;
@@ -270,13 +279,39 @@ export class RepairWorker {
         return this.deps.now() - lastAttempt >= this.blockedRetryMs;
     }
 
-    async repairFault(fault: SliceFault, context: RepairPassContext = { verifications: new Map() }): Promise<RepairFaultResult> {
+    private createPassContext(): RepairPassContext {
+        return {
+            verifications: new Map(),
+            insufficientObjects: new Map(),
+            notifiedInsufficientObjects: new Set()
+        };
+    }
+
+    private currentInsufficientBlocks(faults: SliceFault[]): Map<string, RepairBlockDetails | undefined> {
+        const blockedObjects = new Map<string, RepairBlockDetails | undefined>();
+        for (const fault of faults) {
+            if (fault.repairStatus !== 'blocked' || fault.repairBlockedReason !== 'insufficient-slices')
+                continue;
+            if (this.shouldAttemptFault(fault))
+                continue;
+            blockedObjects.set(fault.objectId, fault.repairDetails);
+        }
+        return blockedObjects;
+    }
+
+    async repairFault(fault: SliceFault, context: RepairPassContext = this.createPassContext()): Promise<RepairFaultResult> {
         if (this.stopping)
             return 'cancelled';
         if (this.leases.has(fault.key))
             return 'skipped';
         this.leases.add(fault.key);
         try {
+            const blockedDetails = context.insufficientObjects.get(fault.objectId);
+            if (blockedDetails !== undefined || context.insufficientObjects.has(fault.objectId)) {
+                await this.deps.remediationService.markRepairBlocked(fault.key, 'insufficient-slices', blockedDetails);
+                return 'processed';
+            }
+
             let record: unknown;
             try {
                 record = await this.deps.database.getObjectById(fault.objectId);
@@ -334,12 +369,13 @@ export class RepairWorker {
             }
             else if (code === 'EQUORUM') {
                 this.log.error('cannot repair %s slice %d: insufficient redundancy', fault.objectId, fault.sliceIndex);
-                await this.deps.remediationService.markRepairBlocked(
-                    fault.key,
-                    'insufficient-slices',
-                    this.repairBlockDetails(err, message)
-                );
-                await this.notify('critical', `Cannot repair object ${fault.objectId} slice ${fault.sliceIndex}: insufficient redundancy (data at risk)`, fault);
+                const details = this.repairBlockDetails(err, message);
+                context.insufficientObjects.set(fault.objectId, details);
+                await this.deps.remediationService.markRepairBlocked(fault.key, 'insufficient-slices', details);
+                if (!context.notifiedInsufficientObjects.has(fault.objectId)) {
+                    context.notifiedInsufficientObjects.add(fault.objectId);
+                    await this.notify('critical', `Cannot repair object ${fault.objectId}: insufficient redundancy (data at risk)`, fault);
+                }
             }
             else if (code === 'EVOLUMEUNWRITABLE') {
                 await this.markTargetUnwritable(fault, this.repairBlockDetails(err, message, { targetVolumeId: fault.volumeId ?? undefined }));

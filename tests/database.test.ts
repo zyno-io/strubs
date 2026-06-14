@@ -157,7 +157,12 @@ describe('database helpers', () => {
     it('connects to MongoDB and initializes collections', async () => {
         const db = createDatabase();
         const volumes = { volume: true };
-        const content = { content: true, createIndexes: vi.fn().mockResolvedValue([]) };
+        const content = {
+            content: true,
+            createIndexes: vi.fn().mockResolvedValue([]),
+            indexes: vi.fn().mockResolvedValue([]),
+            dropIndex: vi.fn().mockResolvedValue({})
+        };
         const collection = vi.fn((name: string) => name === 'volumes' ? volumes : content);
         const mockDb = { collection };
         const mockClient = { db: vi.fn().mockReturnValue(mockDb) };
@@ -170,6 +175,33 @@ describe('database helpers', () => {
         );
         expect((db as any)._collections.volumes).toBe(volumes);
         expect((db as any)._collections.content).toBe(content);
+
+        connectSpy.mockRestore();
+    });
+
+    it('drops invalid compound slice verification indexes during connect', async () => {
+        const db = createDatabase();
+        const volumes = { volume: true };
+        const content = {
+            createIndexes: vi.fn().mockResolvedValue([]),
+            indexes: vi.fn().mockResolvedValue([
+                { name: '_id_' },
+                { name: 'dataVolume0Verification' },
+                { name: 'parityVolume1Verification' },
+                { name: 'dataVolumes' }
+            ]),
+            dropIndex: vi.fn().mockResolvedValue({})
+        };
+        const collection = vi.fn((name: string) => name === 'volumes' ? volumes : content);
+        const mockDb = { collection };
+        const mockClient = { db: vi.fn().mockReturnValue(mockDb) };
+        const connectSpy = vi.spyOn(MongoClient, 'connect').mockResolvedValue(mockClient as any);
+
+        await db.connect();
+
+        expect(content.dropIndex).toHaveBeenCalledWith('dataVolume0Verification');
+        expect(content.dropIndex).toHaveBeenCalledWith('parityVolume1Verification');
+        expect(content.dropIndex).not.toHaveBeenCalledWith('dataVolumes');
 
         connectSpy.mockRestore();
     });

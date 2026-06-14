@@ -239,6 +239,25 @@ describe('RepairWorker', () => {
         expect(deps.remediationService.clearFault).toHaveBeenCalledWith('1:obj1:0');
     });
 
+    it('does not retry target-unwritable blocked faults just because the retry window elapsed', async () => {
+        const blocked = fault({
+            repairStatus: 'blocked',
+            repairBlockedReason: 'target-unwritable',
+            lastRepairAttemptAt: 0
+        });
+        const { worker, deps } = makeWorker({
+            blockedRetryMs: 500,
+            isVolumeWritable: vi.fn().mockReturnValue(false)
+        });
+        deps.remediationService.listFaults.mockReturnValue([blocked]);
+
+        await worker.processFaults();
+
+        expect(deps.database.getObjectById).not.toHaveBeenCalled();
+        expect(deps.verifyObject).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairBlocked).not.toHaveBeenCalled();
+    });
+
     it('leaves the fault on a transient DB error (no ENOENT)', async () => {
         const { worker, deps } = makeWorker({
             database: { getObjectById: vi.fn().mockRejectedValue(new Error('connection reset')) }
@@ -324,8 +343,11 @@ describe('RepairWorker', () => {
         worker.stop();
     });
 
-    it('reuses one pre-repair verification for multiple faults on the same object in a pass', async () => {
-        const equorum = Object.assign(new Error('insufficient slices'), { code: 'EQUORUM' });
+    it('blocks sibling faults after one insufficient-redundancy repair attempt for an object', async () => {
+        const equorum = Object.assign(new Error('insufficient slices'), {
+            code: 'EQUORUM',
+            repairDetails: { requiredSlices: 4, availableSlices: 3 }
+        });
         const { worker, deps } = makeWorker({
             verifyObject: vi.fn().mockResolvedValue({
                 '0': { ok: false, volumeId: 1 },
@@ -341,7 +363,45 @@ describe('RepairWorker', () => {
         await worker.processFaults();
 
         expect(deps.verifyObject).toHaveBeenCalledTimes(1);
-        expect(deps.repairSlice).toHaveBeenCalledTimes(2);
+        expect(deps.repairSlice).toHaveBeenCalledTimes(1);
+        expect(deps.remediationService.markRepairBlocked).toHaveBeenCalledWith(
+            '1:obj1:0',
+            'insufficient-slices',
+            expect.objectContaining({ requiredSlices: 4, availableSlices: 3 })
+        );
+        expect(deps.remediationService.markRepairBlocked).toHaveBeenCalledWith(
+            '1:obj1:1',
+            'insufficient-slices',
+            expect.objectContaining({ requiredSlices: 4, availableSlices: 3 })
+        );
+        expect(deps.notificationService.notify).toHaveBeenCalledTimes(1);
+    });
+
+    it('blocks pending siblings of a not-yet-retryable insufficient-slices fault without repair', async () => {
+        const blocked = fault({
+            key: '1:obj1:0',
+            sliceIndex: 0,
+            repairStatus: 'blocked',
+            repairBlockedReason: 'insufficient-slices',
+            repairBlockedAt: 900,
+            lastRepairAttemptAt: 900,
+            repairDetails: { requiredSlices: 4, availableSlices: 3 }
+        });
+        const pending = fault({ key: '1:obj1:1', sliceIndex: 1 });
+        const { worker, deps } = makeWorker();
+        deps.remediationService.listFaults.mockReturnValue([blocked, pending]);
+
+        await worker.processFaults();
+
+        expect(deps.database.getObjectById).not.toHaveBeenCalled();
+        expect(deps.verifyObject).not.toHaveBeenCalled();
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairAttempted).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairBlocked).toHaveBeenCalledWith(
+            '1:obj1:1',
+            'insufficient-slices',
+            expect.objectContaining({ requiredSlices: 4, availableSlices: 3 })
+        );
     });
 
     it('coalesces overlapping repair passes instead of running them in parallel', async () => {
