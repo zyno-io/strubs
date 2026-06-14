@@ -18,7 +18,7 @@ const createLoggerFactory = () => {
 const createDeps = () => {
     const database = {
         findObjectsNeedingVerification: vi.fn(),
-        findObjectsOnVolumes: vi.fn().mockResolvedValue([]),
+        findObjectsOnVolumesNeedingVerification: vi.fn().mockResolvedValue([]),
         updateObjectVerificationState: vi.fn().mockResolvedValue(undefined),
         setVolumeVerifyErrors: vi.fn().mockResolvedValue(undefined),
         countObjectsVerifiedSince: vi.fn().mockResolvedValue(0)
@@ -53,7 +53,42 @@ const createDeps = () => {
     };
 };
 
+const times = (startedAt: string, data: boolean[], parity: boolean[] = []) => ({
+    data: data.map(verified => verified ? new Date(startedAt) : null),
+    parity: parity.map(verified => verified ? new Date(startedAt) : null)
+});
+
 describe('VerifyVolumesJob', () => {
+    it('reports full verification scope by default', () => {
+        const job = new VerifyVolumesJob(createDeps());
+        expect(job.getStatus()).toMatchObject({
+            running: false,
+            scope: 'full',
+            volumeIds: []
+        });
+    });
+
+    it('reports targeted verification scope while a filtered run is active', () => {
+        const job = new VerifyVolumesJob(createDeps());
+        Object.assign(job as unknown as {
+            running: Promise<void>;
+            startedAt: string;
+            volumeFilter: Set<number>;
+            currentConcurrency: number;
+        }, {
+            running: Promise.resolve(),
+            startedAt: '2024-02-01T00:00:00.000Z',
+            volumeFilter: new Set([2, 1]),
+            currentConcurrency: 2
+        });
+
+        expect(job.getStatus()).toMatchObject({
+            running: true,
+            scope: 'targeted',
+            volumeIds: [1, 2]
+        });
+    });
+
     it('verifies objects and records lastVerify metadata', async () => {
         const deps = createDeps();
         const record = {
@@ -90,7 +125,8 @@ describe('VerifyVolumesJob', () => {
         expect(sliceVerifier.verifySlice).toHaveBeenCalledWith(0);
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
             lastVerifiedAt: new Date(startedAt),
-            sliceErrors: null
+            sliceErrors: null,
+            sliceVerificationTimes: times(startedAt, [true])
         });
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenCalledTimes(2);
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(1, 1, { checksum: 0, total: 0 });
@@ -169,11 +205,13 @@ describe('VerifyVolumesJob', () => {
         expect(verifierSpies[1]).toHaveBeenCalledWith(0);
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(recordA.id, {
             lastVerifiedAt: new Date(startedAt),
-            sliceErrors: null
+            sliceErrors: null,
+            sliceVerificationTimes: times(startedAt, [true])
         });
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(recordB.id, {
             lastVerifiedAt: new Date(startedAt),
-            sliceErrors: null
+            sliceErrors: null,
+            sliceVerificationTimes: times(startedAt, [true])
         });
     });
 
@@ -220,7 +258,8 @@ describe('VerifyVolumesJob', () => {
         expect(sliceVerifier.verifySlice).toHaveBeenCalledTimes(1);
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
             lastVerifiedAt: new Date(startedAt),
-            sliceErrors: { '0': { checksum: true, type: 'data' } }
+            sliceErrors: { '0': { checksum: true, type: 'data' } },
+            sliceVerificationTimes: times(startedAt, [true])
         });
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenCalledTimes(3);
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(1, 1, { checksum: 0, total: 0 });
@@ -326,7 +365,8 @@ describe('VerifyVolumesJob', () => {
             sliceErrors: {
                 '0': { err: 'data failed', type: 'data' },
                 '1': { err: 'parity failed', type: 'parity' }
-            }
+            },
+            sliceVerificationTimes: times(startedAt, [true], [true])
         });
 
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenCalledTimes(4);
@@ -444,7 +484,8 @@ describe('VerifyVolumesJob', () => {
 
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
             lastVerifiedAt: new Date(startedAt),
-            sliceErrors: { '0': { checksum: true, type: 'data' } }
+            sliceErrors: { '0': { checksum: true, type: 'data' } },
+            sliceVerificationTimes: times(startedAt, [true])
         });
         expect(deps.runtimeConfig.set).toHaveBeenCalledWith('verifyStartedAt', startedAt);
         expect(deps.runtimeConfig.set).not.toHaveBeenCalledWith('lastVerify', expect.anything());
@@ -515,7 +556,7 @@ describe('VerifyVolumesJob', () => {
         };
 
         deps.runtimeConfig.get.mockResolvedValueOnce(null);
-        deps.database.findObjectsOnVolumes
+        deps.database.findObjectsOnVolumesNeedingVerification
             .mockResolvedValueOnce([record])
             .mockResolvedValueOnce([]);
 
@@ -532,17 +573,18 @@ describe('VerifyVolumesJob', () => {
         expect(verifySlice).toHaveBeenCalledTimes(2);
         expect(verifySlice).toHaveBeenNthCalledWith(1, 1);
         expect(verifySlice).toHaveBeenNthCalledWith(2, 2);
-        // Targeted runs record slice errors but must NOT advance the rolling
-        // scrub watermark (lastVerifiedAt), so the scrub still covers all slices.
+        // Targeted runs stamp only the matching slices, so the whole-object
+        // watermark cannot advance until every slice has a verification time.
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
-            sliceErrors: null
+            sliceErrors: null,
+            sliceVerificationTimes: times(startedAt, [false, true], [true])
         });
         expect(deps.database.updateObjectVerificationState).not.toHaveBeenCalledWith(record.id, expect.objectContaining({
             lastVerifiedAt: expect.anything()
         }));
-        // Targeted runs paginate by _id cursor, not the lastVerifiedAt watermark.
-        expect(deps.database.findObjectsOnVolumes).toHaveBeenNthCalledWith(1, null, 25, [2]);
-        expect(deps.database.findObjectsOnVolumes).toHaveBeenNthCalledWith(2, 'vol-filter', 25, [2]);
+        // Targeted runs resume by per-slice timestamps, not a transient _id cursor.
+        expect(deps.database.findObjectsOnVolumesNeedingVerification).toHaveBeenNthCalledWith(1, new Date(startedAt), 25, [2]);
+        expect(deps.database.findObjectsOnVolumesNeedingVerification).toHaveBeenNthCalledWith(2, new Date(startedAt), 25, [2]);
         expect(deps.database.findObjectsNeedingVerification).not.toHaveBeenCalled();
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenCalledTimes(1);
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(1, 2, { checksum: 0, total: 0 });
@@ -575,7 +617,7 @@ describe('VerifyVolumesJob', () => {
         };
 
         deps.runtimeConfig.get.mockResolvedValueOnce(null);
-        deps.database.findObjectsOnVolumes
+        deps.database.findObjectsOnVolumesNeedingVerification
             .mockResolvedValueOnce([record])
             .mockResolvedValueOnce([]);
 
@@ -583,13 +625,14 @@ describe('VerifyVolumesJob', () => {
         deps.createSliceVerifier.mockReturnValue({ verifySlice: vi.fn().mockResolvedValue(undefined) });
 
         const job = new VerifyVolumesJob(deps);
-        await job.start({ volumeIds: [2] });
+        const { startedAt } = await job.start({ volumeIds: [2] });
         const running = (job as unknown as { running: Promise<void> | null }).running;
         if (running)
             await running;
 
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
-            sliceErrors: { '0': existingError }
+            sliceErrors: { '0': existingError },
+            sliceVerificationTimes: times(startedAt, [false, true], [false])
         });
     });
 

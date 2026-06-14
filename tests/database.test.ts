@@ -38,6 +38,7 @@ describe('database helpers', () => {
             findOne: vi.fn(),
             insertOne: vi.fn(),
             deleteOne: vi.fn(),
+            updateOne: vi.fn(),
             createIndexes: vi.fn().mockResolvedValue([])
         };
         (db as any)._collections = { volumes, content };
@@ -366,6 +367,72 @@ describe('database helpers', () => {
         await db.deleteObjectById(id);
 
         expect(content.deleteOne).toHaveBeenCalledWith({ _id: expect.any(ObjectId) });
+    });
+
+    it('finds targeted objects by stale per-slice verification time', async () => {
+        const { db, content } = createDbWithCollections();
+        const startedAt = new Date('2026-06-14T00:00:00.000Z');
+        const toArray = vi.fn().mockResolvedValue([]);
+        content.find.mockReturnValue({ toArray });
+
+        await db.findObjectsOnVolumesNeedingVerification(startedAt, 25, [2]);
+
+        const [query, options] = content.find.mock.calls[0];
+        expect(query).toEqual(expect.objectContaining({
+            isFile: true,
+            $or: expect.arrayContaining([
+                expect.objectContaining({
+                    'dataVolumes.0': { $in: [2] },
+                    $and: expect.arrayContaining([
+                        expect.objectContaining({
+                            $or: expect.arrayContaining([
+                                { 'sliceVerificationTimes.data.0': { $lt: startedAt } },
+                                { 'sliceVerificationTimes.data.0': { $exists: false } },
+                                { 'sliceVerificationTimes.data.0': null }
+                            ])
+                        }),
+                        expect.objectContaining({
+                            $or: expect.arrayContaining([
+                                { lastVerifiedAt: { $lt: startedAt } },
+                                { lastVerifiedAt: { $exists: false } },
+                                { lastVerifiedAt: null }
+                            ])
+                        })
+                    ])
+                })
+            ])
+        }));
+        expect(options).toEqual({ sort: { _id: 1 }, limit: 25 });
+    });
+
+    it('persists slice verification times with verification state updates', async () => {
+        const { db, content } = createDbWithCollections();
+        const id = new ObjectId().toHexString();
+        const verifiedAt = new Date('2026-06-14T01:00:00.000Z');
+        content.updateOne.mockResolvedValue({});
+
+        await db.updateObjectVerificationState(id, {
+            lastVerifiedAt: verifiedAt,
+            sliceErrors: null,
+            sliceVerificationTimes: {
+                data: [verifiedAt],
+                parity: []
+            }
+        });
+
+        expect(content.updateOne).toHaveBeenCalledWith(
+            { _id: expect.any(ObjectId) },
+            {
+                $set: {
+                    lastVerifiedAt: verifiedAt,
+                    sliceVerificationTimes: {
+                        data: [verifiedAt],
+                        parity: []
+                    }
+                },
+                $unset: { sliceErrors: '' }
+            }
+        );
     });
 
     it('creates containers when requested and caches the results', async () => {

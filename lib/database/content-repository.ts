@@ -1,8 +1,9 @@
 import { Collection, ObjectId, type Filter } from 'mongodb';
 
+import { config } from '../config';
 import { createError } from '../helpers';
 import { ContainerCache } from './container-cache';
-import type { ContentDocument, ContainerPath, ObjectIdentifier, SliceErrorInfo } from './types';
+import type { ContentDocument, ContainerPath, ObjectIdentifier, ObjectVerificationStateUpdate } from './types';
 
 type NormalizeFn = <T extends ContentDocument>(object: T) => T & { id: string; containerId?: string | null };
 type MongoIdFn = (id: ObjectIdentifier) => ObjectId | null;
@@ -82,22 +83,12 @@ export class ContentRepository {
     }
 
     async findObjectsNeedingVerification(startedAt: Date, limit: number, volumeIds?: number[]): Promise<ContentDocument[]> {
-        const conditions: Filter<ContentDocument>[] = [
-            {
-                $or: [
-                    { lastVerifiedAt: { $lt: startedAt } },
-                    { lastVerifiedAt: { $exists: false } }
-                ]
-            }
-        ];
-        if (Array.isArray(volumeIds) && volumeIds.length) {
-            conditions.push({
-                $or: [
-                    { dataVolumes: { $in: volumeIds } },
-                    { parityVolumes: { $in: volumeIds } }
-                ]
-            });
-        }
+        const staleSliceConditions = Array.isArray(volumeIds) && volumeIds.length
+            ? this.buildStaleSliceConditions(startedAt, volumeIds)
+            : [];
+        const conditions: Filter<ContentDocument>[] = staleSliceConditions.length
+            ? [{ $or: staleSliceConditions }]
+            : [this.timestampIsStale('lastVerifiedAt', startedAt)];
         const query: Filter<ContentDocument> = {
             isFile: true,
             $and: conditions
@@ -110,25 +101,16 @@ export class ContentRepository {
         return objects.map(object => this.normalize(object));
     }
 
-    // Targeted verification: a single forward pass over every object that has a
-    // slice on the given volumes, paginated by _id. Unlike the rolling scrub this
-    // does NOT depend on or mutate `lastVerifiedAt`, so a targeted run can never
-    // advance the rolling watermark and cause the scrub to skip unverified slices.
-    async findObjectsOnVolumes(afterId: ObjectIdentifier, limit: number, volumeIds: number[]): Promise<ContentDocument[]> {
-        const conditions: Filter<ContentDocument>[] = [
-            {
-                $or: [
-                    { dataVolumes: { $in: volumeIds } },
-                    { parityVolumes: { $in: volumeIds } }
-                ]
-            }
-        ];
-        const afterObjectId = afterId ? this.toMongoId(afterId) : null;
-        if (afterObjectId)
-            conditions.push({ _id: { $gt: afterObjectId } });
+    // Targeted verification resumes by per-slice timestamps. Objects already
+    // stamped for every requested volume slice at this run's start time fall out
+    // of the query, so a restart continues without a separate cursor.
+    async findObjectsOnVolumesNeedingVerification(startedAt: Date, limit: number, volumeIds: number[]): Promise<ContentDocument[]> {
+        const staleSliceConditions = this.buildStaleSliceConditions(startedAt, volumeIds);
+        if (!staleSliceConditions.length)
+            return [];
         const query: Filter<ContentDocument> = {
             isFile: true,
-            $and: conditions
+            $or: staleSliceConditions
         };
         const cursor = this.collection.find<ContentDocument>(query, {
             sort: { _id: 1 },
@@ -139,29 +121,31 @@ export class ContentRepository {
     }
 
     async countObjectsVerifiedSince(startedAt: Date, volumeIds?: number[]): Promise<number> {
-        const conditions: Filter<ContentDocument>[] = [
-            {
-                lastVerifiedAt: { $gte: startedAt }
-            }
-        ];
         if (Array.isArray(volumeIds) && volumeIds.length) {
-            conditions.push({
+            const staleSliceConditions = this.buildStaleSliceConditions(startedAt, volumeIds);
+            const conditions: Filter<ContentDocument>[] = [{
                 $or: [
                     { dataVolumes: { $in: volumeIds } },
                     { parityVolumes: { $in: volumeIds } }
                 ]
+            }];
+            if (staleSliceConditions.length)
+                conditions.push({ $nor: staleSliceConditions });
+            return this.collection.countDocuments({
+                isFile: true,
+                $and: conditions
             });
         }
         const query: Filter<ContentDocument> = {
             isFile: true,
-            $and: conditions
+            lastVerifiedAt: { $gte: startedAt }
         };
         return this.collection.countDocuments(query);
     }
 
     async updateObjectVerificationState(
         id: ObjectIdentifier,
-        updates: { lastVerifiedAt?: Date; sliceErrors?: Record<string, SliceErrorInfo> | null }
+        updates: ObjectVerificationStateUpdate
     ): Promise<void> {
         const set: Record<string, unknown> = {};
         const unset: Record<string, unknown> = {};
@@ -173,6 +157,12 @@ export class ContentRepository {
                 unset.sliceErrors = '';
             else
                 set.sliceErrors = updates.sliceErrors;
+        }
+        if (updates.sliceVerificationTimes !== undefined) {
+            if (updates.sliceVerificationTimes === null)
+                unset.sliceVerificationTimes = '';
+            else
+                set.sliceVerificationTimes = updates.sliceVerificationTimes;
         }
 
         const updateDoc: Record<string, Record<string, unknown>> = {};
@@ -188,6 +178,43 @@ export class ContentRepository {
             { _id: this.toMongoId(id) as ObjectId },
             updateDoc
         );
+    }
+
+    private buildStaleSliceConditions(startedAt: Date, volumeIds: number[]): Filter<ContentDocument>[] {
+        const uniqueVolumeIds = Array.from(new Set(volumeIds.filter(id => Number.isFinite(id))));
+        if (!uniqueVolumeIds.length)
+            return [];
+
+        const conditions: Filter<ContentDocument>[] = [];
+        for (let index = 0; index < config.dataSliceCount; index++) {
+            conditions.push({
+                [`dataVolumes.${index}`]: { $in: uniqueVolumeIds },
+                $and: [
+                    this.timestampIsStale(`sliceVerificationTimes.data.${index}`, startedAt),
+                    this.timestampIsStale('lastVerifiedAt', startedAt)
+                ]
+            } as Filter<ContentDocument>);
+        }
+        for (let index = 0; index < config.paritySliceCount; index++) {
+            conditions.push({
+                [`parityVolumes.${index}`]: { $in: uniqueVolumeIds },
+                $and: [
+                    this.timestampIsStale(`sliceVerificationTimes.parity.${index}`, startedAt),
+                    this.timestampIsStale('lastVerifiedAt', startedAt)
+                ]
+            } as Filter<ContentDocument>);
+        }
+        return conditions;
+    }
+
+    private timestampIsStale(path: string, startedAt: Date): Filter<ContentDocument> {
+        return {
+            $or: [
+                { [path]: { $lt: startedAt } },
+                { [path]: { $exists: false } },
+                { [path]: null }
+            ]
+        } as Filter<ContentDocument>;
     }
 
     async getOrCreateContainer(path: ContainerPath): Promise<string | null> {

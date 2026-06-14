@@ -6,6 +6,7 @@ import { ioManager } from '../../io/manager';
 import { deviceProvisioner } from '../../io/device-provisioner';
 import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
+import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
 import { verifyFileJob } from '../../jobs/verify-file-job';
 import { database } from '../../database';
 import type { HttpRequest, HttpResponse, HttpContentPayload } from './server';
@@ -99,16 +100,7 @@ type StatusResponse = {
 
 type DebugResponse = {
     priorityStats: Array<{ volumeId: number; highCount: number; waiters: number }>;
-    verifyStatus: {
-        running: boolean;
-        startedAt: string | null;
-        objectsVerified: number;
-        errors: {
-            total: number;
-            volumes: Record<string, number>;
-        };
-        concurrency: number;
-    };
+    verifyStatus: VerifyVolumesStatus;
 };
 
 export class HttpMgmt {
@@ -282,7 +274,7 @@ export class HttpMgmt {
         return { stopped: true };
     }
 
-    private static async handleVerifyVolumesJobStatusRequest(): Promise<{ running: boolean; startedAt: string | null; objectsVerified: number; errors: { total: number; volumes: Record<string, number> }; concurrency: number }> {
+    private static async handleVerifyVolumesJobStatusRequest(): Promise<VerifyVolumesStatus> {
         return verifyVolumesJob.getStatus();
     }
 

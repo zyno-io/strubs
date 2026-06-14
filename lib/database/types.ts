@@ -19,6 +19,7 @@ export interface ContentDocument {
     md5?: Buffer | null;
     mime?: string | null;
     lastVerifiedAt?: Date | null;
+    sliceVerificationTimes?: SliceVerificationTimes;
     sliceErrors?: Record<string, SliceErrorInfo>;
     [key: string]: any;
 }
@@ -27,4 +28,15 @@ export type SliceErrorInfo = {
     checksum?: boolean;
     err?: string;
     type?: 'data' | 'parity';
+};
+
+export type SliceVerificationTimes = {
+    data?: Array<Date | null>;
+    parity?: Array<Date | null>;
+};
+
+export type ObjectVerificationStateUpdate = {
+    lastVerifiedAt?: Date | null;
+    sliceErrors?: Record<string, SliceErrorInfo> | null;
+    sliceVerificationTimes?: SliceVerificationTimes | null;
 };

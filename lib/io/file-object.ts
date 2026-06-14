@@ -1,7 +1,7 @@
 import { Duplex } from 'stream';
 
 import { database } from '../database';
-import type { ContentDocument, SliceErrorInfo } from '../database';
+import type { ContentDocument, SliceErrorInfo, SliceVerificationTimes } from '../database';
 import { createLogger } from '../log';
 
 import { generateObjectId } from './helpers';
@@ -31,6 +31,7 @@ export interface StoredObjectRecord extends ContentDocument {
     unavailableSlices?: number[];
     damagedSlices?: number[];
     sliceErrors?: Record<string, SliceErrorInfo>;
+    sliceVerificationTimes?: SliceVerificationTimes;
     lastVerifiedAt?: Date | null;
 }
 

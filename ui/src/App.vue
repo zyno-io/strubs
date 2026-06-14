@@ -36,6 +36,8 @@ interface VerifyStatus {
   objectsVerified: number;
   errors: { total: number; volumes: Record<string, number> };
   concurrency: number;
+  scope?: 'full' | 'targeted';
+  volumeIds?: number[];
 }
 const verifyStatus = ref<VerifyStatus | null>(null);
 const verifyActionPending = ref<boolean>(false);
@@ -107,6 +109,21 @@ const verifyVolumeErrors = computed<Array<{ volumeId: string; count: number }>>(
     .map(([volumeId, count]) => ({ volumeId, count }))
     .filter(entry => entry.count > 0)
     .sort((a, b) => b.count - a.count);
+});
+
+const verifyScopeLabel = computed<string>(() => {
+  if (verifyStatus.value?.scope === 'targeted' && (verifyStatus.value.volumeIds?.length ?? 0) > 0)
+    return 'Targeted';
+  return 'Full scrub';
+});
+
+const verifyTargetVolumes = computed<Array<{ id: number; label: string }>>(() => {
+  const ids = verifyStatus.value?.volumeIds ?? [];
+  return ids.map(id => {
+    const volume = volumes.value.find(candidate => candidate.id === id);
+    const suffix = volume?.label ? ` (${volume.label})` : '';
+    return { id, label: `vol ${id}${suffix}` };
+  });
 });
 
 // Fetch data from APIs
@@ -596,6 +613,20 @@ onUnmounted(() => {
           <span class="verify-stat-label">Concurrency</span>
           <span class="verify-stat-value">{{ verifyStatus?.concurrency ?? 0 }}</span>
         </div>
+        <div class="verify-stat">
+          <span class="verify-stat-label">Scope</span>
+          <span class="verify-stat-value">{{ verifyScopeLabel }}</span>
+        </div>
+      </div>
+      <div v-if="verifyTargetVolumes.length > 0" class="verify-targets">
+        <span class="verify-stat-label">Target Volumes:</span>
+        <span
+          v-for="entry in verifyTargetVolumes"
+          :key="entry.id"
+          class="verify-target-badge"
+        >
+          {{ entry.label }}
+        </span>
       </div>
       <div v-if="verifyVolumeErrors.length > 0" class="verify-volume-errors">
         <span class="verify-stat-label">Errors by volume:</span>
@@ -1211,6 +1242,25 @@ h2 {
   margin-top: 16px;
   padding-top: 16px;
   border-top: 1px solid #eee;
+}
+
+.verify-targets {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #eee;
+}
+
+.verify-target-badge {
+  background-color: #e3f2fd;
+  color: #1565c0;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .verify-volume-badge {

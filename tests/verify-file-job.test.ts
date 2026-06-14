@@ -84,7 +84,12 @@ describe('VerifyFileJob', () => {
         });
         expect(databaseMock.updateObjectVerificationState).toHaveBeenCalledTimes(1);
         expect(databaseMock.updateObjectVerificationState).toHaveBeenCalledWith(record.id, expect.objectContaining({
-            sliceErrors: null
+            lastVerifiedAt: expect.any(Date),
+            sliceErrors: null,
+            sliceVerificationTimes: {
+                data: [expect.any(Date), expect.any(Date)],
+                parity: [expect.any(Date)]
+            }
         }));
         expect(createSliceVerifierMock).toHaveBeenCalledTimes(3);
     });
@@ -112,8 +117,13 @@ describe('VerifyFileJob', () => {
         expect(result['0']).toEqual({ ok: true, type: 'data', volumeId: 1 });
         expect(result['2']).toEqual({ ok: true, type: 'parity', volumeId: 3 });
         expect(databaseMock.updateObjectVerificationState).toHaveBeenCalledWith(record.id, expect.objectContaining({
+            lastVerifiedAt: expect.any(Date),
             sliceErrors: {
                 '1': { checksum: true, type: 'data' }
+            },
+            sliceVerificationTimes: {
+                data: [expect.any(Date), expect.any(Date)],
+                parity: [expect.any(Date)]
             }
         }));
         expect(createSliceVerifierMock).toHaveBeenCalledTimes(3);

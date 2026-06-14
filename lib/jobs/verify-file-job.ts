@@ -4,6 +4,7 @@ import { fileObjectService, type FileObjectService } from '../io/file-object/ser
 import type { FileObject, StoredObjectRecord } from '../io/file-object';
 import { FileObjectSliceVerifier } from '../io/file-object/slice-verifier';
 import { createError } from '../helpers';
+import { buildObjectVerificationStateUpdate } from '../verification-state';
 
 type VerifyFileJobDeps = {
     database: typeof database;
@@ -51,6 +52,7 @@ export class VerifyFileJob {
         const totalSlices = record.dataVolumes.length + record.parityVolumes.length;
         const sliceResults: VerifyFileJobResult = {};
         const sliceErrors: Record<string, SliceErrorInfo> = {};
+        const verifiedAt = new Date();
 
         const tasks: Promise<void>[] = [];
         for (let sliceIndex = 0; sliceIndex < totalSlices; sliceIndex++) {
@@ -66,10 +68,10 @@ export class VerifyFileJob {
         }
         await Promise.all(tasks);
 
-        await this.deps.database.updateObjectVerificationState(record.id, {
-            lastVerifiedAt: new Date(),
-            sliceErrors: Object.keys(sliceErrors).length ? sliceErrors : null
-        });
+        await this.deps.database.updateObjectVerificationState(
+            record.id,
+            buildObjectVerificationStateUpdate(record, verifiedAt, sliceErrors, new Set(Object.keys(sliceResults)))
+        );
 
         return sliceResults;
     }

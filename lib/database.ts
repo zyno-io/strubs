@@ -8,8 +8,8 @@ import { ContentRepository } from './database/content-repository';
 import { VolumeRepository, type VolumeVerifyErrors } from './database/volume-repository';
 import { RuntimeConfigRepository } from './database/runtime-config';
 import { FaultRepository, type FaultDocument, type FaultUpsert } from './database/fault-repository';
-import type { ContainerPath, ContentDocument, ObjectIdentifier, SliceErrorInfo } from './database/types';
-export type { ContentDocument, SliceErrorInfo } from './database/types';
+import type { ContainerPath, ContentDocument, ObjectIdentifier, ObjectVerificationStateUpdate, SliceErrorInfo } from './database/types';
+export type { ContentDocument, ObjectVerificationStateUpdate, SliceErrorInfo, SliceVerificationTimes } from './database/types';
 export type { FaultDocument, FaultUpsert } from './database/fault-repository';
 
 const log = createLogger('database');
@@ -140,8 +140,8 @@ export class Database {
         return this.contentRepository.findObjectsNeedingVerification(startedAt, limit, volumeIds);
     }
 
-    async findObjectsOnVolumes(afterId: ObjectIdentifier, limit: number, volumeIds: number[]): Promise<ContentDocument[]> {
-        return this.contentRepository.findObjectsOnVolumes(afterId, limit, volumeIds);
+    async findObjectsOnVolumesNeedingVerification(startedAt: Date, limit: number, volumeIds: number[]): Promise<ContentDocument[]> {
+        return this.contentRepository.findObjectsOnVolumesNeedingVerification(startedAt, limit, volumeIds);
     }
 
     async countObjectsVerifiedSince(startedAt: Date, volumeIds?: number[]): Promise<number> {
@@ -150,7 +150,7 @@ export class Database {
 
     async updateObjectVerificationState(
         id: ObjectIdentifier,
-        updates: { lastVerifiedAt?: Date; sliceErrors?: Record<string, SliceErrorInfo> | null }
+        updates: ObjectVerificationStateUpdate
     ): Promise<void> {
         await this.contentRepository.updateObjectVerificationState(id, updates);
     }
@@ -206,13 +206,39 @@ export class Database {
                 { key: { lastVerifiedAt: 1 }, name: 'lastVerifiedAt' },
                 { key: { sliceErrors: 1 }, name: 'sliceErrors', sparse: true },
                 { key: { dataVolumes: 1 }, name: 'dataVolumes', sparse: true },
-                { key: { parityVolumes: 1 }, name: 'parityVolumes', sparse: true }
+                { key: { parityVolumes: 1 }, name: 'parityVolumes', sparse: true },
+                ...this.createSliceVerificationIndexes()
             ]);
         }
         catch (err) {
             log.error('failed to ensure content indexes', err);
             throw err;
         }
+    }
+
+    private createSliceVerificationIndexes(): Parameters<Collection<ContentDocument>['createIndexes']>[0] {
+        const indexes: Parameters<Collection<ContentDocument>['createIndexes']>[0] = [];
+        for (let index = 0; index < config.dataSliceCount; index++) {
+            indexes.push({
+                key: {
+                    [`dataVolumes.${index}`]: 1,
+                    [`sliceVerificationTimes.data.${index}`]: 1
+                },
+                name: `dataVolume${index}Verification`,
+                sparse: true
+            });
+        }
+        for (let index = 0; index < config.paritySliceCount; index++) {
+            indexes.push({
+                key: {
+                    [`parityVolumes.${index}`]: 1,
+                    [`sliceVerificationTimes.parity.${index}`]: 1
+                },
+                name: `parityVolume${index}Verification`,
+                sparse: true
+            });
+        }
+        return indexes;
     }
 
     private async ensureFaultIndexes(): Promise<void> {
