@@ -30,7 +30,8 @@ describe('StorageStatsTracker', () => {
             getStorageStats: vi.fn(),
             backfillContentSliceSizes: vi.fn().mockResolvedValue(0),
             computeStorageStats: vi.fn(),
-            replaceStorageStats: vi.fn()
+            replaceStorageStats: vi.fn(),
+            refreshStorageStatsUnavailable: vi.fn()
         };
         const tracker = new StorageStatsTracker({
             database: database as any,
@@ -80,7 +81,8 @@ describe('StorageStatsTracker', () => {
             getStorageStats: vi.fn(),
             backfillContentSliceSizes: vi.fn().mockResolvedValue(0),
             computeStorageStats: vi.fn(),
-            replaceStorageStats: vi.fn()
+            replaceStorageStats: vi.fn(),
+            refreshStorageStatsUnavailable: vi.fn()
         };
         const tracker = new StorageStatsTracker({
             database: database as any,
@@ -126,7 +128,8 @@ describe('StorageStatsTracker', () => {
             getStorageStats: vi.fn(),
             backfillContentSliceSizes: vi.fn().mockResolvedValue(2),
             computeStorageStats: vi.fn().mockResolvedValue(snapshot),
-            replaceStorageStats: vi.fn().mockResolvedValue(undefined)
+            replaceStorageStats: vi.fn().mockResolvedValue(undefined),
+            refreshStorageStatsUnavailable: vi.fn()
         };
         const tracker = new StorageStatsTracker({
             database: database as any,
@@ -147,5 +150,55 @@ describe('StorageStatsTracker', () => {
         expect(database.backfillContentSliceSizes.mock.invocationCallOrder[0])
             .toBeLessThan(database.computeStorageStats.mock.invocationCallOrder[0]);
         expect(database.replaceStorageStats).toHaveBeenCalledWith(snapshot);
+    });
+
+    it('refreshes only unavailable counters when cached readable volumes are stale', async () => {
+        const cached = {
+            updatedAt: new Date('2026-06-14T00:00:00.000Z'),
+            readableVolumeIds: [1, 2, 3],
+            system: {
+                objectCount: 1,
+                logicalBytes: 10,
+                dataSliceCount: 2,
+                paritySliceCount: 1,
+                dataBytes: 100,
+                parityBytes: 50,
+                physicalBytes: 150,
+                unavailableObjectCount: 0,
+                unavailableLogicalBytes: 0
+            },
+            volumes: {}
+        };
+        const refreshed = {
+            ...cached,
+            readableVolumeIds: [1, 3],
+            system: { ...cached.system, unavailableObjectCount: 1, unavailableLogicalBytes: 10 }
+        };
+        const database = {
+            applyStorageStatsDelta: vi.fn().mockResolvedValue(undefined),
+            getStorageStats: vi.fn().mockResolvedValue(cached),
+            backfillContentSliceSizes: vi.fn().mockResolvedValue(0),
+            computeStorageStats: vi.fn(),
+            replaceStorageStats: vi.fn(),
+            refreshStorageStatsUnavailable: vi.fn().mockResolvedValue(refreshed)
+        };
+        const tracker = new StorageStatsTracker({
+            database: database as any,
+            ioManager: {
+                getVolumeEntries: vi.fn(() => [
+                    [1, { isReadable: true }],
+                    [2, { isReadable: false }],
+                    [3, {}]
+                ])
+            },
+            createLogger: createLogger()
+        });
+
+        const snapshot = await tracker.getSnapshot();
+
+        expect(snapshot).toBe(refreshed);
+        expect(database.computeStorageStats).not.toHaveBeenCalled();
+        expect(database.replaceStorageStats).not.toHaveBeenCalled();
+        expect(database.refreshStorageStatsUnavailable).toHaveBeenCalledWith([1, 3], expect.any(Date));
     });
 });

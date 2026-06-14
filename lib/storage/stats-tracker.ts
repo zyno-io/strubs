@@ -31,6 +31,7 @@ export class StorageStatsTracker {
     private started = false;
     private flushInFlight: Promise<void> | null = null;
     private reconcileInFlight: Promise<void> | null = null;
+    private unavailableRefreshInFlight: Promise<StorageStatsSnapshot | null> | null = null;
     private mutationSerial = 0;
 
     constructor(deps?: Partial<StorageStatsTrackerDeps>) {
@@ -45,8 +46,8 @@ export class StorageStatsTracker {
         this.flushIntervalMs = Math.max(1000, options.flushIntervalMs);
 
         if (options.reconcileIntervalMs > 0) {
-            void this.reconcile().catch(err => {
-                this.log.error('initial storage stats reconciliation failed', err);
+            void this.ensureSnapshot().catch(err => {
+                this.log.error('initial storage stats refresh failed', err);
             });
             this.reconcileTimer = setInterval(() => {
                 void this.reconcile().catch(err => {
@@ -72,6 +73,8 @@ export class StorageStatsTracker {
         }
         if (this.reconcileInFlight)
             await this.reconcileInFlight;
+        if (this.unavailableRefreshInFlight)
+            await this.unavailableRefreshInFlight;
         await this.flushPendingDeltas(true);
     }
 
@@ -84,7 +87,19 @@ export class StorageStatsTracker {
     }
 
     async getSnapshot(): Promise<StorageStatsSnapshot | null> {
-        return this.deps.database.getStorageStats();
+        const snapshot = await this.deps.database.getStorageStats();
+        if (!snapshot)
+            return null;
+        return this.refreshUnavailableIfNeeded(snapshot);
+    }
+
+    private async ensureSnapshot(): Promise<void> {
+        const snapshot = await this.deps.database.getStorageStats();
+        if (!snapshot) {
+            await this.reconcile();
+            return;
+        }
+        await this.refreshUnavailableIfNeeded(snapshot);
     }
 
     async reconcile(): Promise<void> {
@@ -98,7 +113,8 @@ export class StorageStatsTracker {
                 if (backfilled > 0)
                     this.log('backfilled slice sizes for %d object(s)', backfilled);
                 const startedAtSerial = this.mutationSerial;
-                const snapshot = await this.deps.database.computeStorageStats(this.getReadableVolumeIds(), new Date());
+                const readableVolumeIds = this.getReadableVolumeIds();
+                const snapshot = await this.deps.database.computeStorageStats(readableVolumeIds, new Date());
                 await this.deps.database.replaceStorageStats(snapshot);
                 const changedDuringReconcile = this.mutationSerial !== startedAtSerial;
                 this.log('reconciled storage stats: objects=%d logicalBytes=%d physicalBytes=%d unavailable=%d',
@@ -176,7 +192,30 @@ export class StorageStatsTracker {
     private getReadableVolumeIds(): number[] {
         return this.deps.ioManager.getVolumeEntries()
             .filter(([, volume]) => volume.isReadable !== false)
-            .map(([id]) => id);
+            .map(([id]) => id)
+            .sort((a, b) => a - b);
+    }
+
+    private async refreshUnavailableIfNeeded(snapshot: StorageStatsSnapshot): Promise<StorageStatsSnapshot> {
+        const readableVolumeIds = this.getReadableVolumeIds();
+        if (this.sameVolumeIds(snapshot.readableVolumeIds, readableVolumeIds))
+            return snapshot;
+        if (!this.unavailableRefreshInFlight) {
+            this.unavailableRefreshInFlight = this.deps.database.refreshStorageStatsUnavailable(readableVolumeIds, new Date()).finally(() => {
+                this.unavailableRefreshInFlight = null;
+            });
+        }
+        return (await this.unavailableRefreshInFlight) ?? snapshot;
+    }
+
+    private sameVolumeIds(left: number[] | undefined, right: number[]): boolean {
+        if (!left || left.length !== right.length)
+            return false;
+        for (let index = 0; index < left.length; index++) {
+            if (left[index] !== right[index])
+                return false;
+        }
+        return true;
     }
 }
 

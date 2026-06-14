@@ -410,14 +410,16 @@ describe('database helpers', () => {
     it('finds targeted objects by stale per-slice verification time', async () => {
         const { db, content } = createDbWithCollections();
         const startedAt = new Date('2026-06-14T00:00:00.000Z');
+        const afterId = new ObjectId();
         const toArray = vi.fn().mockResolvedValue([]);
         content.find.mockReturnValue({ toArray });
 
-        await db.findObjectsOnVolumesNeedingVerification(startedAt, 25, [2]);
+        await db.findObjectsOnVolumesNeedingVerification(startedAt, 25, [2], afterId.toHexString());
 
         const [query, options] = content.find.mock.calls[0];
         expect(query).toEqual(expect.objectContaining({
             isFile: true,
+            _id: { $gt: afterId },
             $or: expect.arrayContaining([
                 expect.objectContaining({
                     'dataVolumes.0': { $in: [2] },
@@ -514,6 +516,75 @@ describe('database helpers', () => {
             paritySliceCount: 2,
             parityBytes: 200
         });
+    });
+
+    it('skips unavailable storage aggregation when all stored volumes are readable', async () => {
+        const { db, content } = createDbWithCollections();
+        const aggregateResults = [
+            [{ objectCount: 2, logicalBytes: 30, dataSliceCount: 4, paritySliceCount: 2, dataBytes: 400, parityBytes: 200 }],
+            [{ volumeId: 1, sliceCount: 2, bytes: 200 }],
+            [{ volumeId: 3, sliceCount: 2, bytes: 200 }],
+            [{ volumeId: 1, objectCount: 2, logicalBytes: 30 }, { volumeId: 3, objectCount: 2, logicalBytes: 30 }]
+        ];
+        content.aggregate.mockImplementation(() => ({
+            toArray: vi.fn().mockResolvedValue(aggregateResults.shift() ?? [])
+        }));
+
+        const stats = await db.computeStorageStats([1, 3], new Date('2026-06-14T00:00:00.000Z'));
+
+        expect(content.aggregate).toHaveBeenCalledTimes(4);
+        expect(stats.system.unavailableObjectCount).toBe(0);
+        expect(stats.system.unavailableLogicalBytes).toBe(0);
+        expect(stats.readableVolumeIds).toEqual([1, 3]);
+    });
+
+    it('refreshes unavailable storage counters against cached volume ids', async () => {
+        const { db, content, storageStats } = createDbWithCollections();
+        const snapshot = {
+            updatedAt: new Date('2026-06-14T00:00:00.000Z'),
+            system: {
+                objectCount: 2,
+                logicalBytes: 30,
+                dataSliceCount: 4,
+                paritySliceCount: 2,
+                dataBytes: 400,
+                parityBytes: 200,
+                physicalBytes: 600,
+                unavailableObjectCount: 0,
+                unavailableLogicalBytes: 0
+            },
+            volumes: { '1': {}, '3': {} }
+        };
+        storageStats.findOne
+            .mockResolvedValueOnce({ _id: 'current', ...snapshot })
+            .mockResolvedValueOnce({
+                _id: 'current',
+                ...snapshot,
+                readableVolumeIds: [1],
+                system: { ...snapshot.system, unavailableObjectCount: 1, unavailableLogicalBytes: 10 }
+            });
+        content.aggregate.mockReturnValue({
+            toArray: vi.fn().mockResolvedValue([{ objectCount: 1, logicalBytes: 10 }])
+        });
+        storageStats.updateOne.mockResolvedValue({});
+        const updatedAt = new Date('2026-06-14T01:00:00.000Z');
+
+        const refreshed = await db.refreshStorageStatsUnavailable([1], updatedAt);
+
+        expect(content.aggregate).toHaveBeenCalledTimes(1);
+        expect(storageStats.updateOne).toHaveBeenCalledWith(
+            { _id: 'current' },
+            {
+                $set: {
+                    updatedAt,
+                    unavailableUpdatedAt: updatedAt,
+                    readableVolumeIds: [1],
+                    'system.unavailableObjectCount': 1,
+                    'system.unavailableLogicalBytes': 10
+                }
+            }
+        );
+        expect(refreshed?.system.unavailableObjectCount).toBe(1);
     });
 
     it('backfills missing slice sizes', async () => {

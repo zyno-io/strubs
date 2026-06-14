@@ -22,6 +22,25 @@ export class StorageStatsRepository {
         );
     }
 
+    async updateUnavailable(
+        unavailable: Pick<StorageStatsSnapshot['system'], 'unavailableObjectCount' | 'unavailableLogicalBytes'>,
+        readableVolumeIds: number[],
+        updatedAt = new Date()
+    ): Promise<void> {
+        await this.collection.updateOne(
+            { _id: 'current' },
+            {
+                $set: {
+                    updatedAt,
+                    unavailableUpdatedAt: updatedAt,
+                    readableVolumeIds,
+                    'system.unavailableObjectCount': unavailable.unavailableObjectCount,
+                    'system.unavailableLogicalBytes': unavailable.unavailableLogicalBytes
+                }
+            }
+        );
+    }
+
     async applyDelta(delta: StorageStatsDelta, updatedAt = new Date()): Promise<void> {
         const inc: Record<string, number> = {};
         this.addCounterIncrements(inc, 'system', delta.system);

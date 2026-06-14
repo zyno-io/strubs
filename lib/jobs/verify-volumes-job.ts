@@ -61,6 +61,7 @@ const defaultDeps: VerifyVolumesJobDeps = {
 
 const VERIFY_BATCH_SIZE = 25;
 const VERIFY_VOLUME_IDS_KEY = 'verifyVolumeIds';
+const VERIFY_CURSOR_ID_KEY = 'verifyCursorId';
 // How long stop() waits for the run to drain in-flight work before giving up.
 // A read against a failing drive can wedge in the kernel (its libuv threadpool
 // thread never returns), so a cooperative cancel may never complete. After this
@@ -75,6 +76,7 @@ interface ActiveRun {
     token: number;
     cancelled: boolean;
     coordinator: VolumeReadCoordinator;
+    cursorId: string | null;
 }
 const envConcurrency = process.env.STRUBS_VERIFY_PARALLEL ? Number.parseInt(process.env.STRUBS_VERIFY_PARALLEL, 10) : NaN;
 const cpuCount = os.cpus?.().length ?? 1;
@@ -184,16 +186,18 @@ export class VerifyVolumesJob {
             const existing = await this.deps.runtimeConfig.get('verifyStartedAt');
             if (typeof existing === 'string' && existing.length) {
                 const persistedFilter = await this.loadPersistedVolumeFilter();
+                const persistedCursorId = await this.loadPersistedCursorId();
                 const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
-                this.launch(existing, true, persistedFilter, restoredCount);
+                this.launch(existing, true, persistedFilter, restoredCount, persistedCursorId);
                 return { startedAt: existing, accepted: this.filterCoversRequest(persistedFilter, requestedFilter) };
             }
 
             await this.persistVolumeFilter(requestedFilter);
+            await this.deps.runtimeConfig.delete(VERIFY_CURSOR_ID_KEY);
 
             const startedAt = new Date().toISOString();
             await this.deps.runtimeConfig.set('verifyStartedAt', startedAt);
-            this.launch(startedAt, false, requestedFilter, 0);
+            this.launch(startedAt, false, requestedFilter, 0, null);
             return { startedAt, accepted: true };
         }
         finally {
@@ -211,8 +215,9 @@ export class VerifyVolumesJob {
                 return;
             this.log('resuming verify job started at %s', existing);
             const persistedFilter = await this.loadPersistedVolumeFilter();
+            const persistedCursorId = await this.loadPersistedCursorId();
             const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
-            this.launch(existing, true, persistedFilter, restoredCount);
+            this.launch(existing, true, persistedFilter, restoredCount, persistedCursorId);
         }
         finally {
             this.startGuard = false;
@@ -251,6 +256,7 @@ export class VerifyVolumesJob {
         if (!options?.preserveState) {
             await this.deps.runtimeConfig.delete('verifyStartedAt');
             await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
+            await this.deps.runtimeConfig.delete(VERIFY_CURSOR_ID_KEY);
         }
     }
 
@@ -294,7 +300,7 @@ export class VerifyVolumesJob {
         };
     }
 
-    private launch(startedAt: string, isResume: boolean, volumeIds: number[] | null, initialObjectsVerified: number): void {
+    private launch(startedAt: string, isResume: boolean, volumeIds: number[] | null, initialObjectsVerified: number, cursorId: string | null): void {
         if (this.running)
             return;
 
@@ -306,7 +312,7 @@ export class VerifyVolumesJob {
             this.log('starting verification (resume) at %s', startedAt);
         else
             this.log('starting verification at %s', startedAt);
-        const run: ActiveRun = { token: ++this.runToken, cancelled: false, coordinator: new VolumeReadCoordinator() };
+        const run: ActiveRun = { token: ++this.runToken, cancelled: false, coordinator: new VolumeReadCoordinator(), cursorId };
         this.activeRun = run;
         this.progress.objectsVerified = initialObjectsVerified;
         this.progress.errors = { total: 0, volumes: {} };
@@ -365,7 +371,7 @@ export class VerifyVolumesJob {
 
         try {
             while (!run.cancelled) {
-                const batch = await this.fetchBatch(startedAtDate);
+                const batch = await this.fetchBatch(run, startedAtDate);
                 if (!batch.length) {
                     completed = true;
                     break;
@@ -408,6 +414,7 @@ export class VerifyVolumesJob {
 
                 if (run.cancelled || interrupted)
                     break;
+                await this.advanceCursor(run, batch);
             }
         }
         finally {
@@ -418,6 +425,7 @@ export class VerifyVolumesJob {
             if (shouldFinalize) {
                 await this.deps.runtimeConfig.delete('verifyStartedAt');
                 await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
+                await this.deps.runtimeConfig.delete(VERIFY_CURSOR_ID_KEY);
             }
             if (shouldFinalize && !this.isTargetedRun) {
                 const finishedAt = new Date().toISOString();
@@ -450,16 +458,31 @@ export class VerifyVolumesJob {
         return counts;
     }
 
-    private async fetchBatch(startedAt: Date): Promise<StoredObjectRecord[]> {
+    private async fetchBatch(run: ActiveRun, startedAt: Date): Promise<StoredObjectRecord[]> {
         const volumeIds = this.getVerifiableVolumeIds();
         if (!volumeIds.length)
             return [];
         if (this.isTargetedRun) {
-            const objects = await this.deps.database.findObjectsOnVolumesNeedingVerification(startedAt, VERIFY_BATCH_SIZE, volumeIds);
+            const objects = await this.deps.database.findObjectsOnVolumesNeedingVerification(startedAt, VERIFY_BATCH_SIZE, volumeIds, run.cursorId);
             return objects as StoredObjectRecord[];
         }
-        const objects = await this.deps.database.findObjectsNeedingVerification(startedAt, VERIFY_BATCH_SIZE, volumeIds);
+        const objects = await this.deps.database.findObjectsNeedingVerification(startedAt, VERIFY_BATCH_SIZE, volumeIds, run.cursorId);
         return objects as StoredObjectRecord[];
+    }
+
+    private async advanceCursor(run: ActiveRun, batch: StoredObjectRecord[]): Promise<void> {
+        const cursorId = this.getBatchCursor(batch);
+        if (!cursorId)
+            return;
+        run.cursorId = cursorId;
+        if (this.activeRun !== run)
+            return;
+        await this.deps.runtimeConfig.set(VERIFY_CURSOR_ID_KEY, cursorId);
+    }
+
+    private getBatchCursor(batch: StoredObjectRecord[]): string | null {
+        const last = batch[batch.length - 1];
+        return typeof last?.id === 'string' && last.id.length ? last.id : null;
     }
 
     private async verifyObject(run: ActiveRun, record: StoredObjectRecord, startedAt: Date, lane?: number): Promise<VerifyVolumesObjectResult | null> {
@@ -718,6 +741,11 @@ export class VerifyVolumesJob {
     private async loadPersistedVolumeFilter(): Promise<number[] | null> {
         const stored = await this.deps.runtimeConfig.get(VERIFY_VOLUME_IDS_KEY);
         return this.normalizeVolumeIds(stored);
+    }
+
+    private async loadPersistedCursorId(): Promise<string | null> {
+        const stored = await this.deps.runtimeConfig.get(VERIFY_CURSOR_ID_KEY);
+        return typeof stored === 'string' && stored.length ? stored : null;
     }
 
     private async persistVolumeFilter(volumeIds: number[] | null): Promise<void> {

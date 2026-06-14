@@ -2,15 +2,33 @@ import type { FileObject } from '../file-object';
 import { Base } from './base';
 import { createLogger } from '../../log';
 import { volumePriorityManager } from '../volume-priority-manager';
+import { config } from '../../config';
+
+type FileObjectSliceVerifierDeps = {
+    readDelayMs: number;
+    sleep: (ms: number) => Promise<void>;
+};
+
+const defaultDeps: FileObjectSliceVerifierDeps = {
+    readDelayMs: config.verifyReadDelayMs,
+    sleep: (ms: number) => new Promise(resolve => {
+        const timer = setTimeout(resolve, ms);
+        timer.unref?.();
+    })
+};
 
 export class FileObjectSliceVerifier extends Base {
+    private readonly deps: FileObjectSliceVerifierDeps;
     private prepared = false;
     private readonly logger: ReturnType<typeof createLogger>;
+    private readonly readDelayMs: number;
     private lastLogTimestamp = 0;
     private totalVerifiedBytes = 0;
 
-    constructor(fileObject: FileObject) {
+    constructor(fileObject: FileObject, deps?: Partial<FileObjectSliceVerifierDeps>) {
         super(fileObject);
+        this.deps = { ...defaultDeps, ...deps };
+        this.readDelayMs = this.normalizeDelayMs(this.deps.readDelayMs);
         this.logger = createLogger(`${this.fileObject.getLoggerPrefix()}:slice-verifier`);
     }
 
@@ -85,22 +103,35 @@ export class FileObjectSliceVerifier extends Base {
             throw new Error('plan is not configured');
 
         slice.seekToHead();
+        let readCount = 0;
+        const readNext = async () => {
+            if (readCount > 0)
+                await this.delayBetweenReads();
+            await this.readAndTrack(sliceIndex, slice);
+            readCount++;
+        };
 
         this._configureStartState();
-        await this.readAndTrack(sliceIndex, slice);
+        await readNext();
 
         const standardChunkCount = plan.standardChunkCountPerSlice ?? 0;
         if (standardChunkCount > 0) {
             this._configureMiddleState();
             for (let index = 0; index < standardChunkCount; index++)
-                await this.readAndTrack(sliceIndex, slice);
+                await readNext();
         }
 
         const endChunkSize = plan.endChunkDataSize ?? 0;
         if (endChunkSize > 0) {
             this._configureEndState();
-            await this.readAndTrack(sliceIndex, slice);
+            await readNext();
         }
+    }
+
+    private async delayBetweenReads(): Promise<void> {
+        if (this.readDelayMs <= 0)
+            return;
+        await this.deps.sleep(this.readDelayMs);
     }
 
     private async readAndTrack(sliceIndex: number, slice: (typeof this._slices)[number]): Promise<void> {
@@ -123,5 +154,10 @@ export class FileObjectSliceVerifier extends Base {
         if (sliceIndex < this.dataSliceCount)
             return { key: String(sliceIndex), type: 'data' };
         return { key: String(sliceIndex), type: 'parity' };
+    }
+
+    private normalizeDelayMs(value: number): number {
+        const normalized = Math.floor(value);
+        return Number.isFinite(normalized) && normalized >= 0 ? normalized : 0;
     }
 }

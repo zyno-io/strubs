@@ -16,8 +16,9 @@ const DEFAULT_REPAIR_BATCH_SIZE = 25;
 const DEFAULT_REPAIR_BACKLOG_DELAY_MS = 10 * 1000;
 const DEFAULT_REPAIR_BLOCKED_RETRY_MS = 60 * 60 * 1000;
 const DEFAULT_VOLUME_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
-const DEFAULT_STORAGE_STATS_INTERVAL_MS = 15 * 60 * 1000;
+const DEFAULT_STORAGE_STATS_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_STORAGE_STATS_FLUSH_INTERVAL_MS = 5 * 1000;
+const DEFAULT_VERIFY_READ_DELAY_MS = 2;
 
 function parseSeverity(value: string | undefined, fallback: Severity): Severity {
     if (value && (VALID_SEVERITIES as string[]).includes(value))
@@ -78,6 +79,10 @@ export class Config {
     storageStatsIntervalMs: number;
     storageStatsFlushIntervalMs: number;
 
+    // Cooperative pacing between chunk reads during verification. This trades
+    // scrub throughput for lower foreground-read contention.
+    verifyReadDelayMs: number;
+
     constructor() {
         this.mongoUrl = process.env.STRUBS_MONGO_URL || 'mongodb://strubs:strubs@127.0.0.1:27017/strubs?authSource=admin';
         this.dataSliceCount = process.env.STRUBS_DATA_SLICES ? parseInt(process.env.STRUBS_DATA_SLICES, 10) : 4;
@@ -111,6 +116,10 @@ export class Config {
         this.storageStatsFlushIntervalMs = parsePositiveInt(
             process.env.STRUBS_STORAGE_STATS_FLUSH_INTERVAL_MS,
             DEFAULT_STORAGE_STATS_FLUSH_INTERVAL_MS
+        );
+        this.verifyReadDelayMs = parseNonNegativeInt(
+            process.env.STRUBS_VERIFY_READ_DELAY_MS,
+            DEFAULT_VERIFY_READ_DELAY_MS
         );
     }
 

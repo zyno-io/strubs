@@ -132,12 +132,13 @@ describe('VerifyVolumesJob', () => {
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(1, 1, { checksum: 0, total: 0 });
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(2, 2, { checksum: 0, total: 0 });
         expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(1, 'verifyStartedAt', startedAt);
-        expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(2, 'lastVerify', expect.objectContaining({
+        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('verifyCursorId', record.id);
+        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('lastVerify', expect.objectContaining({
             startedAt,
             checksumErrors: 0,
             totalErrors: 0
         }));
-        expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds']));
+        expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds', 'verifyCursorId']));
     });
 
     it('verifies multiple objects in parallel batches', async () => {
@@ -265,7 +266,7 @@ describe('VerifyVolumesJob', () => {
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(1, 1, { checksum: 0, total: 0 });
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(2, 2, { checksum: 0, total: 0 });
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(3, 1, { checksum: 1, total: 1 });
-        expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(2, 'lastVerify', expect.objectContaining({
+        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('lastVerify', expect.objectContaining({
             checksumErrors: 1,
             totalErrors: 1
         }));
@@ -375,7 +376,7 @@ describe('VerifyVolumesJob', () => {
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(3, 1, { checksum: 0, total: 1 });
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(4, 2, { checksum: 0, total: 1 });
 
-        expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(2, 'lastVerify', expect.objectContaining({
+        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('lastVerify', expect.objectContaining({
             checksumErrors: 0,
             totalErrors: 2
         }));
@@ -516,7 +517,7 @@ describe('VerifyVolumesJob', () => {
         releaseBatch?.();
         await stopPromise;
 
-        expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds']));
+        expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds', 'verifyCursorId']));
     });
 
     it('restores progress when resuming a pending job', async () => {
@@ -524,7 +525,8 @@ describe('VerifyVolumesJob', () => {
         const startedAt = '2024-02-01T00:00:00.000Z';
         deps.runtimeConfig.get
             .mockResolvedValueOnce(startedAt)
-            .mockResolvedValueOnce([2]);
+            .mockResolvedValueOnce([2])
+            .mockResolvedValueOnce('cursor-1');
         deps.database.countObjectsVerifiedSince.mockResolvedValueOnce(42);
         deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
 
@@ -582,16 +584,16 @@ describe('VerifyVolumesJob', () => {
         expect(deps.database.updateObjectVerificationState).not.toHaveBeenCalledWith(record.id, expect.objectContaining({
             lastVerifiedAt: expect.anything()
         }));
-        // Targeted runs resume by per-slice timestamps, not a transient _id cursor.
-        expect(deps.database.findObjectsOnVolumesNeedingVerification).toHaveBeenNthCalledWith(1, new Date(startedAt), 25, [2]);
-        expect(deps.database.findObjectsOnVolumesNeedingVerification).toHaveBeenNthCalledWith(2, new Date(startedAt), 25, [2]);
+        expect(deps.database.findObjectsOnVolumesNeedingVerification).toHaveBeenNthCalledWith(1, new Date(startedAt), 25, [2], null);
+        expect(deps.database.findObjectsOnVolumesNeedingVerification).toHaveBeenNthCalledWith(2, new Date(startedAt), 25, [2], record.id);
         expect(deps.database.findObjectsNeedingVerification).not.toHaveBeenCalled();
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenCalledTimes(1);
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenNthCalledWith(1, 2, { checksum: 0, total: 0 });
         expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(1, 'verifyVolumeIds', [2]);
         expect(deps.runtimeConfig.set).toHaveBeenNthCalledWith(2, 'verifyStartedAt', startedAt);
+        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('verifyCursorId', record.id);
         expect(deps.runtimeConfig.set).not.toHaveBeenCalledWith('lastVerify', expect.anything());
-        expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds']));
+        expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds', 'verifyCursorId']));
     });
 
     it('preserves unrelated slice errors during targeted verification', async () => {

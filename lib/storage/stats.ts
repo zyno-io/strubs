@@ -20,6 +20,8 @@ export type StorageVolumeStats = StorageCounters;
 
 export type StorageStatsSnapshot = {
     updatedAt: Date;
+    readableVolumeIds?: number[];
+    unavailableUpdatedAt?: Date;
     system: StorageSystemStats;
     volumes: Record<string, StorageVolumeStats>;
 };
@@ -46,6 +48,8 @@ export function createEmptyStorageCounters(): StorageCounters {
 export function createEmptyStorageStatsSnapshot(updatedAt = new Date()): StorageStatsSnapshot {
     return {
         updatedAt,
+        readableVolumeIds: [],
+        unavailableUpdatedAt: updatedAt,
         system: {
             ...createEmptyStorageCounters(),
             unavailableObjectCount: 0,

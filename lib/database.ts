@@ -145,12 +145,12 @@ export class Database {
         return this.contentRepository.getObjectByPath(path);
     }
 
-    async findObjectsNeedingVerification(startedAt: Date, limit: number, volumeIds?: number[]): Promise<ContentDocument[]> {
-        return this.contentRepository.findObjectsNeedingVerification(startedAt, limit, volumeIds);
+    async findObjectsNeedingVerification(startedAt: Date, limit: number, volumeIds?: number[], afterId?: ObjectIdentifier): Promise<ContentDocument[]> {
+        return this.contentRepository.findObjectsNeedingVerification(startedAt, limit, volumeIds, afterId);
     }
 
-    async findObjectsOnVolumesNeedingVerification(startedAt: Date, limit: number, volumeIds: number[]): Promise<ContentDocument[]> {
-        return this.contentRepository.findObjectsOnVolumesNeedingVerification(startedAt, limit, volumeIds);
+    async findObjectsOnVolumesNeedingVerification(startedAt: Date, limit: number, volumeIds: number[], afterId?: ObjectIdentifier): Promise<ContentDocument[]> {
+        return this.contentRepository.findObjectsOnVolumesNeedingVerification(startedAt, limit, volumeIds, afterId);
     }
 
     async countObjectsVerifiedSince(startedAt: Date, volumeIds?: number[]): Promise<number> {
@@ -194,6 +194,17 @@ export class Database {
 
     async computeStorageStats(availableVolumeIds: number[], updatedAt?: Date): Promise<StorageStatsSnapshot> {
         return this.contentRepository.computeStorageStats(availableVolumeIds, updatedAt);
+    }
+
+    async refreshStorageStatsUnavailable(readableVolumeIds: number[], updatedAt = new Date()): Promise<StorageStatsSnapshot | null> {
+        const snapshot = await this.getStorageStats();
+        if (!snapshot)
+            return null;
+        const knownVolumeIds = Object.keys(snapshot.volumes).map(Number);
+        const normalizedReadable = Array.from(new Set(readableVolumeIds.filter(id => Number.isFinite(id)))).sort((a, b) => a - b);
+        const unavailable = await this.contentRepository.computeUnavailableStorageStats(knownVolumeIds, normalizedReadable);
+        await this.storageStatsRepository.updateUnavailable(unavailable, normalizedReadable, updatedAt);
+        return this.getStorageStats();
     }
 
     async getStorageStats(): Promise<StorageStatsSnapshot | null> {

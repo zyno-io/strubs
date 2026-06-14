@@ -6,6 +6,7 @@ import { createError } from '../helpers';
 import {
     createEmptyStorageCounters,
     createEmptyStorageStatsSnapshot,
+    type StorageSystemStats,
     type StorageStatsSnapshot
 } from '../storage/stats';
 import { ContainerCache } from './container-cache';
@@ -154,19 +155,80 @@ export class ContentRepository {
         await this.populateVolumeStorageStats(snapshot, 'dataVolumes', 'data');
         await this.populateVolumeStorageStats(snapshot, 'parityVolumes', 'parity');
         await this.populateVolumeObjectStats(snapshot);
-        await this.populateUnavailableStorageStats(snapshot, availableVolumeIds);
+        const unavailable = await this.computeUnavailableStorageStats(
+            Object.keys(snapshot.volumes).map(Number),
+            availableVolumeIds
+        );
+        snapshot.system.unavailableObjectCount = unavailable.unavailableObjectCount;
+        snapshot.system.unavailableLogicalBytes = unavailable.unavailableLogicalBytes;
+        snapshot.readableVolumeIds = this.normalizeVolumeIds(availableVolumeIds);
+        snapshot.unavailableUpdatedAt = updatedAt;
         return snapshot;
     }
 
-    async findObjectsNeedingVerification(startedAt: Date, limit: number, volumeIds?: number[]): Promise<ContentDocument[]> {
+    async computeUnavailableStorageStats(knownVolumeIds: number[], readableVolumeIds: number[]): Promise<Pick<StorageSystemStats, 'unavailableObjectCount' | 'unavailableLogicalBytes'>> {
+        const readable = new Set(this.normalizeVolumeIds(readableVolumeIds));
+        const unreadable = this.normalizeVolumeIds(knownVolumeIds).filter(volumeId => !readable.has(volumeId));
+        if (!unreadable.length) {
+            return {
+                unavailableObjectCount: 0,
+                unavailableLogicalBytes: 0
+            };
+        }
+
+        const [unavailable] = await this.collection.aggregate<{
+            objectCount: number;
+            logicalBytes: number;
+        }>([
+            {
+                $match: {
+                    isFile: true,
+                    $or: [
+                        { dataVolumes: { $in: unreadable } },
+                        { parityVolumes: { $in: unreadable } }
+                    ]
+                }
+            },
+            {
+                $project: {
+                    size: { $ifNull: ['$size', 0] },
+                    paritySliceCount: { $size: { $ifNull: ['$parityVolumes', []] } },
+                    unavailableSlices: {
+                        $add: [
+                            { $size: { $setIntersection: [{ $ifNull: ['$dataVolumes', []] }, unreadable] } },
+                            { $size: { $setIntersection: [{ $ifNull: ['$parityVolumes', []] }, unreadable] } }
+                        ]
+                    }
+                }
+            },
+            { $match: { $expr: { $gt: ['$unavailableSlices', '$paritySliceCount'] } } },
+            {
+                $group: {
+                    _id: null,
+                    objectCount: { $sum: 1 },
+                    logicalBytes: { $sum: '$size' }
+                }
+            },
+            { $project: { _id: 0 } }
+        ]).toArray();
+
+        return {
+            unavailableObjectCount: unavailable?.objectCount ?? 0,
+            unavailableLogicalBytes: unavailable?.logicalBytes ?? 0
+        };
+    }
+
+    async findObjectsNeedingVerification(startedAt: Date, limit: number, volumeIds?: number[], afterId?: ObjectIdentifier): Promise<ContentDocument[]> {
         const staleSliceConditions = Array.isArray(volumeIds) && volumeIds.length
             ? this.buildStaleSliceConditions(startedAt, volumeIds)
             : [];
         const conditions: Filter<ContentDocument>[] = staleSliceConditions.length
             ? [{ $or: staleSliceConditions }]
             : [this.timestampIsStale('lastVerifiedAt', startedAt)];
+        const afterFilter = this.idAfterFilter(afterId);
         const query: Filter<ContentDocument> = {
             isFile: true,
+            ...(afterFilter ?? {}),
             $and: conditions
         };
         const cursor = this.collection.find<ContentDocument>(query, {
@@ -177,15 +239,16 @@ export class ContentRepository {
         return objects.map(object => this.normalize(object));
     }
 
-    // Targeted verification resumes by per-slice timestamps. Objects already
-    // stamped for every requested volume slice at this run's start time fall out
-    // of the query, so a restart continues without a separate cursor.
-    async findObjectsOnVolumesNeedingVerification(startedAt: Date, limit: number, volumeIds: number[]): Promise<ContentDocument[]> {
+    // Targeted verification uses per-slice timestamps for correctness and an
+    // optional _id cursor to avoid rescanning already passed objects during a run.
+    async findObjectsOnVolumesNeedingVerification(startedAt: Date, limit: number, volumeIds: number[], afterId?: ObjectIdentifier): Promise<ContentDocument[]> {
         const staleSliceConditions = this.buildStaleSliceConditions(startedAt, volumeIds);
         if (!staleSliceConditions.length)
             return [];
+        const afterFilter = this.idAfterFilter(afterId);
         const query: Filter<ContentDocument> = {
             isFile: true,
+            ...(afterFilter ?? {}),
             $or: staleSliceConditions
         };
         const cursor = this.collection.find<ContentDocument>(query, {
@@ -344,44 +407,14 @@ export class ContentRepository {
         }
     }
 
-    private async populateUnavailableStorageStats(snapshot: StorageStatsSnapshot, availableVolumeIds: number[]): Promise<void> {
-        const available = Array.from(new Set(availableVolumeIds.filter(id => Number.isFinite(id))));
-        const [unavailable] = await this.collection.aggregate<{
-            objectCount: number;
-            logicalBytes: number;
-        }>([
-            { $match: { isFile: true } },
-            {
-                $project: {
-                    size: { $ifNull: ['$size', 0] },
-                    requiredSlices: { $size: { $ifNull: ['$dataVolumes', []] } },
-                    availableSlices: {
-                        $add: [
-                            { $size: { $setIntersection: [{ $ifNull: ['$dataVolumes', []] }, available] } },
-                            { $size: { $setIntersection: [{ $ifNull: ['$parityVolumes', []] }, available] } }
-                        ]
-                    }
-                }
-            },
-            { $match: { $expr: { $lt: ['$availableSlices', '$requiredSlices'] } } },
-            {
-                $group: {
-                    _id: null,
-                    objectCount: { $sum: 1 },
-                    logicalBytes: { $sum: '$size' }
-                }
-            },
-            { $project: { _id: 0 } }
-        ]).toArray();
-
-        snapshot.system.unavailableObjectCount = unavailable?.objectCount ?? 0;
-        snapshot.system.unavailableLogicalBytes = unavailable?.logicalBytes ?? 0;
-    }
-
     private getOrCreateVolumeStats(snapshot: StorageStatsSnapshot, volumeId: number) {
         const key = String(volumeId);
         snapshot.volumes[key] ??= createEmptyStorageCounters();
         return snapshot.volumes[key];
+    }
+
+    private normalizeVolumeIds(volumeIds: number[]): number[] {
+        return Array.from(new Set(volumeIds.filter(id => Number.isFinite(id)))).sort((a, b) => a - b);
     }
 
     private sliceSizeExpression(): Record<string, unknown> {
@@ -484,6 +517,20 @@ export class ContentRepository {
                 { [path]: null }
             ]
         } as Filter<ContentDocument>;
+    }
+
+    private idAfterFilter(afterId?: ObjectIdentifier): Filter<ContentDocument> | null {
+        if (!afterId)
+            return null;
+        try {
+            const mongoId = this.toMongoId(afterId);
+            if (!mongoId)
+                return null;
+            return { _id: { $gt: mongoId } } as Filter<ContentDocument>;
+        }
+        catch {
+            return null;
+        }
     }
 
     async getOrCreateContainer(path: ContainerPath): Promise<string | null> {
