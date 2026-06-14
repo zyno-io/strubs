@@ -2,7 +2,13 @@ import { createLogger } from '../log';
 import { database, type FaultDocument, type FaultUpsert } from '../database';
 import type { Severity } from '../notify/notifier';
 import { notificationService, NotificationService } from '../notify/service';
-import { faultKey, type SliceFault, type SliceFaultInput } from './fault';
+import {
+    faultKey,
+    type RepairBlockedReason,
+    type RepairBlockDetails,
+    type SliceFault,
+    type SliceFaultInput
+} from './fault';
 
 // Minimal durable store contract; the database singleton satisfies it.
 export interface FaultStore {
@@ -87,7 +93,13 @@ export class RemediationService {
                     isChecksum: doc.isChecksum,
                     firstSeen: doc.firstSeen.getTime(),
                     lastSeen: doc.lastSeen.getTime(),
-                    count: doc.count
+                    count: doc.count,
+                    repairStatus: doc.repairStatus ?? 'pending',
+                    repairBlockedReason: doc.repairBlockedReason,
+                    repairBlockedAt: doc.repairBlockedAt?.getTime(),
+                    lastRepairAttemptAt: doc.lastRepairAttemptAt?.getTime(),
+                    lastRepairError: doc.lastRepairError,
+                    repairDetails: doc.repairDetails
                 };
                 this.faults.set(fault.key, fault);
             }
@@ -100,6 +112,55 @@ export class RemediationService {
 
     listFaults(): SliceFault[] {
         return Array.from(this.faults.values());
+    }
+
+    async markRepairAttempted(key: string): Promise<boolean> {
+        const fault = this.faults.get(key);
+        if (!fault)
+            return false;
+
+        fault.repairStatus = 'pending';
+        fault.lastRepairAttemptAt = this.deps.now();
+        delete fault.repairBlockedReason;
+        delete fault.repairBlockedAt;
+        delete fault.lastRepairError;
+        delete fault.repairDetails;
+
+        await this.persist(fault);
+        return true;
+    }
+
+    async markRepairFailed(key: string, message: string): Promise<boolean> {
+        const fault = this.faults.get(key);
+        if (!fault)
+            return false;
+
+        fault.repairStatus = 'pending';
+        fault.lastRepairAttemptAt = this.deps.now();
+        fault.lastRepairError = message;
+        delete fault.repairBlockedReason;
+        delete fault.repairBlockedAt;
+        delete fault.repairDetails;
+
+        await this.persist(fault);
+        return true;
+    }
+
+    async markRepairBlocked(key: string, reason: RepairBlockedReason, details?: RepairBlockDetails): Promise<boolean> {
+        const fault = this.faults.get(key);
+        if (!fault)
+            return false;
+
+        const now = this.deps.now();
+        fault.repairStatus = 'blocked';
+        fault.repairBlockedReason = reason;
+        fault.repairBlockedAt = now;
+        fault.lastRepairAttemptAt = now;
+        fault.lastRepairError = details?.message;
+        fault.repairDetails = details;
+
+        await this.persist(fault);
+        return true;
     }
 
     async clearFault(key: string): Promise<boolean> {
@@ -117,7 +178,7 @@ export class RemediationService {
         return removed;
     }
 
-    private persist(fault: SliceFault): void {
+    private persist(fault: SliceFault): Promise<void> {
         // Snapshot the mutable in-memory fault so the queued write reflects the
         // values at this occurrence, not whatever they become later.
         const payload: FaultUpsert = {
@@ -131,9 +192,15 @@ export class RemediationService {
             isChecksum: fault.isChecksum,
             firstSeen: new Date(fault.firstSeen),
             lastSeen: new Date(fault.lastSeen),
-            count: fault.count
+            count: fault.count,
+            repairStatus: fault.repairStatus,
+            repairBlockedReason: fault.repairBlockedReason,
+            repairBlockedAt: fault.repairBlockedAt !== undefined ? new Date(fault.repairBlockedAt) : undefined,
+            lastRepairAttemptAt: fault.lastRepairAttemptAt !== undefined ? new Date(fault.lastRepairAttemptAt) : undefined,
+            lastRepairError: fault.lastRepairError,
+            repairDetails: fault.repairDetails
         };
-        void this.enqueuePersist(fault.key, async () => {
+        return this.enqueuePersist(fault.key, async () => {
             try {
                 await this.deps.faultStore.upsertFault(payload);
             }
@@ -164,9 +231,10 @@ export class RemediationService {
             existing.count += 1;
             existing.code = input.code ?? existing.code;
             existing.message = input.message ?? existing.message;
+            existing.repairStatus ??= 'pending';
             return existing;
         }
-        const fault: SliceFault = { ...input, key, firstSeen: now, lastSeen: now, count: 1 };
+        const fault: SliceFault = { ...input, key, firstSeen: now, lastSeen: now, count: 1, repairStatus: 'pending' };
         this.faults.set(key, fault);
         this.log('new slice fault %s source=%s code=%s', key, fault.source, fault.code ?? 'n/a');
         return fault;

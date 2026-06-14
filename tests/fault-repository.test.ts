@@ -30,6 +30,64 @@ describe('FaultRepository', () => {
         expect(options).toEqual({ upsert: true });
     });
 
+    it('persists and clears repair state fields', async () => {
+        const { repo, collection } = makeRepo();
+        const firstSeen = new Date(1000);
+        const lastSeen = new Date(2000);
+        const blockedAt = new Date(3000);
+        await repo.upsert({
+            key: '7:obj:0',
+            objectId: 'obj',
+            sliceIndex: 0,
+            volumeId: 7,
+            source: 'read',
+            firstSeen,
+            lastSeen,
+            count: 1,
+            repairStatus: 'blocked',
+            repairBlockedReason: 'insufficient-slices',
+            repairBlockedAt: blockedAt,
+            lastRepairAttemptAt: blockedAt,
+            lastRepairError: 'insufficient slices',
+            repairDetails: { requiredSlices: 4, availableSlices: 3 }
+        });
+
+        let update = collection.updateOne.mock.calls[0][1];
+        expect(update.$set).toMatchObject({
+            repairStatus: 'blocked',
+            repairBlockedReason: 'insufficient-slices',
+            repairBlockedAt: blockedAt,
+            lastRepairAttemptAt: blockedAt,
+            lastRepairError: 'insufficient slices',
+            repairDetails: { requiredSlices: 4, availableSlices: 3 }
+        });
+
+        await repo.upsert({
+            key: '7:obj:0',
+            objectId: 'obj',
+            sliceIndex: 0,
+            volumeId: 7,
+            source: 'read',
+            firstSeen,
+            lastSeen,
+            count: 1,
+            repairStatus: 'pending',
+            lastRepairAttemptAt: blockedAt
+        });
+
+        update = collection.updateOne.mock.calls[1][1];
+        expect(update.$set).toMatchObject({
+            repairStatus: 'pending',
+            lastRepairAttemptAt: blockedAt
+        });
+        expect(update.$unset).toMatchObject({
+            repairBlockedReason: '',
+            repairBlockedAt: '',
+            lastRepairError: '',
+            repairDetails: ''
+        });
+    });
+
     it('lists faults sorted by lastSeen and deletes by key', async () => {
         const { repo, collection } = makeRepo();
         const list = await repo.list();

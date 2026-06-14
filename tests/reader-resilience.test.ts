@@ -150,6 +150,21 @@ describe('FileObjectReader resilience', () => {
         const reader = new FileObjectReader(createStub({ size: 64 }));
         await reader.prepare();
         reader.setReadRange(0, 64);
-        await expect(reader.readChunk()).rejects.toThrow('insufficient slices');
+        const err = await reader.readChunk().then(
+            () => null,
+            error => error
+        );
+
+        expect(err).toMatchObject({
+            code: 'EQUORUM',
+            repairDetails: {
+                requiredSlices: 2,
+                availableSlices: 1,
+                totalSlices: 3,
+                availableSliceIndexes: [1],
+                missingSliceIndexes: [0, 2],
+                missingVolumeIds: [1, 3]
+            }
+        });
     });
 });

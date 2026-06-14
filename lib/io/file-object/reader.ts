@@ -1,6 +1,7 @@
 import { createLogger } from '../../log';
 import type { FileObject } from '../file-object';
 import { remediationService } from '../../remediation/service';
+import type { RepairBlockDetails } from '../../remediation/fault';
 import { Base } from './base';
 
 // After this many fresh read faults on one slice within a single read, stop
@@ -90,9 +91,10 @@ export class FileObjectReader extends Base {
         this._currentChunkSetIndex = 0;
     }
 
-    private _quorumError(): Error {
-        const err = new Error('insufficient slices available to reconstruct file') as Error & { code?: string };
+    private _quorumError(sources?: Set<number>): Error {
+        const err = new Error('insufficient slices available to reconstruct file') as Error & { code?: string; repairDetails?: RepairBlockDetails };
         err.code = 'EQUORUM';
+        err.repairDetails = this._quorumDetails(sources);
         return err;
     }
 
@@ -261,11 +263,8 @@ export class FileObjectReader extends Base {
             }
         }
 
-        if (sources.size < this.dataSliceCount) {
-            const err = new Error('insufficient slices available to reconstruct file') as Error & { code?: string };
-            err.code = 'EQUORUM';
-            throw err;
-        }
+        if (sources.size < this.dataSliceCount)
+            throw this._quorumError(sources);
 
         // Targets are the data slices we could not read directly.
         const targets: number[] = [];
@@ -361,6 +360,38 @@ export class FileObjectReader extends Base {
         if (index < this.dataSliceCount)
             return this.dataSliceVolumeIds[index] ?? null;
         return this.paritySliceVolumeIds[index - this.dataSliceCount] ?? null;
+    }
+
+    private _quorumDetails(sources?: Set<number>): RepairBlockDetails {
+        const allSliceIndexes = Array.from({ length: this._totalSliceCount }, (_unused, index) => index);
+        const availableSliceIndexes = sources
+            ? Array.from(sources).sort((a, b) => a - b)
+            : allSliceIndexes.filter(index => !this._failedSlices.has(index));
+        const available = new Set(availableSliceIndexes);
+        const missingSliceIndexes = allSliceIndexes.filter(index => !available.has(index));
+        const failedSliceIndexes = Array.from(this._failedSlices).sort((a, b) => a - b);
+
+        return {
+            requiredSlices: this.dataSliceCount,
+            availableSlices: availableSliceIndexes.length,
+            totalSlices: this._totalSliceCount,
+            chunkIndex: this._currentChunkSetIndex,
+            availableSliceIndexes,
+            missingSliceIndexes,
+            failedSliceIndexes,
+            missingVolumeIds: this.uniqueVolumeIds(missingSliceIndexes),
+            failedVolumeIds: this.uniqueVolumeIds(failedSliceIndexes)
+        };
+    }
+
+    private uniqueVolumeIds(sliceIndexes: number[]): number[] {
+        const volumeIds = new Set<number>();
+        for (const index of sliceIndexes) {
+            const volumeId = this.volumeIdForSlice(index);
+            if (volumeId !== null)
+                volumeIds.add(volumeId);
+        }
+        return Array.from(volumeIds).sort((a, b) => a - b);
     }
 
     private isIOAbortError(err: unknown): boolean {

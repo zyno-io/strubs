@@ -245,4 +245,31 @@ describe('IOManager', () => {
         expect(createdVolumes).toHaveLength(1);
         expect(lsblkMock).toHaveBeenCalledTimes(1);
     });
+
+    it('wakes repair when volume availability changes', async () => {
+        const repairWakeMock = vi.fn();
+        const volumeFleetStub = {
+            registerVolume: vi.fn().mockResolvedValue(undefined),
+            updateVolumeFlags: vi.fn().mockResolvedValue(undefined),
+            countVolumeGroups: vi.fn().mockReturnValue(1)
+        };
+        const manager = new (await import('../lib/io/manager')).IOManager({
+            deviceDiscovery: {
+                discover: vi.fn().mockResolvedValue([])
+            },
+            volumeFleet: volumeFleetStub as unknown as VolumeFleet,
+            mountRootManager: {
+                ensureExists: vi.fn().mockResolvedValue(undefined)
+            },
+            repairWorker: {
+                wake: repairWakeMock
+            }
+        });
+
+        await manager.registerVolume(buildVolumeConfig() as any);
+        await manager.updateVolumeFlags(1, { isEnabled: true });
+
+        expect(repairWakeMock).toHaveBeenCalledWith('volume 1 registered');
+        expect(repairWakeMock).toHaveBeenCalledWith('volume 1 availability changed');
+    });
 });

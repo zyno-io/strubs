@@ -3,7 +3,7 @@ import { database } from '../database';
 import type { Severity } from '../notify/notifier';
 import { notificationService, NotificationService } from '../notify/service';
 import { remediationService, RemediationService } from './service';
-import type { SliceFault } from './fault';
+import type { RepairBlockDetails, SliceFault } from './fault';
 
 type VerifySliceResult = { ok: boolean; volumeId: number | null };
 type VerifyResult = Record<string, VerifySliceResult>;
@@ -14,7 +14,7 @@ type SliceRepairerModule = typeof import('../io/file-object/slice-repairer');
 
 type RepairWorkerDeps = {
     database: Pick<typeof database, 'getObjectById'>;
-    remediationService: Pick<RemediationService, 'listFaults' | 'clearFault' | 'onSliceFault'>;
+    remediationService: Pick<RemediationService, 'listFaults' | 'clearFault' | 'onSliceFault' | 'markRepairAttempted' | 'markRepairBlocked' | 'markRepairFailed'>;
     notificationService: NotificationService;
     // Lazily imported so this module (and core) never pulls the native
     // reed-solomon binding unless a repair actually runs.
@@ -106,6 +106,10 @@ export class RepairWorker {
         return this.started;
     }
 
+    wake(reason: string): void {
+        this.scheduleProcess(reason);
+    }
+
     async processFaults(): Promise<void> {
         if (this.running) {
             this.rerunRequested = true;
@@ -164,6 +168,8 @@ export class RepairWorker {
                 return;
             }
 
+            await this.deps.remediationService.markRepairAttempted(fault.key);
+
             // Classify: re-verify the slice. A clean result => transient.
             const before = await this.deps.verifyObject(fault.objectId);
             if (before[String(fault.sliceIndex)]?.ok) {
@@ -183,6 +189,7 @@ export class RepairWorker {
                 await this.notify('info', `Repaired slice ${fault.sliceIndex} of object ${fault.objectId} on volume ${fault.volumeId ?? 'unknown'}`, fault);
             }
             else {
+                await this.deps.remediationService.markRepairFailed(fault.key, 'repaired slice did not verify clean');
                 await this.notify('warning', `Repair of object ${fault.objectId} slice ${fault.sliceIndex} did not verify clean`, fault);
             }
         }
@@ -191,16 +198,28 @@ export class RepairWorker {
             const message = err instanceof Error ? err.message : String(err);
             if (code === 'EQUORUM') {
                 this.log.error('cannot repair %s slice %d: insufficient redundancy', fault.objectId, fault.sliceIndex);
+                await this.deps.remediationService.markRepairBlocked(
+                    fault.key,
+                    'insufficient-slices',
+                    this.repairBlockDetails(err, message)
+                );
                 await this.notify('critical', `Cannot repair object ${fault.objectId} slice ${fault.sliceIndex}: insufficient redundancy (data at risk)`, fault);
             }
             else {
                 this.log.error('repair failed for %s slice %d: %s', fault.objectId, fault.sliceIndex, message);
+                await this.deps.remediationService.markRepairFailed(fault.key, message);
                 await this.notify('warning', `Repair failed for object ${fault.objectId} slice ${fault.sliceIndex}: ${message}`, fault);
             }
         }
         finally {
             this.leases.delete(fault.key);
         }
+    }
+
+    private repairBlockDetails(err: unknown, message: string): RepairBlockDetails {
+        const details = { ...((err as { repairDetails?: RepairBlockDetails } | undefined)?.repairDetails ?? {}) };
+        details.message ??= message;
+        return details;
     }
 
     private async clear(fault: SliceFault, reason: string): Promise<void> {

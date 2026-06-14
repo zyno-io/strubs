@@ -4,6 +4,7 @@ import { deviceDiscovery, type DeviceDiscovery, type CachedDevice } from './devi
 import { volumeFleet as defaultVolumeFleet, type VolumeFleet } from './volume-fleet';
 import type { Volume, VolumeConfig, PersistedVolumeConfig } from './volume';
 import { mountRootManager as defaultMountRootManager, type MountRootManager } from './mount-root-manager';
+import { repairWorker } from '../remediation/repair-worker';
 
 const log = createLogger('io-manager');
 
@@ -11,12 +12,14 @@ type IOManagerDeps = {
     deviceDiscovery: DeviceDiscovery;
     volumeFleet: VolumeFleet;
     mountRootManager: MountRootManager;
+    repairWorker: Pick<typeof repairWorker, 'wake'>;
 };
 
 const defaultDeps: IOManagerDeps = {
     deviceDiscovery,
     volumeFleet: defaultVolumeFleet,
-    mountRootManager: defaultMountRootManager
+    mountRootManager: defaultMountRootManager,
+    repairWorker
 };
 
 export class IOManager {
@@ -98,6 +101,7 @@ export class IOManager {
         await this.deps.mountRootManager.ensureExists();
         await this.deps.volumeFleet.registerVolume(config, this._onlineDevices);
         this.volumeGroupCount = this.deps.volumeFleet.countVolumeGroups();
+        this.deps.repairWorker.wake(`volume ${config.id} registered`);
     }
 
     async softDeleteVolume(id: number): Promise<void> {
@@ -107,6 +111,8 @@ export class IOManager {
     async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null }): Promise<void> {
         await this.reloadBlockDevices();
         await this.deps.volumeFleet.updateVolumeFlags(id, changes, this._onlineDevices);
+        if (changes.isEnabled === true || changes.isDeleted === false)
+            this.deps.repairWorker.wake(`volume ${id} availability changed`);
     }
 
     getCachedDevices(): CachedDevice[] {

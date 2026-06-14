@@ -92,6 +92,62 @@ describe('RemediationService', () => {
         expect(faultStore.deleteFault).toHaveBeenCalledWith(fault.key);
     });
 
+    it('marks a fault as repair-blocked and persists the reason', async () => {
+        const { service, faultStore } = makeService();
+        service.reportSliceFault({ objectId: 'obj1', sliceIndex: 0, volumeId: 7, source: 'read', code: 'EIO' });
+        await expect(service.markRepairBlocked('7:obj1:0', 'insufficient-slices', {
+            requiredSlices: 4,
+            availableSlices: 3,
+            missingSliceIndexes: [5],
+            missingVolumeIds: [9],
+            message: 'insufficient slices'
+        })).resolves.toBe(true);
+
+        const [fault] = service.listFaults();
+        expect(fault).toMatchObject({
+            repairStatus: 'blocked',
+            repairBlockedReason: 'insufficient-slices',
+            repairBlockedAt: 1000,
+            lastRepairAttemptAt: 1000,
+            lastRepairError: 'insufficient slices',
+            repairDetails: {
+                requiredSlices: 4,
+                availableSlices: 3,
+                missingSliceIndexes: [5],
+                missingVolumeIds: [9]
+            }
+        });
+        const upserted = faultStore.upsertFault.mock.calls.at(-1)?.[0];
+        expect(upserted).toMatchObject({
+            repairStatus: 'blocked',
+            repairBlockedReason: 'insufficient-slices',
+            repairDetails: expect.objectContaining({ requiredSlices: 4 })
+        });
+        expect(upserted.repairBlockedAt).toBeInstanceOf(Date);
+    });
+
+    it('returns a blocked fault to pending when repair is attempted again', async () => {
+        const { service, faultStore } = makeService();
+        service.reportSliceFault({ objectId: 'obj1', sliceIndex: 0, volumeId: 7, source: 'read', code: 'EIO' });
+        await service.markRepairBlocked('7:obj1:0', 'insufficient-slices', { message: 'insufficient slices' });
+
+        await expect(service.markRepairAttempted('7:obj1:0')).resolves.toBe(true);
+
+        const [fault] = service.listFaults();
+        expect(fault).toMatchObject({
+            repairStatus: 'pending',
+            lastRepairAttemptAt: 1000
+        });
+        expect(fault.repairBlockedReason).toBeUndefined();
+        expect(fault.repairBlockedAt).toBeUndefined();
+        expect(fault.lastRepairError).toBeUndefined();
+        expect(fault.repairDetails).toBeUndefined();
+
+        const upserted = faultStore.upsertFault.mock.calls.at(-1)?.[0];
+        expect(upserted).toMatchObject({ repairStatus: 'pending' });
+        expect(upserted.repairBlockedReason).toBeUndefined();
+    });
+
     it('persists faults to the durable store', async () => {
         const { service, faultStore } = makeService();
         service.reportSliceFault({ objectId: 'obj1', sliceIndex: 0, volumeId: 7, source: 'verify', code: 'EIO' });
@@ -106,12 +162,40 @@ describe('RemediationService', () => {
     it('hydrates in-memory faults from the store on startup', async () => {
         const faultStore = makeStore();
         faultStore.listFaults.mockResolvedValue([
-            { _id: '3:objX:1', objectId: 'objX', sliceIndex: 1, volumeId: 3, source: 'verify', code: 'EIO', firstSeen: new Date(1000), lastSeen: new Date(2000), count: 4 }
+            {
+                _id: '3:objX:1',
+                objectId: 'objX',
+                sliceIndex: 1,
+                volumeId: 3,
+                source: 'verify',
+                code: 'EIO',
+                firstSeen: new Date(1000),
+                lastSeen: new Date(2000),
+                count: 4,
+                repairStatus: 'blocked',
+                repairBlockedReason: 'insufficient-slices',
+                repairBlockedAt: new Date(3000),
+                lastRepairAttemptAt: new Date(2500),
+                lastRepairError: 'insufficient slices',
+                repairDetails: { requiredSlices: 4, availableSlices: 3 }
+            }
         ]);
         const { service } = makeService(undefined, faultStore);
         await service.hydrate();
         const faults = service.listFaults();
         expect(faults).toHaveLength(1);
-        expect(faults[0]).toMatchObject({ key: '3:objX:1', objectId: 'objX', count: 4, firstSeen: 1000, lastSeen: 2000 });
+        expect(faults[0]).toMatchObject({
+            key: '3:objX:1',
+            objectId: 'objX',
+            count: 4,
+            firstSeen: 1000,
+            lastSeen: 2000,
+            repairStatus: 'blocked',
+            repairBlockedReason: 'insufficient-slices',
+            repairBlockedAt: 3000,
+            lastRepairAttemptAt: 2500,
+            lastRepairError: 'insufficient slices',
+            repairDetails: { requiredSlices: 4, availableSlices: 3 }
+        });
     });
 });

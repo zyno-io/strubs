@@ -3,6 +3,21 @@
 // pipeline ingests, dedupes, classifies and (later) repairs.
 
 export type FaultSource = 'read' | 'verify' | 'syslog' | 'smart';
+export type RepairStatus = 'pending' | 'blocked';
+export type RepairBlockedReason = 'insufficient-slices';
+
+export interface RepairBlockDetails {
+    requiredSlices?: number;
+    availableSlices?: number;
+    totalSlices?: number;
+    chunkIndex?: number;
+    availableSliceIndexes?: number[];
+    missingSliceIndexes?: number[];
+    failedSliceIndexes?: number[];
+    missingVolumeIds?: number[];
+    failedVolumeIds?: number[];
+    message?: string;
+}
 
 export interface SliceFaultInput {
     objectId: string;
@@ -19,6 +34,12 @@ export interface SliceFault extends SliceFaultInput {
     firstSeen: number;
     lastSeen: number;
     count: number;
+    repairStatus?: RepairStatus;
+    repairBlockedReason?: RepairBlockedReason;
+    repairBlockedAt?: number;
+    lastRepairAttemptAt?: number;
+    lastRepairError?: string;
+    repairDetails?: RepairBlockDetails;
 }
 
 // Identity of a fault is (volume, object, slice): the same bad slice seen

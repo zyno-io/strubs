@@ -219,7 +219,8 @@ export class Database {
         try {
             await this.faultsCollection.createIndexes([
                 { key: { lastSeen: 1 }, name: 'lastSeen' },
-                { key: { volumeId: 1 }, name: 'volumeId' }
+                { key: { volumeId: 1 }, name: 'volumeId' },
+                { key: { repairStatus: 1 }, name: 'repairStatus', sparse: true }
             ]);
         }
         catch (err) {

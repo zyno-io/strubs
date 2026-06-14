@@ -26,6 +26,9 @@ const makeWorker = (overrides?: any) => {
         remediationService: {
             listFaults: vi.fn(() => [fault()]),
             clearFault: vi.fn().mockResolvedValue(true),
+            markRepairAttempted: vi.fn().mockResolvedValue(true),
+            markRepairBlocked: vi.fn().mockResolvedValue(true),
+            markRepairFailed: vi.fn().mockResolvedValue(true),
             onSliceFault: vi.fn((listener: (fault: SliceFault) => void) => {
                 faultListeners.add(listener);
                 return () => {
@@ -53,6 +56,7 @@ describe('RepairWorker', () => {
 
         expect(deps.repairSlice).not.toHaveBeenCalled();
         expect(deps.remediationService.clearFault).toHaveBeenCalledWith('1:obj1:0');
+        expect(deps.remediationService.markRepairAttempted).toHaveBeenCalledWith('1:obj1:0');
     });
 
     it('rebuilds a confirmed-bad slice and clears the fault after it re-verifies', async () => {
@@ -76,6 +80,7 @@ describe('RepairWorker', () => {
 
         expect(deps.repairSlice).toHaveBeenCalled();
         expect(deps.remediationService.clearFault).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairFailed).toHaveBeenCalledWith('1:obj1:0', 'repaired slice did not verify clean');
         expect(deps.notificationService.notify).toHaveBeenCalledWith(expect.objectContaining({ severity: 'warning' }));
     });
 
@@ -89,7 +94,10 @@ describe('RepairWorker', () => {
     });
 
     it('raises a critical alert and leaves the fault when redundancy is insufficient', async () => {
-        const equorum = Object.assign(new Error('insufficient slices'), { code: 'EQUORUM' });
+        const equorum = Object.assign(new Error('insufficient slices'), {
+            code: 'EQUORUM',
+            repairDetails: { requiredSlices: 4, availableSlices: 3, missingSliceIndexes: [5] }
+        });
         const { worker, deps } = makeWorker({
             verifyObject: vi.fn().mockResolvedValue({ '0': { ok: false, volumeId: 1 } }),
             repairSlice: vi.fn().mockRejectedValue(equorum)
@@ -97,7 +105,29 @@ describe('RepairWorker', () => {
         await worker.processFaults();
 
         expect(deps.remediationService.clearFault).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairBlocked).toHaveBeenCalledWith(
+            '1:obj1:0',
+            'insufficient-slices',
+            expect.objectContaining({
+                requiredSlices: 4,
+                availableSlices: 3,
+                missingSliceIndexes: [5],
+                message: 'insufficient slices'
+            })
+        );
         expect(deps.notificationService.notify).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }));
+    });
+
+    it('records non-quorum repair failures without marking the fault blocked', async () => {
+        const failure = new Error('write failed');
+        const { worker, deps } = makeWorker({
+            verifyObject: vi.fn().mockResolvedValue({ '0': { ok: false, volumeId: 1 } }),
+            repairSlice: vi.fn().mockRejectedValue(failure)
+        });
+        await worker.processFaults();
+
+        expect(deps.remediationService.markRepairFailed).toHaveBeenCalledWith('1:obj1:0', 'write failed');
+        expect(deps.remediationService.markRepairBlocked).not.toHaveBeenCalled();
     });
 
     it('clears the fault when the object no longer exists', async () => {
