@@ -1,7 +1,13 @@
 import { Collection, ObjectId, type Filter } from 'mongodb';
 
 import { config } from '../config';
+import { constants } from '../constants';
 import { createError } from '../helpers';
+import {
+    createEmptyStorageCounters,
+    createEmptyStorageStatsSnapshot,
+    type StorageStatsSnapshot
+} from '../storage/stats';
 import { ContainerCache } from './container-cache';
 import type { ContentDocument, ContainerPath, ObjectIdentifier, ObjectVerificationStateUpdate } from './types';
 
@@ -80,6 +86,76 @@ export class ContentRepository {
         await this.collection.deleteOne({
             _id: this.toMongoId(id) as ObjectId
         });
+    }
+
+    async backfillSliceSizes(): Promise<number> {
+        const result = await this.collection.updateMany(
+            {
+                isFile: true,
+                $or: [
+                    { sliceSize: { $exists: false } },
+                    { sliceSize: null }
+                ]
+            },
+            [
+                {
+                    $set: {
+                        sliceSize: this.sliceSizeExpression()
+                    }
+                }
+            ]
+        );
+        return result.modifiedCount ?? 0;
+    }
+
+    async computeStorageStats(availableVolumeIds: number[], updatedAt = new Date()): Promise<StorageStatsSnapshot> {
+        const snapshot = createEmptyStorageStatsSnapshot(updatedAt);
+        const [system] = await this.collection.aggregate<{
+            objectCount: number;
+            logicalBytes: number;
+            dataSliceCount: number;
+            paritySliceCount: number;
+            dataBytes: number;
+            parityBytes: number;
+        }>([
+            { $match: { isFile: true } },
+            {
+                $project: {
+                    size: { $ifNull: ['$size', 0] },
+                    sliceSize: this.sliceSizeExpression(),
+                    dataSliceCount: { $size: { $ifNull: ['$dataVolumes', []] } },
+                    paritySliceCount: { $size: { $ifNull: ['$parityVolumes', []] } }
+                }
+            },
+            {
+                $group: {
+                    _id: null,
+                    objectCount: { $sum: 1 },
+                    logicalBytes: { $sum: '$size' },
+                    dataSliceCount: { $sum: '$dataSliceCount' },
+                    paritySliceCount: { $sum: '$paritySliceCount' },
+                    dataBytes: { $sum: { $multiply: ['$sliceSize', '$dataSliceCount'] } },
+                    parityBytes: { $sum: { $multiply: ['$sliceSize', '$paritySliceCount'] } }
+                }
+            },
+            { $project: { _id: 0 } }
+        ]).toArray();
+
+        if (system) {
+            snapshot.system.objectCount = system.objectCount ?? 0;
+            snapshot.system.logicalBytes = system.logicalBytes ?? 0;
+            snapshot.system.dataSliceCount = system.dataSliceCount ?? 0;
+            snapshot.system.paritySliceCount = system.paritySliceCount ?? 0;
+            snapshot.system.dataBytes = system.dataBytes ?? 0;
+            snapshot.system.parityBytes = system.parityBytes ?? 0;
+            snapshot.system.physicalBytes = snapshot.system.dataBytes + snapshot.system.parityBytes;
+        }
+
+        await this.populateVolumeStorageStats(snapshot, 'dataVolumes', 'data');
+        await this.populateVolumeStorageStats(snapshot, 'parityVolumes', 'parity');
+        await this.populateVolumeObjectStats(snapshot);
+        await this.populateUnavailableStorageStats(snapshot, availableVolumeIds);
+        return snapshot;
     }
 
     async findObjectsNeedingVerification(startedAt: Date, limit: number, volumeIds?: number[]): Promise<ContentDocument[]> {
@@ -178,6 +254,199 @@ export class ContentRepository {
             { _id: this.toMongoId(id) as ObjectId },
             updateDoc
         );
+    }
+
+    private async populateVolumeStorageStats(snapshot: StorageStatsSnapshot, field: 'dataVolumes' | 'parityVolumes', type: 'data' | 'parity'): Promise<void> {
+        const rows = await this.collection.aggregate<{
+            volumeId: number;
+            sliceCount: number;
+            bytes: number;
+        }>([
+            { $match: { isFile: true } },
+            {
+                $project: {
+                    volumeId: `$${field}`,
+                    sliceSize: this.sliceSizeExpression()
+                }
+            },
+            { $unwind: '$volumeId' },
+            {
+                $group: {
+                    _id: '$volumeId',
+                    sliceCount: { $sum: 1 },
+                    bytes: { $sum: '$sliceSize' }
+                }
+            },
+            {
+                $project: {
+                    _id: 0,
+                    volumeId: '$_id',
+                    sliceCount: 1,
+                    bytes: 1
+                }
+            }
+        ]).toArray();
+
+        for (const row of rows) {
+            const stats = this.getOrCreateVolumeStats(snapshot, row.volumeId);
+            if (type === 'data') {
+                stats.dataSliceCount += row.sliceCount ?? 0;
+                stats.dataBytes += row.bytes ?? 0;
+            }
+            else {
+                stats.paritySliceCount += row.sliceCount ?? 0;
+                stats.parityBytes += row.bytes ?? 0;
+            }
+            stats.physicalBytes = stats.dataBytes + stats.parityBytes;
+        }
+    }
+
+    private async populateVolumeObjectStats(snapshot: StorageStatsSnapshot): Promise<void> {
+        const rows = await this.collection.aggregate<{
+            volumeId: number;
+            objectCount: number;
+            logicalBytes: number;
+        }>([
+            { $match: { isFile: true } },
+            {
+                $project: {
+                    size: { $ifNull: ['$size', 0] },
+                    volumeId: {
+                        $setUnion: [
+                            { $ifNull: ['$dataVolumes', []] },
+                            { $ifNull: ['$parityVolumes', []] }
+                        ]
+                    }
+                }
+            },
+            { $unwind: '$volumeId' },
+            {
+                $group: {
+                    _id: '$volumeId',
+                    objectCount: { $sum: 1 },
+                    logicalBytes: { $sum: '$size' }
+                }
+            },
+            {
+                $project: {
+                    _id: 0,
+                    volumeId: '$_id',
+                    objectCount: 1,
+                    logicalBytes: 1
+                }
+            }
+        ]).toArray();
+
+        for (const row of rows) {
+            const stats = this.getOrCreateVolumeStats(snapshot, row.volumeId);
+            stats.objectCount += row.objectCount ?? 0;
+            stats.logicalBytes += row.logicalBytes ?? 0;
+        }
+    }
+
+    private async populateUnavailableStorageStats(snapshot: StorageStatsSnapshot, availableVolumeIds: number[]): Promise<void> {
+        const available = Array.from(new Set(availableVolumeIds.filter(id => Number.isFinite(id))));
+        const [unavailable] = await this.collection.aggregate<{
+            objectCount: number;
+            logicalBytes: number;
+        }>([
+            { $match: { isFile: true } },
+            {
+                $project: {
+                    size: { $ifNull: ['$size', 0] },
+                    requiredSlices: { $size: { $ifNull: ['$dataVolumes', []] } },
+                    availableSlices: {
+                        $add: [
+                            { $size: { $setIntersection: [{ $ifNull: ['$dataVolumes', []] }, available] } },
+                            { $size: { $setIntersection: [{ $ifNull: ['$parityVolumes', []] }, available] } }
+                        ]
+                    }
+                }
+            },
+            { $match: { $expr: { $lt: ['$availableSlices', '$requiredSlices'] } } },
+            {
+                $group: {
+                    _id: null,
+                    objectCount: { $sum: 1 },
+                    logicalBytes: { $sum: '$size' }
+                }
+            },
+            { $project: { _id: 0 } }
+        ]).toArray();
+
+        snapshot.system.unavailableObjectCount = unavailable?.objectCount ?? 0;
+        snapshot.system.unavailableLogicalBytes = unavailable?.logicalBytes ?? 0;
+    }
+
+    private getOrCreateVolumeStats(snapshot: StorageStatsSnapshot, volumeId: number) {
+        const key = String(volumeId);
+        snapshot.volumes[key] ??= createEmptyStorageCounters();
+        return snapshot.volumes[key];
+    }
+
+    private sliceSizeExpression(): Record<string, unknown> {
+        return {
+            $ifNull: [
+                '$sliceSize',
+                {
+                    $let: {
+                        vars: {
+                            chunkSize: { $ifNull: ['$chunkSize', config.chunkSize] },
+                            size: { $ifNull: ['$size', 0] },
+                            dataSliceCount: {
+                                $max: [
+                                    { $size: { $ifNull: ['$dataVolumes', []] } },
+                                    1
+                                ]
+                            }
+                        },
+                        in: {
+                            $let: {
+                                vars: {
+                                    sliceDataSize: { $ceil: { $divide: ['$$size', '$$dataSliceCount'] } },
+                                    startChunkSize: { $subtract: ['$$chunkSize', constants.FILE_HEADER_SIZE] },
+                                    chunkDataSize: { $subtract: ['$$chunkSize', constants.CHUNK_HEADER_SIZE] }
+                                },
+                                in: {
+                                    $add: [
+                                        constants.FILE_HEADER_SIZE,
+                                        '$$sliceDataSize',
+                                        {
+                                            $multiply: [
+                                                constants.CHUNK_HEADER_SIZE,
+                                                {
+                                                    $max: [
+                                                        1,
+                                                        {
+                                                            $ceil: {
+                                                                $add: [
+                                                                    1,
+                                                                    {
+                                                                        $divide: [
+                                                                            {
+                                                                                $add: [
+                                                                                    { $subtract: ['$$sliceDataSize', '$$startChunkSize'] },
+                                                                                    constants.CHUNK_HEADER_SIZE
+                                                                                ]
+                                                                            },
+                                                                            '$$chunkDataSize'
+                                                                        ]
+                                                                    }
+                                                                ]
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        };
     }
 
     private buildStaleSliceConditions(startedAt: Date, volumeIds: number[]): Filter<ContentDocument>[] {

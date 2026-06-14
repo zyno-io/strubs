@@ -16,6 +16,8 @@ const DEFAULT_REPAIR_BATCH_SIZE = 25;
 const DEFAULT_REPAIR_BACKLOG_DELAY_MS = 10 * 1000;
 const DEFAULT_REPAIR_BLOCKED_RETRY_MS = 60 * 60 * 1000;
 const DEFAULT_VOLUME_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_STORAGE_STATS_INTERVAL_MS = 15 * 60 * 1000;
+const DEFAULT_STORAGE_STATS_FLUSH_INTERVAL_MS = 5 * 1000;
 
 function parseSeverity(value: string | undefined, fallback: Severity): Severity {
     if (value && (VALID_SEVERITIES as string[]).includes(value))
@@ -70,6 +72,12 @@ export class Config {
     volumeHealthIntervalMs: number;
     volumeFaultThreshold: number;
 
+    // Cached content/volume storage statistics. The reconciliation interval
+    // rebuilds from content aggregation; the flush interval batches live object
+    // create/delete deltas into the cached snapshot.
+    storageStatsIntervalMs: number;
+    storageStatsFlushIntervalMs: number;
+
     constructor() {
         this.mongoUrl = process.env.STRUBS_MONGO_URL || 'mongodb://strubs:strubs@127.0.0.1:27017/strubs?authSource=admin';
         this.dataSliceCount = process.env.STRUBS_DATA_SLICES ? parseInt(process.env.STRUBS_DATA_SLICES, 10) : 4;
@@ -97,6 +105,13 @@ export class Config {
         this.volumeFaultThreshold = process.env.STRUBS_VOLUME_FAULT_THRESHOLD
             ? parseInt(process.env.STRUBS_VOLUME_FAULT_THRESHOLD, 10)
             : 10;
+        this.storageStatsIntervalMs = process.env.STRUBS_STORAGE_STATS_INTERVAL_MS
+            ? parseInt(process.env.STRUBS_STORAGE_STATS_INTERVAL_MS, 10)
+            : DEFAULT_STORAGE_STATS_INTERVAL_MS;
+        this.storageStatsFlushIntervalMs = parsePositiveInt(
+            process.env.STRUBS_STORAGE_STATS_FLUSH_INTERVAL_MS,
+            DEFAULT_STORAGE_STATS_FLUSH_INTERVAL_MS
+        );
     }
 
     async loadIdentity(): Promise<void> {

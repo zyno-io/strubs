@@ -3,6 +3,7 @@ import { Duplex } from 'stream';
 import { database } from '../database';
 import type { ContentDocument, SliceErrorInfo, SliceVerificationTimes } from '../database';
 import { createLogger } from '../log';
+import { storageStatsTracker } from '../storage/stats-tracker';
 
 import { generateObjectId } from './helpers';
 import { planner } from './planner';
@@ -26,6 +27,7 @@ export interface StoredObjectRecord extends ContentDocument {
     md5: Buffer | null;
     mime?: string | null;
     chunkSize: number;
+    sliceSize?: number;
     dataVolumes: number[];
     parityVolumes: number[];
     unavailableSlices?: number[];
@@ -43,6 +45,8 @@ export type FileObjectDependencies = {
     generatePlan: (size: number) => Promise<Plan>;
     createObjectRecord: (record: StoredObjectRecord) => Promise<void>;
     deleteObjectById: (id: string) => Promise<void>;
+    recordObjectCreated: (record: StoredObjectRecord) => void;
+    recordObjectDeleted: (record: StoredObjectRecord) => void;
     createLogger: typeof createLogger;
 };
 
@@ -51,6 +55,8 @@ const defaultDeps: FileObjectDependencies = {
     generatePlan: (size: number) => Promise.resolve(planner.generatePlan(size)),
     createObjectRecord: record => database.createObjectRecord(record),
     deleteObjectById: id => database.deleteObjectById(id),
+    recordObjectCreated: record => storageStatsTracker.recordCreated(record),
+    recordObjectDeleted: record => storageStatsTracker.recordDeleted(record),
     createLogger
 };
 
@@ -155,6 +161,7 @@ export class FileObject extends Duplex {
             md5: this.md5,
             mime: this.mime,
             chunkSize: this.chunkSize,
+            sliceSize: this.plan?.sliceSize ?? undefined,
             dataVolumes: this.dataSliceVolumeIds,
             parityVolumes: this.paritySliceVolumeIds
         };
@@ -163,6 +170,7 @@ export class FileObject extends Duplex {
             delete dbObject.mime;
 
         await this.deps.createObjectRecord(dbObject);
+        this.deps.recordObjectCreated(dbObject);
 
         this._isPersisted = true;
         this._mode = null;
@@ -275,7 +283,9 @@ export class FileObject extends Duplex {
         }
 
         if (this._isPersisted && this.id) {
+            const deletedRecord = this.toStoredObjectRecord();
             await this.deps.deleteObjectById(this.id);
+            this.deps.recordObjectDeleted(deletedRecord);
         }
 
         this._mode = null;
@@ -283,6 +293,24 @@ export class FileObject extends Duplex {
 
         this.logger('deleted object');
         this._hasVolumeReservations = false;
+    }
+
+    private toStoredObjectRecord(): StoredObjectRecord {
+        if (!this.id)
+            throw new Error('file object has no id');
+        return {
+            id: this.id,
+            containerId: this.containerId,
+            isFile: true,
+            name: this.name ?? '',
+            size: this.size,
+            md5: this.md5,
+            mime: this.mime,
+            chunkSize: this.chunkSize,
+            sliceSize: this.plan?.sliceSize ?? undefined,
+            dataVolumes: this.dataSliceVolumeIds,
+            parityVolumes: this.paritySliceVolumeIds
+        };
     }
 
     override async _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): Promise<void> {

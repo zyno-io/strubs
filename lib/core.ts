@@ -13,6 +13,7 @@ import { volumeHealthMonitor } from './io/volume-health-monitor';
 import { configureNotifications } from './notify/bootstrap';
 import { remediationService } from './remediation/service';
 import { repairWorker } from './remediation/repair-worker';
+import { storageStatsTracker } from './storage/stats-tracker';
 
 const log = createLogger('core');
 
@@ -73,6 +74,10 @@ export class Core {
                 blockedRetryMs: config.repairBlockedRetryMs
             });
             volumeHealthMonitor.start(config.volumeHealthIntervalMs, config.volumeFaultThreshold);
+            storageStatsTracker.start({
+                reconcileIntervalMs: config.storageStatsIntervalMs,
+                flushIntervalMs: config.storageStatsFlushIntervalMs
+            });
 
             this.started = true;
             log('STRUBS started.');
@@ -105,6 +110,14 @@ export class Core {
             }
             catch (err) {
                 stopError = err;
+            }
+
+            try {
+                await storageStatsTracker.stop();
+            }
+            catch (err) {
+                if (!stopError)
+                    stopError = err;
             }
 
             try {

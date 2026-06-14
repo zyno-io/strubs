@@ -8,9 +8,12 @@ import { ContentRepository } from './database/content-repository';
 import { VolumeRepository, type VolumeVerifyErrors } from './database/volume-repository';
 import { RuntimeConfigRepository } from './database/runtime-config';
 import { FaultRepository, type FaultDocument, type FaultUpsert } from './database/fault-repository';
+import { StorageStatsRepository } from './database/storage-stats-repository';
 import type { ContainerPath, ContentDocument, ObjectIdentifier, ObjectVerificationStateUpdate, SliceErrorInfo } from './database/types';
+import type { StorageStatsDelta, StorageStatsSnapshot } from './storage/stats';
 export type { ContentDocument, ObjectVerificationStateUpdate, SliceErrorInfo, SliceVerificationTimes } from './database/types';
 export type { FaultDocument, FaultUpsert } from './database/fault-repository';
+export type { StorageStatsDelta, StorageStatsSnapshot } from './storage/stats';
 
 const log = createLogger('database');
 
@@ -22,11 +25,13 @@ export class Database {
         content: Collection<ContentDocument> | null;
         runtimeConfig: Collection<{ key: string; value: unknown }> | null;
         faults: Collection<FaultDocument> | null;
+        storageStats: Collection<any> | null;
     } = {
         volumes: null,
         content: null,
         runtimeConfig: null,
-        faults: null
+        faults: null,
+        storageStats: null
     };
     private readonly _containerCache = new ContainerCache();
     private _repositories: {
@@ -34,11 +39,13 @@ export class Database {
         content: ContentRepository | null;
         runtimeConfig: RuntimeConfigRepository | null;
         faults: FaultRepository | null;
+        storageStats: StorageStatsRepository | null;
     } = {
         volumes: null,
         content: null,
         runtimeConfig: null,
-        faults: null
+        faults: null,
+        storageStats: null
     };
 
     constructor() {
@@ -57,6 +64,7 @@ export class Database {
             this._collections.content = this._db.collection('content');
             this._collections.runtimeConfig = this._db.collection('runtimeConfig');
             this._collections.faults = this._db.collection('faults');
+            this._collections.storageStats = this._db.collection('storageStats');
             this._repositories = {
                 volumes: new VolumeRepository(this._collections.volumes),
                 content: new ContentRepository(
@@ -66,7 +74,8 @@ export class Database {
                     this.getMongoId.bind(this)
                 ),
                 runtimeConfig: new RuntimeConfigRepository(this._collections.runtimeConfig),
-                faults: new FaultRepository(this._collections.faults)
+                faults: new FaultRepository(this._collections.faults),
+                storageStats: new StorageStatsRepository(this._collections.storageStats)
             };
             await this.ensureContentIndexes();
             await this.ensureFaultIndexes();
@@ -177,6 +186,26 @@ export class Database {
 
     async deleteObjectById(id: ObjectIdentifier): Promise<void> {
         await this.contentRepository.deleteObjectById(id);
+    }
+
+    async backfillContentSliceSizes(): Promise<number> {
+        return this.contentRepository.backfillSliceSizes();
+    }
+
+    async computeStorageStats(availableVolumeIds: number[], updatedAt?: Date): Promise<StorageStatsSnapshot> {
+        return this.contentRepository.computeStorageStats(availableVolumeIds, updatedAt);
+    }
+
+    async getStorageStats(): Promise<StorageStatsSnapshot | null> {
+        return this.storageStatsRepository.get();
+    }
+
+    async replaceStorageStats(snapshot: StorageStatsSnapshot): Promise<void> {
+        await this.storageStatsRepository.replace(snapshot);
+    }
+
+    async applyStorageStatsDelta(delta: StorageStatsDelta, updatedAt?: Date): Promise<void> {
+        await this.storageStatsRepository.applyDelta(delta, updatedAt);
     }
 
     getMongoId(id: ObjectIdentifier): ObjectId | null {
@@ -310,6 +339,12 @@ export class Database {
         return this._collections.faults;
     }
 
+    private get storageStatsCollection(): Collection<any> {
+        if (!this._collections.storageStats)
+            throw new Error('database not initialized');
+        return this._collections.storageStats;
+    }
+
     private get volumeRepository(): VolumeRepository {
         if (!this._repositories.volumes) {
             this._repositories.volumes = new VolumeRepository(this.volumesCollection);
@@ -341,6 +376,13 @@ export class Database {
             this._repositories.runtimeConfig = new RuntimeConfigRepository(this.runtimeConfigCollection);
         }
         return this._repositories.runtimeConfig;
+    }
+
+    private get storageStatsRepository(): StorageStatsRepository {
+        if (!this._repositories.storageStats) {
+            this._repositories.storageStats = new StorageStatsRepository(this.storageStatsCollection);
+        }
+        return this._repositories.storageStats;
     }
 }
 

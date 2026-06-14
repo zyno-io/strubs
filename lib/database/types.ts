@@ -12,6 +12,7 @@ export interface ContentDocument {
     isFile?: boolean;
     size?: number;
     chunkSize?: number;
+    sliceSize?: number | null;
     dataVolumes?: number[];
     parityVolumes?: number[];
     unavailableSlices?: number[];

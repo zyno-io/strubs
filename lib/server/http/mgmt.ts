@@ -17,6 +17,8 @@ import { notificationService } from '../../notify/service';
 import type { Severity } from '../../notify/notifier';
 import { remediationService } from '../../remediation/service';
 import type { SliceFault } from '../../remediation/fault';
+import { storageStatsTracker } from '../../storage/stats-tracker';
+import type { StorageStatsSnapshot } from '../../storage/stats';
 
 export type VolumeStatus = {
     id: number;
@@ -345,6 +347,17 @@ export class HttpMgmt {
         };
     }
 
+    private static async handleStorageStatsRequest(): Promise<StorageStatsSnapshot> {
+        let snapshot = await storageStatsTracker.getSnapshot();
+        if (!snapshot) {
+            await storageStatsTracker.reconcile();
+            snapshot = await storageStatsTracker.getSnapshot();
+        }
+        if (!snapshot)
+            throw new Error('storage stats unavailable');
+        return snapshot;
+    }
+
     private static async handleVolumeCreationRequest(req: HttpRequest): Promise<VolumeStatus> {
         const payload = await this.parseJsonBody<{ blockPath?: string; wipe?: unknown; replace?: unknown }>(req);
         const blockPath = payload.blockPath;
@@ -582,6 +595,11 @@ export class HttpMgmt {
                 method: 'GET',
                 match: url => url === '/$/debug' ? {} : null,
                 handler: async () => this.handleDebugRequest()
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/storage-stats' ? {} : null,
+                handler: async () => this.handleStorageStatsRequest()
             },
             {
                 method: 'GET',

@@ -27,6 +27,10 @@ const verifyVolumesJobMock = {
 const verifyFileJobMock = {
     verify: vi.fn()
 };
+const storageStatsTrackerMock = {
+    getSnapshot: vi.fn(),
+    reconcile: vi.fn()
+};
 const databaseSoftDeleteMock = vi.fn();
 const databaseUpdateFlagsMock = vi.fn();
 const volumeSmartMonitorMock = {
@@ -54,6 +58,10 @@ vi.mock('../lib/jobs/verify-volumes-job', () => ({
 
 vi.mock('../lib/jobs/verify-file-job', () => ({
     verifyFileJob: verifyFileJobMock
+}));
+
+vi.mock('../lib/storage/stats-tracker', () => ({
+    storageStatsTracker: storageStatsTrackerMock
 }));
 
 vi.mock('../lib/database', () => ({
@@ -92,6 +100,8 @@ beforeEach(() => {
     verifyVolumesJobMock.stop.mockReset();
     verifyVolumesJobMock.getStatus.mockReset();
     verifyFileJobMock.verify.mockReset();
+    storageStatsTrackerMock.getSnapshot.mockReset();
+    storageStatsTrackerMock.reconcile.mockReset();
     ioManagerMock.getVolumeEntries.mockReturnValue([]);
     ioManagerMock.getCachedDevices.mockReturnValue([]);
     const summary = {
@@ -108,6 +118,22 @@ beforeEach(() => {
         summary,
         details: { smart_status: { passed: true } }
     });
+    storageStatsTrackerMock.getSnapshot.mockResolvedValue({
+        updatedAt: new Date('2026-06-14T00:00:00.000Z'),
+        system: {
+            objectCount: 0,
+            logicalBytes: 0,
+            dataSliceCount: 0,
+            paritySliceCount: 0,
+            dataBytes: 0,
+            parityBytes: 0,
+            physicalBytes: 0,
+            unavailableObjectCount: 0,
+            unavailableLogicalBytes: 0
+        },
+        volumes: {}
+    });
+    storageStatsTrackerMock.reconcile.mockResolvedValue(undefined);
 });
 
 const createRequest = (method: string, url: string, body?: unknown): HttpRequest => {
@@ -657,6 +683,66 @@ describe('HttpMgmt.handle', () => {
             gbCapacity: 200 / (1024 ** 3),
             gbFree: 100 / (1024 ** 3)
         });
+    });
+
+    it('returns cached storage stats', async () => {
+        const snapshot = {
+            updatedAt: new Date('2026-06-14T00:00:00.000Z'),
+            system: {
+                objectCount: 2,
+                logicalBytes: 100,
+                dataSliceCount: 4,
+                paritySliceCount: 2,
+                dataBytes: 160,
+                parityBytes: 80,
+                physicalBytes: 240,
+                unavailableObjectCount: 1,
+                unavailableLogicalBytes: 25
+            },
+            volumes: {
+                '1': {
+                    objectCount: 2,
+                    logicalBytes: 100,
+                    dataSliceCount: 2,
+                    paritySliceCount: 0,
+                    dataBytes: 80,
+                    parityBytes: 0,
+                    physicalBytes: 80
+                }
+            }
+        };
+        storageStatsTrackerMock.getSnapshot.mockResolvedValue(snapshot);
+
+        const response = await HttpMgmt.handle(23, createRequest('GET', '/$/storage-stats'), nullResponse);
+
+        expect(response).toBe(snapshot);
+        expect(storageStatsTrackerMock.reconcile).not.toHaveBeenCalled();
+    });
+
+    it('reconciles storage stats on demand when the cache is missing', async () => {
+        const snapshot = {
+            updatedAt: new Date('2026-06-14T00:00:00.000Z'),
+            system: {
+                objectCount: 0,
+                logicalBytes: 0,
+                dataSliceCount: 0,
+                paritySliceCount: 0,
+                dataBytes: 0,
+                parityBytes: 0,
+                physicalBytes: 0,
+                unavailableObjectCount: 0,
+                unavailableLogicalBytes: 0
+            },
+            volumes: {}
+        };
+        storageStatsTrackerMock.getSnapshot
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce(snapshot);
+
+        const response = await HttpMgmt.handle(24, createRequest('GET', '/$/storage-stats'), nullResponse);
+
+        expect(storageStatsTrackerMock.reconcile).toHaveBeenCalledTimes(1);
+        expect(response).toBe(snapshot);
     });
 
     it('creates a new volume when provisioning a block device', async () => {

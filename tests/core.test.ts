@@ -48,6 +48,15 @@ vi.mock('../lib/io/volume-smart-monitor', () => ({
     }
 }));
 
+const storageStatsStartMock = vi.fn();
+const storageStatsStopMock = vi.fn();
+vi.mock('../lib/storage/stats-tracker', () => ({
+    storageStatsTracker: {
+        start: storageStatsStartMock,
+        stop: storageStatsStopMock
+    }
+}));
+
 const serverStartMock = vi.fn();
 const serverStopMock = vi.fn();
 vi.mock('../lib/server/manager', () => ({
@@ -82,6 +91,8 @@ describe('Core', () => {
         verifyStopMock.mockReset();
         smartMonitorStartMock.mockReset();
         smartMonitorStopMock.mockReset();
+        storageStatsStartMock.mockReset();
+        storageStatsStopMock.mockReset();
         loadIdentityMock.mockResolvedValue(undefined);
         connectMock.mockResolvedValue(undefined);
         ioInitMock.mockResolvedValue(undefined);
@@ -90,6 +101,7 @@ describe('Core', () => {
         serverStopMock.mockResolvedValue(undefined);
         smartMonitorStartMock.mockResolvedValue(undefined);
         smartMonitorStopMock.mockResolvedValue(undefined);
+        storageStatsStopMock.mockResolvedValue(undefined);
     });
 
     it('performs the full startup sequence', async () => {
@@ -105,6 +117,7 @@ describe('Core', () => {
         expect(smartMonitorStartMock).toHaveBeenCalledTimes(1);
         expect(serverStartMock).toHaveBeenCalledTimes(1);
         expect(verifyResumeMock).toHaveBeenCalledTimes(1);
+        expect(storageStatsStartMock).toHaveBeenCalledTimes(1);
     });
 
     it('treats EEXIST as a successful run directory creation', async () => {
@@ -158,6 +171,7 @@ describe('Core', () => {
         expect(smartMonitorStopMock).toHaveBeenCalledTimes(1);
         expect(ioStopMock).toHaveBeenCalledTimes(1);
         expect(verifyStopMock).toHaveBeenCalledTimes(1);
+        expect(storageStatsStopMock).toHaveBeenCalledTimes(1);
     });
 
     it('ignores stop when start has not completed', async () => {
@@ -169,5 +183,6 @@ describe('Core', () => {
         expect(serverStopMock).not.toHaveBeenCalled();
         expect(ioStopMock).not.toHaveBeenCalled();
         expect(verifyStopMock).not.toHaveBeenCalled();
+        expect(storageStatsStopMock).not.toHaveBeenCalled();
     });
 });

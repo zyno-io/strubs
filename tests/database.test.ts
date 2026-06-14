@@ -36,12 +36,18 @@ describe('database helpers', () => {
         const content = {
             find: vi.fn(),
             findOne: vi.fn(),
+            aggregate: vi.fn(),
             insertOne: vi.fn(),
             deleteOne: vi.fn(),
             updateOne: vi.fn(),
+            updateMany: vi.fn(),
             createIndexes: vi.fn().mockResolvedValue([])
         };
-        (db as any)._collections = { volumes, content };
+        const storageStats = {
+            findOne: vi.fn(),
+            updateOne: vi.fn()
+        };
+        (db as any)._collections = { volumes, content, storageStats };
         (db as any)._repositories = {
             volumes: new VolumeRepository(volumes as any),
             content: new ContentRepository(
@@ -51,7 +57,7 @@ describe('database helpers', () => {
                 db.getMongoId.bind(db)
             )
         };
-        return { db, volumes, content };
+        return { db, volumes, content, storageStats };
     };
 
     beforeEach(() => {
@@ -432,6 +438,119 @@ describe('database helpers', () => {
                 },
                 $unset: { sliceErrors: '' }
             }
+        );
+    });
+
+    it('computes storage stats from content aggregation results', async () => {
+        const { db, content } = createDbWithCollections();
+        const aggregateResults = [
+            [{ objectCount: 2, logicalBytes: 30, dataSliceCount: 4, paritySliceCount: 2, dataBytes: 400, parityBytes: 200 }],
+            [{ volumeId: 1, sliceCount: 2, bytes: 200 }],
+            [{ volumeId: 3, sliceCount: 2, bytes: 200 }],
+            [{ volumeId: 1, objectCount: 2, logicalBytes: 30 }, { volumeId: 3, objectCount: 2, logicalBytes: 30 }],
+            [{ objectCount: 1, logicalBytes: 10 }]
+        ];
+        content.aggregate.mockImplementation(() => ({
+            toArray: vi.fn().mockResolvedValue(aggregateResults.shift() ?? [])
+        }));
+
+        const updatedAt = new Date('2026-06-14T00:00:00.000Z');
+        const stats = await db.computeStorageStats([1], updatedAt);
+
+        expect(content.aggregate).toHaveBeenCalledTimes(5);
+        expect(stats.updatedAt).toBe(updatedAt);
+        expect(stats.system).toMatchObject({
+            objectCount: 2,
+            logicalBytes: 30,
+            dataSliceCount: 4,
+            paritySliceCount: 2,
+            dataBytes: 400,
+            parityBytes: 200,
+            physicalBytes: 600,
+            unavailableObjectCount: 1,
+            unavailableLogicalBytes: 10
+        });
+        expect(stats.volumes['1']).toMatchObject({
+            objectCount: 2,
+            logicalBytes: 30,
+            dataSliceCount: 2,
+            dataBytes: 200
+        });
+        expect(stats.volumes['3']).toMatchObject({
+            objectCount: 2,
+            logicalBytes: 30,
+            paritySliceCount: 2,
+            parityBytes: 200
+        });
+    });
+
+    it('backfills missing slice sizes', async () => {
+        const { db, content } = createDbWithCollections();
+        content.updateMany.mockResolvedValue({ modifiedCount: 3 });
+
+        const modified = await db.backfillContentSliceSizes();
+
+        expect(modified).toBe(3);
+        expect(content.updateMany).toHaveBeenCalledWith(
+            {
+                isFile: true,
+                $or: [
+                    { sliceSize: { $exists: false } },
+                    { sliceSize: null }
+                ]
+            },
+            [
+                {
+                    $set: {
+                        sliceSize: expect.any(Object)
+                    }
+                }
+            ]
+        );
+    });
+
+    it('applies storage stats deltas to the cached snapshot', async () => {
+        const { db, storageStats } = createDbWithCollections();
+        const updatedAt = new Date('2026-06-14T00:00:00.000Z');
+        storageStats.updateOne.mockResolvedValue({});
+
+        await db.applyStorageStatsDelta({
+            system: {
+                objectCount: 1,
+                logicalBytes: 10,
+                dataSliceCount: 2,
+                paritySliceCount: 1,
+                dataBytes: 100,
+                parityBytes: 50,
+                physicalBytes: 150,
+                unavailableObjectCount: 0,
+                unavailableLogicalBytes: 0
+            },
+            volumes: {
+                '1': {
+                    objectCount: 1,
+                    logicalBytes: 10,
+                    dataSliceCount: 1,
+                    paritySliceCount: 0,
+                    dataBytes: 50,
+                    parityBytes: 0,
+                    physicalBytes: 50
+                }
+            }
+        }, updatedAt);
+
+        expect(storageStats.updateOne).toHaveBeenCalledWith(
+            { _id: 'current' },
+            expect.objectContaining({
+                $set: { updatedAt },
+                $inc: expect.objectContaining({
+                    'system.objectCount': 1,
+                    'system.logicalBytes': 10,
+                    'volumes.1.objectCount': 1,
+                    'volumes.1.dataBytes': 50
+                })
+            }),
+            { upsert: true }
         );
     });
 

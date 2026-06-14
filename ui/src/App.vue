@@ -44,6 +44,38 @@ const verifyActionPending = ref<boolean>(false);
 const stopRequested = ref<boolean>(false);
 let verifyPollTimer: ReturnType<typeof setInterval> | null = null;
 
+interface StorageCounters {
+  objectCount: number;
+  logicalBytes: number;
+  dataSliceCount: number;
+  paritySliceCount: number;
+  dataBytes: number;
+  parityBytes: number;
+  physicalBytes: number;
+}
+
+interface StorageStats {
+  updatedAt: string | Date;
+  system: StorageCounters & {
+    unavailableObjectCount: number;
+    unavailableLogicalBytes: number;
+  };
+  volumes: Record<string, StorageCounters>;
+}
+
+const storageStats = ref<StorageStats | null>(null);
+let storageStatsPollTimer: ReturnType<typeof setInterval> | null = null;
+
+async function fetchStorageStats(): Promise<void> {
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/storage-stats`);
+    if (!res.ok) return;
+    storageStats.value = await res.json();
+  } catch {
+    // Ignore transient stats polling errors
+  }
+}
+
 // Poll the verify job status; tolerant of transient errors so polling continues
 async function fetchVerifyStatus(): Promise<void> {
   try {
@@ -126,6 +158,18 @@ const verifyTargetVolumes = computed<Array<{ id: number; label: string }>>(() =>
   });
 });
 
+const storageVolumeRows = computed<Array<{ id: number; label: string; stats: StorageCounters }>>(() => {
+  const entries = Object.entries(storageStats.value?.volumes ?? {});
+  return entries
+    .map(([id, stats]) => {
+      const volumeId = Number(id);
+      const volume = volumes.value.find(candidate => candidate.id === volumeId);
+      const suffix = volume?.label ? ` (${volume.label})` : '';
+      return { id: volumeId, label: `vol ${volumeId}${suffix}`, stats };
+    })
+    .sort((a, b) => a.id - b.id);
+});
+
 // Fetch data from APIs
 async function fetchData(): Promise<void> {
   try {
@@ -148,6 +192,7 @@ async function fetchData(): Promise<void> {
   } finally {
     loading.value = false;
   }
+  void fetchStorageStats();
 }
 
 // Refresh block devices by calling the reload endpoint
@@ -539,14 +584,17 @@ async function deleteVolume(): Promise<void> {
 onMounted(() => {
   fetchData();
   fetchVerifyStatus();
+  fetchStorageStats();
   // Keep the verify panel live without a manual refresh
   verifyPollTimer = setInterval(fetchVerifyStatus, 3000);
+  storageStatsPollTimer = setInterval(fetchStorageStats, 10000);
   // Close context menu on click anywhere
   document.addEventListener('click', hideContextMenu);
 });
 
 onUnmounted(() => {
   if (verifyPollTimer !== null) clearInterval(verifyPollTimer);
+  if (storageStatsPollTimer !== null) clearInterval(storageStatsPollTimer);
   document.removeEventListener('click', hideContextMenu);
 });
 </script>
@@ -637,6 +685,65 @@ onUnmounted(() => {
         >
           vol {{ entry.volumeId }}: {{ entry.count.toLocaleString() }}
         </span>
+      </div>
+    </section>
+
+    <section v-if="storageStats" class="section storage-panel">
+      <div class="section-header">
+        <h2>Storage</h2>
+        <span class="storage-updated">Updated {{ formatDateTime(String(storageStats.updatedAt)) }}</span>
+      </div>
+      <div class="storage-stats">
+        <div class="storage-stat">
+          <span class="storage-stat-label">Files</span>
+          <span class="storage-stat-value">{{ storageStats.system.objectCount.toLocaleString() }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Logical Data</span>
+          <span class="storage-stat-value">{{ formatBytes(storageStats.system.logicalBytes) }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Data Slices</span>
+          <span class="storage-stat-value">{{ formatBytes(storageStats.system.dataBytes) }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Parity Slices</span>
+          <span class="storage-stat-value">{{ formatBytes(storageStats.system.parityBytes) }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Physical Total</span>
+          <span class="storage-stat-value">{{ formatBytes(storageStats.system.physicalBytes) }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Unavailable</span>
+          <span class="storage-stat-value" :class="{ 'error-text': storageStats.system.unavailableObjectCount > 0 }">
+            {{ storageStats.system.unavailableObjectCount.toLocaleString() }} / {{ formatBytes(storageStats.system.unavailableLogicalBytes) }}
+          </span>
+        </div>
+      </div>
+      <div v-if="storageVolumeRows.length > 0" class="storage-table-wrap">
+        <table class="storage-table">
+          <thead>
+            <tr>
+              <th>Volume</th>
+              <th>Files</th>
+              <th>Logical Data</th>
+              <th>Data Slices</th>
+              <th>Parity Slices</th>
+              <th>Physical Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="entry in storageVolumeRows" :key="entry.id">
+              <td>{{ entry.label }}</td>
+              <td>{{ entry.stats.objectCount.toLocaleString() }}</td>
+              <td>{{ formatBytes(entry.stats.logicalBytes) }}</td>
+              <td>{{ formatBytes(entry.stats.dataBytes) }}</td>
+              <td>{{ formatBytes(entry.stats.parityBytes) }}</td>
+              <td>{{ formatBytes(entry.stats.physicalBytes) }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
@@ -1270,6 +1377,84 @@ h2 {
   border-radius: 12px;
   font-size: 12px;
   font-weight: 600;
+}
+
+/* Storage Panel */
+.storage-panel {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 20px;
+  background-color: #fafafa;
+  box-sizing: border-box;
+}
+
+.storage-updated {
+  color: #777;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.storage-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.storage-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.storage-stat-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.storage-stat-value {
+  font-size: 16px;
+  color: #333;
+  font-weight: 600;
+}
+
+.storage-table-wrap {
+  overflow-x: auto;
+  margin-top: 18px;
+}
+
+.storage-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 720px;
+}
+
+.storage-table th,
+.storage-table td {
+  border-bottom: 1px solid #e8e8e8;
+  padding: 10px 8px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.storage-table th:first-child,
+.storage-table td:first-child {
+  text-align: left;
+}
+
+.storage-table th {
+  color: #666;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.storage-table td {
+  color: #333;
+  font-size: 14px;
 }
 
 /* Modal Styles */
