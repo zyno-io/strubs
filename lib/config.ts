@@ -12,12 +12,28 @@ const VALID_SEVERITIES: Severity[] = ['info', 'warning', 'critical'];
 const DEFAULT_SCRUB_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_SYSLOG_WATCH_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_REPAIR_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_REPAIR_BATCH_SIZE = 25;
+const DEFAULT_REPAIR_BACKLOG_DELAY_MS = 10 * 1000;
 const DEFAULT_VOLUME_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
 
 function parseSeverity(value: string | undefined, fallback: Severity): Severity {
     if (value && (VALID_SEVERITIES as string[]).includes(value))
         return value as Severity;
     return fallback;
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+    if (!value)
+        return fallback;
+    const parsed = parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeInt(value: string | undefined, fallback: number): number {
+    if (!value)
+        return fallback;
+    const parsed = parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 export class Config {
@@ -44,6 +60,8 @@ export class Config {
     // Closed-loop slice repair worker safety-net cadence. Set to 0 to disable
     // periodic polling; newly reported faults still wake a repair pass.
     repairIntervalMs: number;
+    repairBatchSize: number;
+    repairBacklogDelayMs: number;
 
     // Volume health monitor (auto read-only degradation) cadence + threshold.
     // Set the interval to 0 to disable it.
@@ -68,6 +86,8 @@ export class Config {
         this.repairIntervalMs = process.env.STRUBS_REPAIR_INTERVAL_MS
             ? parseInt(process.env.STRUBS_REPAIR_INTERVAL_MS, 10)
             : DEFAULT_REPAIR_INTERVAL_MS;
+        this.repairBatchSize = parsePositiveInt(process.env.STRUBS_REPAIR_BATCH_SIZE, DEFAULT_REPAIR_BATCH_SIZE);
+        this.repairBacklogDelayMs = parseNonNegativeInt(process.env.STRUBS_REPAIR_BACKLOG_DELAY_MS, DEFAULT_REPAIR_BACKLOG_DELAY_MS);
         this.volumeHealthIntervalMs = process.env.STRUBS_VOLUME_HEALTH_INTERVAL_MS
             ? parseInt(process.env.STRUBS_VOLUME_HEALTH_INTERVAL_MS, 10)
             : DEFAULT_VOLUME_HEALTH_INTERVAL_MS;

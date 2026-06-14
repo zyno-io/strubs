@@ -11,11 +11,18 @@ type LoadedObject = { id?: string | null; size: number };
 type VerifyFileJobModule = typeof import('../jobs/verify-file-job');
 type FileObjectModule = typeof import('../io/file-object');
 type SliceRepairerModule = typeof import('../io/file-object/slice-repairer');
+type RepairFaultResult = 'processed' | 'skipped' | 'cancelled';
+type RepairWorkerStartOptions = {
+    batchSize?: number;
+    backlogDelayMs?: number;
+};
 
 type RepairWorkerDeps = {
     database: Pick<typeof database, 'getObjectById'>;
     remediationService: Pick<RemediationService, 'listFaults' | 'clearFault' | 'onSliceFault' | 'markRepairAttempted' | 'markRepairBlocked' | 'markRepairFailed'>;
     notificationService: NotificationService;
+    batchSize: number;
+    backlogDelayMs: number;
     // Lazily imported so this module (and core) never pulls the native
     // reed-solomon binding unless a repair actually runs.
     verifyObject: (objectId: string) => Promise<VerifyResult>;
@@ -24,10 +31,15 @@ type RepairWorkerDeps = {
     createLogger: typeof createLogger;
 };
 
+const DEFAULT_BATCH_SIZE = 25;
+const DEFAULT_BACKLOG_DELAY_MS = 10 * 1000;
+
 const defaultDeps: RepairWorkerDeps = {
     database,
     remediationService,
     notificationService,
+    batchSize: DEFAULT_BATCH_SIZE,
+    backlogDelayMs: DEFAULT_BACKLOG_DELAY_MS,
     verifyObject: async (objectId: string) => {
         const { verifyFileJob } = require('../jobs/verify-file-job') as VerifyFileJobModule;
         return verifyFileJob.verify(objectId) as Promise<VerifyResult>;
@@ -54,21 +66,30 @@ export class RepairWorker {
     private readonly log: ReturnType<typeof createLogger>;
     private readonly leases = new Set<string>();
     private timer: NodeJS.Timeout | null = null;
+    private backlogTimer: NodeJS.Timeout | null = null;
     private wakeHandle: NodeJS.Immediate | null = null;
     private unsubscribeFaults: (() => void) | null = null;
     private running = false;
     private started = false;
+    private stopping = false;
     private rerunRequested = false;
+    private batchSize: number;
+    private backlogDelayMs: number;
 
     constructor(deps?: Partial<RepairWorkerDeps>) {
         this.deps = { ...defaultDeps, ...deps };
         this.log = this.deps.createLogger('repair-worker');
+        this.batchSize = this.normalizeBatchSize(this.deps.batchSize);
+        this.backlogDelayMs = this.normalizeBacklogDelayMs(this.deps.backlogDelayMs);
     }
 
-    start(intervalMs: number): void {
+    start(intervalMs: number, options?: RepairWorkerStartOptions): void {
         if (this.started)
             return;
         this.started = true;
+        this.stopping = false;
+        this.batchSize = this.normalizeBatchSize(options?.batchSize ?? this.deps.batchSize);
+        this.backlogDelayMs = this.normalizeBacklogDelayMs(options?.backlogDelayMs ?? this.deps.backlogDelayMs);
 
         this.unsubscribeFaults = this.deps.remediationService.onSliceFault(fault => {
             this.scheduleProcess(`fault ${fault.key}`);
@@ -79,18 +100,24 @@ export class RepairWorker {
         }
         else {
             this.log('repair worker polling every %dms', intervalMs);
-            this.timer = setInterval(() => void this.processFaults(), intervalMs);
+            this.timer = setInterval(() => this.scheduleProcess('periodic poll'), intervalMs);
             this.timer.unref?.();
         }
+        this.log('repair worker processing up to %d fault(s) per pass with %dms backlog delay', this.batchSize, this.backlogDelayMs);
 
         if (this.deps.remediationService.listFaults().length > 0)
             this.scheduleProcess('startup faults');
     }
 
     stop(): void {
+        this.stopping = true;
         if (this.timer) {
             clearInterval(this.timer);
             this.timer = null;
+        }
+        if (this.backlogTimer) {
+            clearTimeout(this.backlogTimer);
+            this.backlogTimer = null;
         }
         if (this.wakeHandle) {
             clearImmediate(this.wakeHandle);
@@ -111,6 +138,8 @@ export class RepairWorker {
     }
 
     async processFaults(): Promise<void> {
+        if (this.stopping)
+            return;
         if (this.running) {
             this.rerunRequested = true;
             return;
@@ -119,8 +148,30 @@ export class RepairWorker {
         try {
             do {
                 this.rerunRequested = false;
-                for (const fault of this.deps.remediationService.listFaults())
-                    await this.repairFault(fault);
+                const faults = this.deps.remediationService.listFaults();
+                let visited = 0;
+                let hitBatchLimit = false;
+
+                for (const fault of faults) {
+                    if (this.stopping)
+                        return;
+
+                    const result = await this.repairFault(fault);
+                    visited++;
+
+                    if (result === 'cancelled' || this.stopping)
+                        return;
+
+                    if (visited >= this.batchSize && visited < faults.length) {
+                        hitBatchLimit = true;
+                        break;
+                    }
+                }
+
+                if (hitBatchLimit && !this.rerunRequested) {
+                    this.scheduleProcess('repair backlog', this.backlogDelayMs);
+                    return;
+                }
             } while (this.rerunRequested);
         }
         finally {
@@ -128,12 +179,33 @@ export class RepairWorker {
         }
     }
 
-    private scheduleProcess(reason: string): void {
-        if (!this.started)
+    private scheduleProcess(reason: string, delayMs = 0): void {
+        if (!this.started || this.stopping)
             return;
+
+        if (delayMs > 0) {
+            if (this.wakeHandle || this.backlogTimer)
+                return;
+
+            this.log('scheduling repair pass for %s in %dms', reason, delayMs);
+            this.backlogTimer = setTimeout(() => {
+                this.backlogTimer = null;
+                void this.processFaults().catch(err => {
+                    this.log.error('scheduled repair pass failed: %s', err instanceof Error ? err.message : String(err));
+                });
+            }, delayMs);
+            this.backlogTimer.unref?.();
+            return;
+        }
+
         if (this.running) {
             this.rerunRequested = true;
             return;
+        }
+
+        if (this.backlogTimer) {
+            clearTimeout(this.backlogTimer);
+            this.backlogTimer = null;
         }
         if (this.wakeHandle)
             return;
@@ -148,9 +220,11 @@ export class RepairWorker {
         this.wakeHandle.unref?.();
     }
 
-    async repairFault(fault: SliceFault): Promise<void> {
+    async repairFault(fault: SliceFault): Promise<RepairFaultResult> {
+        if (this.stopping)
+            return 'cancelled';
         if (this.leases.has(fault.key))
-            return;
+            return 'skipped';
         this.leases.add(fault.key);
         try {
             let record: unknown;
@@ -162,11 +236,14 @@ export class RepairWorker {
                 // transient DB error must not delete a durable fault.
                 if ((err as { code?: string } | undefined)?.code === 'ENOENT') {
                     await this.clear(fault, 'object no longer exists');
-                    return;
+                    return 'processed';
                 }
                 this.log.error('failed to load object %s for repair: %s', fault.objectId, err instanceof Error ? err.message : String(err));
-                return;
+                return 'processed';
             }
+
+            if (this.stopping)
+                return 'cancelled';
 
             await this.deps.remediationService.markRepairAttempted(fault.key);
 
@@ -175,7 +252,7 @@ export class RepairWorker {
             if (before[String(fault.sliceIndex)]?.ok) {
                 await this.clear(fault, 'verified clean (transient)');
                 await this.notify('info', `Transient fault on object ${fault.objectId} slice ${fault.sliceIndex} cleared`, fault);
-                return;
+                return 'processed';
             }
 
             // Permanent: rebuild the slice in place from parity.
@@ -192,11 +269,16 @@ export class RepairWorker {
                 await this.deps.remediationService.markRepairFailed(fault.key, 'repaired slice did not verify clean');
                 await this.notify('warning', `Repair of object ${fault.objectId} slice ${fault.sliceIndex} did not verify clean`, fault);
             }
+            return 'processed';
         }
         catch (err) {
             const code = (err as { code?: string } | undefined)?.code;
             const message = err instanceof Error ? err.message : String(err);
-            if (code === 'EQUORUM') {
+            if (code === 'IOABORT') {
+                this.log('repair pass cancelled while repairing %s slice %d: %s', fault.objectId, fault.sliceIndex, message);
+                return 'cancelled';
+            }
+            else if (code === 'EQUORUM') {
                 this.log.error('cannot repair %s slice %d: insufficient redundancy', fault.objectId, fault.sliceIndex);
                 await this.deps.remediationService.markRepairBlocked(
                     fault.key,
@@ -210,6 +292,7 @@ export class RepairWorker {
                 await this.deps.remediationService.markRepairFailed(fault.key, message);
                 await this.notify('warning', `Repair failed for object ${fault.objectId} slice ${fault.sliceIndex}: ${message}`, fault);
             }
+            return 'processed';
         }
         finally {
             this.leases.delete(fault.key);
@@ -237,6 +320,16 @@ export class RepairWorker {
         }).catch(err => {
             this.log.error('failed to send repair notification: %s', err instanceof Error ? err.message : String(err));
         });
+    }
+
+    private normalizeBatchSize(value: number): number {
+        const normalized = Math.floor(value);
+        return Number.isFinite(normalized) && normalized > 0 ? normalized : DEFAULT_BATCH_SIZE;
+    }
+
+    private normalizeBacklogDelayMs(value: number): number {
+        const normalized = Math.floor(value);
+        return Number.isFinite(normalized) && normalized >= 0 ? normalized : DEFAULT_BACKLOG_DELAY_MS;
     }
 }
 

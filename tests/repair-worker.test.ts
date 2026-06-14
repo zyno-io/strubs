@@ -130,6 +130,24 @@ describe('RepairWorker', () => {
         expect(deps.remediationService.markRepairBlocked).not.toHaveBeenCalled();
     });
 
+    it('treats shutdown I/O aborts as cancellation without failure notifications', async () => {
+        const ioAbort = Object.assign(new Error('I/O aborted due to shutdown'), { code: 'IOABORT' });
+        const { worker, deps } = makeWorker({
+            verifyObject: vi.fn().mockRejectedValue(ioAbort)
+        });
+        deps.remediationService.listFaults.mockReturnValue([
+            fault(),
+            fault({ key: '1:obj2:1', objectId: 'obj2', sliceIndex: 1 })
+        ]);
+
+        await worker.processFaults();
+
+        expect(deps.database.getObjectById).toHaveBeenCalledTimes(1);
+        expect(deps.remediationService.markRepairFailed).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairBlocked).not.toHaveBeenCalled();
+        expect(deps.notificationService.notify).not.toHaveBeenCalled();
+    });
+
     it('clears the fault when the object no longer exists', async () => {
         const { worker, deps } = makeWorker({
             database: { getObjectById: vi.fn().mockRejectedValue(Object.assign(new Error('object not found'), { code: 'ENOENT' })) }
@@ -150,6 +168,24 @@ describe('RepairWorker', () => {
         expect(deps.remediationService.clearFault).not.toHaveBeenCalled();
     });
 
+    it('stops the active repair pass before starting another fault', async () => {
+        const { worker, deps } = makeWorker();
+        deps.remediationService.listFaults.mockReturnValue([
+            fault(),
+            fault({ key: '1:obj2:1', objectId: 'obj2', sliceIndex: 1 })
+        ]);
+        const repairFault = vi.spyOn(worker, 'repairFault')
+            .mockImplementationOnce(async () => {
+                worker.stop();
+                return 'processed' as never;
+            })
+            .mockResolvedValue('processed' as never);
+
+        await worker.processFaults();
+
+        expect(repairFault).toHaveBeenCalledTimes(1);
+    });
+
     it('wakes a repair pass when a fault is reported even with periodic polling disabled', async () => {
         const { worker, deps, faultListeners } = makeWorker();
         const processFaults = vi.spyOn(worker, 'processFaults').mockResolvedValue(undefined);
@@ -162,6 +198,32 @@ describe('RepairWorker', () => {
         await flushImmediate();
 
         expect(processFaults).toHaveBeenCalledTimes(1);
+        worker.stop();
+    });
+
+    it('processes a bounded backlog batch and delays remaining faults', async () => {
+        const initialFaults = [
+            fault(),
+            fault({ key: '1:obj2:1', objectId: 'obj2', sliceIndex: 1 }),
+            fault({ key: '1:obj3:2', objectId: 'obj3', sliceIndex: 2 })
+        ];
+        let faults = initialFaults.slice();
+        const { worker, deps } = makeWorker({ batchSize: 2, backlogDelayMs: 5 });
+        deps.remediationService.listFaults.mockImplementation(() => faults.slice());
+        const repairFault = vi.spyOn(worker, 'repairFault').mockImplementation(async current => {
+            faults = faults.filter(existing => existing.key !== current.key);
+            return 'processed' as never;
+        });
+
+        worker.start(0);
+        await flushImmediate();
+
+        expect(repairFault).toHaveBeenCalledTimes(2);
+
+        await new Promise(resolve => setTimeout(resolve, 20));
+        await Promise.resolve();
+
+        expect(repairFault).toHaveBeenCalledTimes(3);
         worker.stop();
     });
 

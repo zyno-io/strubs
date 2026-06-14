@@ -67,7 +67,10 @@ export class Core {
             await serverManager.start();
             verifyScheduler.start(config.scrubIntervalMs);
             systemLogWatcher.start(config.systemLogWatchIntervalMs);
-            repairWorker.start(config.repairIntervalMs);
+            repairWorker.start(config.repairIntervalMs, {
+                batchSize: config.repairBatchSize,
+                backlogDelayMs: config.repairBacklogDelayMs
+            });
             volumeHealthMonitor.start(config.volumeHealthIntervalMs, config.volumeFaultThreshold);
 
             this.started = true;
