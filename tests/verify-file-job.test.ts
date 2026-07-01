@@ -119,7 +119,7 @@ describe('VerifyFileJob', () => {
         expect(databaseMock.updateObjectVerificationState).toHaveBeenCalledWith(record.id, expect.objectContaining({
             lastVerifiedAt: expect.any(Date),
             sliceErrors: {
-                '1': { checksum: true, type: 'data' }
+                '1': { code: 'ECHECKSUM', category: 'checksum', checksum: true, type: 'data' }
             },
             sliceVerificationTimes: {
                 data: [expect.any(Date), expect.any(Date)],
@@ -127,6 +127,32 @@ describe('VerifyFileJob', () => {
             }
         }));
         expect(createSliceVerifierMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('threads the requested mode to the slice verifier (light)', async () => {
+        const record = createRecord();
+        databaseMock.getObjectById.mockResolvedValue(record);
+        const loadedObject = {} as FileObject;
+        fileObjectServiceMock.load.mockResolvedValue(loadedObject);
+        verifySliceMock.mockResolvedValue(undefined);
+
+        await job.verify(record.id, { mode: 'light' });
+
+        expect(createSliceVerifierMock).toHaveBeenCalledTimes(3);
+        for (const call of createSliceVerifierMock.mock.calls)
+            expect(call).toEqual([loadedObject, 'light']);
+    });
+
+    it('defaults to full mode when none is given', async () => {
+        const record = createRecord();
+        databaseMock.getObjectById.mockResolvedValue(record);
+        fileObjectServiceMock.load.mockResolvedValue({} as FileObject);
+        verifySliceMock.mockResolvedValue(undefined);
+
+        await job.verify(record.id);
+
+        for (const call of createSliceVerifierMock.mock.calls)
+            expect(call[1]).toBe('full');
     });
 
     it('throws when the object is not a file', async () => {

@@ -29,6 +29,7 @@ export interface VolumeConfig {
     parity_size?: number;
     verifyErrors?: VolumeVerifyErrors | null;
     label?: string | null;
+    comment?: string | null;
     is_deleted?: boolean;
 }
 
@@ -61,6 +62,7 @@ export class Volume extends EventEmitter {
     public deviceGroup: number | null = null;
     public verifyErrors: VolumeVerifyErrors | null;
     public label: string | null = null;
+    public comment: string | null = null;
     public mountError: string | null = null;
     private readonly log: ReturnType<typeof createLogger>;
 
@@ -83,6 +85,7 @@ export class Volume extends EventEmitter {
         this.bytesUsedParity = inConfig.parity_size || 0; // TODO: add
         this.verifyErrors = inConfig.verifyErrors ?? null;
         this.label = typeof inConfig.label === 'string' ? inConfig.label : (inConfig.label ?? null);
+        this.comment = typeof inConfig.comment === 'string' ? inConfig.comment : (inConfig.comment ?? null);
 
         this.log = createLogger('volume' + this.id);
 
@@ -120,6 +123,10 @@ export class Volume extends EventEmitter {
 
     setLabel(value: string | null): void {
         this.label = value;
+    }
+
+    setComment(value: string | null): void {
+        this.comment = value;
     }
 
     async start(): Promise<void> {
@@ -432,19 +439,26 @@ export class Volume extends EventEmitter {
     }
 
     async openCommittedFh(fileName: string): Promise<FileHandle> {
-        try {
-            if (!this.isReadable)
-                throw new Error('volume is not readable');
-            if (!this.mountPoint)
-                throw new Error('mount point is not configured');
+        // The volume being offline/unmounted is a volume-level condition, not a
+        // property of this slice: tag it EUNAVAIL so it is never confused with a
+        // genuinely missing or corrupt slice on a healthy disk.
+        if (!this.isReadable || !this.mountPoint) {
+            const err = new Error(this.mountPoint ? 'volume is not readable' : 'mount point is not configured') as Error & { code?: string };
+            err.code = 'EUNAVAIL';
+            throw err;
+        }
 
-            const path = this.resolveSliceDirectory(fileName) + '/' + fileName;
-            const fileHandle = await fsp.open(path, 'r');
-            return fileHandle;
+        const path = this.resolveSliceDirectory(fileName) + '/' + fileName;
+        try {
+            return await fsp.open(path, 'r');
         } catch (err) {
-            const throwErr = new Error('failed to open slice') as Error & { cause?: unknown; path?: string };
+            // Preserve the filesystem errno (ENOENT => the slice file genuinely
+            // does not exist on a mounted volume; EIO/EACCES => disk trouble) so
+            // downstream categorization can distinguish "missing" from "unreadable".
+            const throwErr = new Error('failed to open slice') as Error & { cause?: unknown; path?: string; code?: string };
             throwErr.cause = err;
-            throwErr.path = this.resolveSliceDirectory(fileName) + '/' + fileName;
+            throwErr.path = path;
+            throwErr.code = (err as NodeJS.ErrnoException)?.code;
             throw throwErr;
         }
     }

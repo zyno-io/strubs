@@ -10,8 +10,10 @@ import { Base } from './base';
 // for just that chunk set ("reconstruct that part") and the slice is retried.
 const ESCALATE_THRESHOLD = 2;
 // Codes that mean the slice is unusable for the rest of this read — escalate
-// immediately rather than re-probing a dead handle every chunk set.
-const HARD_FAULT_CODES = new Set(['EOPEN', 'ETIMEOUT']);
+// immediately rather than re-probing a dead handle every chunk set. EHEADER
+// (mis-attributed header), EUNAVAIL (volume offline) and ENOENT (slice file
+// gone) can never succeed on retry, so they are hard faults too.
+const HARD_FAULT_CODES = new Set(['EOPEN', 'ETIMEOUT', 'EHEADER', 'EUNAVAIL', 'ENOENT']);
 
 export class FileObjectReader extends Base {
     private logger: ReturnType<typeof createLogger>;

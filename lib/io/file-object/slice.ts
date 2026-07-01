@@ -202,15 +202,23 @@ export class Slice {
                     30000,
                     'read slice header'
                 );
-                if (headerRead.bytesRead !== constants.FILE_HEADER_SIZE)
-                    throw new Error(`short read on slice header: ${headerRead.bytesRead}/${constants.FILE_HEADER_SIZE}`);
+                if (headerRead.bytesRead !== constants.FILE_HEADER_SIZE) {
+                    const shortErr = new Error(`short read on slice header: ${headerRead.bytesRead}/${constants.FILE_HEADER_SIZE}`) as Error & { code?: string };
+                    shortErr.code = 'EIO';
+                    throw shortErr;
+                }
                 this._validateHeader(this._readBuf as Buffer);
             } catch (err) {
                 // Release priority hold on error to prevent deadlock
                 this._releasePriorityHold();
                 await this._cleanupInputHandle();
 
-                const throwErr = new Error('failed to read slice header') as Error & { cause?: unknown };
+                // Preserve the underlying reason in the message (so EHEADER vs a
+                // genuine I/O fault is legible without opening the file) and keep
+                // the source code: EHEADER (bad/foreign header), EIO (short/native
+                // read), or EOPEN only when the cause carried no code of its own.
+                const causeMessage = err instanceof Error ? err.message : String(err);
+                const throwErr = new Error(`failed to read slice header: ${causeMessage}`) as Error & { cause?: unknown };
                 throwErr.cause = err;
                 const code = (err as { code?: string } | undefined)?.code ?? 'EOPEN';
                 throw this._decorateError(throwErr, code);
@@ -526,17 +534,26 @@ export class Slice {
     // misplaced slice file can never be accepted as a (silently wrong) source
     // for reconstruction. Field offsets mirror create().
     private _validateHeader(buf: Buffer): void {
+        // A header that opens fine but describes a different object/slice means the
+        // on-disk bytes are intact yet mis-attributed (wrong object id, stale slice
+        // placement, etc.). Tag these EHEADER so remediation can tell a recoverable
+        // mis-stamp from a genuine read fault — they categorize very differently.
+        const fail = (message: string): never => {
+            const err = new Error(message) as Error & { code?: string };
+            err.code = 'EHEADER';
+            throw err;
+        };
         const idBuf = this.fileObject.idBuf;
         if (!idBuf || !buf.subarray(23, 35).equals(idBuf))
-            throw new Error('slice header object id mismatch');
+            fail('slice header object id mismatch');
         if (buf.readUInt8(40) !== this.fileObject.dataSliceCount)
-            throw new Error('slice header data slice count mismatch');
+            fail('slice header data slice count mismatch');
         if (buf.readUInt8(41) !== this.fileObject.paritySliceCount)
-            throw new Error('slice header parity slice count mismatch');
+            fail('slice header parity slice count mismatch');
         if (buf.readUInt8(42) !== this.sliceIndex)
-            throw new Error('slice header slice index mismatch');
+            fail('slice header slice index mismatch');
         if (buf.readIntLE(43, 3) !== this.fileObject.chunkSize)
-            throw new Error('slice header chunk size mismatch');
+            fail('slice header chunk size mismatch');
     }
 
     private throwChecksumError(): never {

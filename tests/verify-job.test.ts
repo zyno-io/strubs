@@ -259,7 +259,7 @@ describe('VerifyVolumesJob', () => {
         expect(sliceVerifier.verifySlice).toHaveBeenCalledTimes(1);
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
             lastVerifiedAt: new Date(startedAt),
-            sliceErrors: { '0': { checksum: true, type: 'data' } },
+            sliceErrors: { '0': { code: 'ECHECKSUM', category: 'checksum', checksum: true, type: 'data' } },
             sliceVerificationTimes: times(startedAt, [true])
         });
         expect(deps.database.setVolumeVerifyErrors).toHaveBeenCalledTimes(3);
@@ -364,8 +364,8 @@ describe('VerifyVolumesJob', () => {
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
             lastVerifiedAt: new Date(startedAt),
             sliceErrors: {
-                '0': { err: 'data failed', type: 'data' },
-                '1': { err: 'parity failed', type: 'parity' }
+                '0': { category: 'unknown', err: 'data failed', type: 'data' },
+                '1': { category: 'unknown', err: 'parity failed', type: 'parity' }
             },
             sliceVerificationTimes: times(startedAt, [true], [true])
         });
@@ -485,7 +485,7 @@ describe('VerifyVolumesJob', () => {
 
         expect(deps.database.updateObjectVerificationState).toHaveBeenCalledWith(record.id, {
             lastVerifiedAt: new Date(startedAt),
-            sliceErrors: { '0': { checksum: true, type: 'data' } },
+            sliceErrors: { '0': { code: 'ECHECKSUM', category: 'checksum', checksum: true, type: 'data' } },
             sliceVerificationTimes: times(startedAt, [true])
         });
         expect(deps.runtimeConfig.set).toHaveBeenCalledWith('verifyStartedAt', startedAt);
@@ -636,6 +636,67 @@ describe('VerifyVolumesJob', () => {
             sliceErrors: { '0': existingError },
             sliceVerificationTimes: times(startedAt, [false, true], [false])
         });
+    });
+
+    it('reports full mode by default', () => {
+        const job = new VerifyVolumesJob(createDeps());
+        expect(job.getStatus().mode).toBe('full');
+    });
+
+    it('threads light mode to the slice verifier and persists/reports it', async () => {
+        const deps = createDeps();
+        const record = {
+            id: 'light-obj',
+            size: 1,
+            dataVolumes: [1],
+            parityVolumes: [],
+            chunkSize: 1,
+            dataSliceVolumeIds: [1],
+            paritySliceVolumeIds: [],
+            unavailableSlices: [],
+            damagedSlices: [],
+            isFile: true,
+            name: 'file',
+            md5: null
+        };
+
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+        deps.database.findObjectsNeedingVerification
+            .mockResolvedValueOnce([record])
+            .mockResolvedValueOnce([]);
+        deps.fileObjectService.load.mockResolvedValue({} as any);
+        const sliceVerifier = { verifySlice: vi.fn().mockResolvedValue(undefined) };
+        deps.createSliceVerifier.mockReturnValue(sliceVerifier);
+
+        const job = new VerifyVolumesJob(deps);
+        await job.start({ mode: 'light' });
+        expect(job.getStatus().mode).toBe('light');
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        const loadedObject = await deps.fileObjectService.load.mock.results[0]?.value;
+        expect(deps.createSliceVerifier).toHaveBeenCalledWith(loadedObject, 'light');
+        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('verifyMode', 'light');
+    });
+
+    it('restores the persisted mode when resuming a pending job', async () => {
+        const deps = createDeps();
+        const startedAt = '2024-02-01T00:00:00.000Z';
+        deps.runtimeConfig.get
+            .mockResolvedValueOnce(startedAt)
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce('light');
+        deps.database.countObjectsVerifiedSince.mockResolvedValueOnce(0);
+        deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
+
+        const job = new VerifyVolumesJob(deps);
+        await job.start();
+        expect(job.getStatus().mode).toBe('light');
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
     });
 
     it('reports current concurrency via status', async () => {

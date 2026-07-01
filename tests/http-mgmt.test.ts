@@ -234,6 +234,7 @@ describe('HttpMgmt.handle', () => {
                 partitionUuid: 'part-1',
                 busGroup: null,
                 label: 'Primary',
+                comment: null,
                 bytesTotal: 1024,
                 bytesFree: 512,
                 verifyErrors: null,
@@ -988,7 +989,7 @@ describe('HttpMgmt.handle', () => {
         verifyVolumesJobMock.start.mockResolvedValue({ startedAt: '2024-01-02T00:00:00.000Z' });
         const response = await HttpMgmt.handle(17, createRequest('POST', '/$/verify-volumes', { volumeIds: [3, 3, 4] }), nullResponse);
         expect(response).toEqual({ startedAt: '2024-01-02T00:00:00.000Z' });
-        expect(verifyVolumesJobMock.start).toHaveBeenCalledWith({ volumeIds: [3, 4] });
+        expect(verifyVolumesJobMock.start).toHaveBeenCalledWith({ volumeIds: [3, 4], mode: 'full' });
     });
 
     it('rejects invalid volume filter payloads', async () => {
@@ -1017,7 +1018,7 @@ describe('HttpMgmt.handle', () => {
         verifyFileJobMock.verify.mockResolvedValue(result);
         const response = await HttpMgmt.handle(19, createRequest('POST', `/$/verify-file/${id}`), nullResponse);
         expect(response).toEqual(result);
-        expect(verifyFileJobMock.verify).toHaveBeenCalledWith(id);
+        expect(verifyFileJobMock.verify).toHaveBeenCalledWith(id, { mode: 'full' });
     });
 
     it('rejects invalid verify file ids', async () => {

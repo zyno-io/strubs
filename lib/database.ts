@@ -11,7 +11,7 @@ import { FaultRepository, type FaultDocument, type FaultUpsert } from './databas
 import { StorageStatsRepository } from './database/storage-stats-repository';
 import type { ContainerPath, ContentDocument, ObjectIdentifier, ObjectVerificationStateUpdate, SliceErrorInfo } from './database/types';
 import type { StorageStatsDelta, StorageStatsSnapshot } from './storage/stats';
-export type { ContentDocument, ObjectVerificationStateUpdate, SliceErrorInfo, SliceVerificationTimes } from './database/types';
+export type { ContentDocument, ObjectVerificationStateUpdate, SliceErrorInfo, SliceErrorCategory, SliceVerificationTimes } from './database/types';
 export type { FaultDocument, FaultUpsert } from './database/fault-repository';
 export type { StorageStatsDelta, StorageStatsSnapshot } from './storage/stats';
 
@@ -99,7 +99,7 @@ export class Database {
         await this.volumeRepository.softDeleteVolume(id);
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null }): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
         await this.volumeRepository.updateVolumeFlags(id, changes);
     }
 

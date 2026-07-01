@@ -27,7 +27,7 @@ export class VolumeRepository {
         );
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null }): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
         const set: Record<string, unknown> = {};
         const unset: Record<string, unknown> = {};
         if (changes.isEnabled !== undefined)
@@ -43,6 +43,12 @@ export class VolumeRepository {
                 unset.label = '';
             else
                 set.label = changes.label;
+        }
+        if (changes.comment !== undefined) {
+            if (changes.comment === null)
+                unset.comment = '';
+            else
+                set.comment = changes.comment;
         }
         const update: Record<string, Record<string, unknown>> = {};
         if (Object.keys(set).length)

@@ -8,6 +8,10 @@ import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
 import { verifyFileJob } from '../../jobs/verify-file-job';
+import { verifyScheduler } from '../../jobs/verify-scheduler';
+import { repairWorker } from '../../remediation/repair-worker';
+import { config } from '../../config';
+import { isMaintenanceFrozen, setMaintenanceFrozen } from '../../maintenance';
 import { database } from '../../database';
 import type { HttpRequest, HttpResponse, HttpContentPayload } from './server';
 import type { Volume } from '../../io/volume';
@@ -37,6 +41,7 @@ export type VolumeStatus = {
     partitionUuid: string | null;
     busGroup: number | null;
     label: string | null;
+    comment: string | null;
     bytesTotal: number;
     bytesFree: number | null;
     verifyErrors: Volume['verifyErrors'];
@@ -74,6 +79,10 @@ export type BlockDevice = {
     busGroup: number | null;
     volumeId?: number;
     volumeLabel?: string | null;
+    // Derived "group.bay" label (e.g. "3.2") for UNASSIGNED enclosure drives,
+    // inferred from the labeled bridge sibling sharing the same USB port.
+    // Null when not derivable (no labeled sibling, non-enclosure disk, etc.).
+    derivedGroupLabel?: string | null;
     children: BlockDevicePartition[];
 };
 
@@ -168,6 +177,7 @@ export class HttpMgmt {
             volumes.set(id, volume);
         }
         const enriched = devices.map(device => this.serializeCachedDevice(device, volumes));
+        this.applyDerivedGroupLabels(enriched);
         enriched.sort((a, b) => {
             if (sortParam === 'sysfsPath')
                 return String(a.sysfsPath ?? '').localeCompare(String(b.sysfsPath ?? ''));
@@ -220,6 +230,72 @@ export class HttpMgmt {
         return serialized;
     }
 
+    // For UNASSIGNED enclosure drives, derive a "group.bay" label from the
+    // labeled bridge sibling. The two drives behind one dual-drive USB bridge
+    // share the same USB port (sysfs interface) and differ only by SCSI LUN
+    // (0 and 1); their human bay numbers are consecutive. So an unassigned
+    // drive's bay = sibling's bay + (ownLun - siblingLun). The enclosure group
+    // number comes from the sibling's label. Left null when not derivable.
+    private static applyDerivedGroupLabels(devices: BlockDevice[]): void {
+        type Topo = { device: BlockDevice; bridgeKey: string; lun: number };
+        const bridges = new Map<string, Topo[]>();
+        const topos: Topo[] = [];
+        for (const device of devices) {
+            const topo = this.parseBridgeTopology(device.sysfsPath);
+            if (!topo)
+                continue;
+            const entry: Topo = { device, bridgeKey: topo.bridgeKey, lun: topo.lun };
+            topos.push(entry);
+            const list = bridges.get(topo.bridgeKey);
+            if (list)
+                list.push(entry);
+            else
+                bridges.set(topo.bridgeKey, [entry]);
+        }
+
+        for (const entry of topos) {
+            // Assigned devices already carry their real volume label.
+            if (entry.device.volumeLabel)
+                continue;
+            const siblings = bridges.get(entry.bridgeKey);
+            if (!siblings)
+                continue;
+            for (const sibling of siblings) {
+                if (sibling === entry || sibling.lun === entry.lun)
+                    continue;
+                const parsed = this.parseGroupBayLabel(sibling.device.volumeLabel);
+                if (!parsed)
+                    continue;
+                const derivedBay = parsed.bay + (entry.lun - sibling.lun);
+                if (derivedBay < 1)
+                    continue;
+                entry.device.derivedGroupLabel = `${parsed.group}.${derivedBay}`;
+                break;
+            }
+        }
+    }
+
+    // Extract the USB bridge interface (shared by both LUNs of a dual-drive
+    // bridge) and the SCSI LUN from a resolved sysfs path, e.g.
+    // /sys/.../2-3.4.2.1/2-3.4.2.1:1.0/host21/target21:0:0/21:0:0:1/block/sdv
+    private static parseBridgeTopology(sysfsPath: string | null | undefined): { bridgeKey: string; lun: number } | null {
+        if (!sysfsPath)
+            return null;
+        const match = /\/(\d+-[\d.]+:\d+\.\d+)\/host\d+\/target\d+:\d+:\d+\/\d+:\d+:\d+:(\d+)\//.exec(sysfsPath);
+        if (!match)
+            return null;
+        return { bridgeKey: match[1], lun: Number(match[2]) };
+    }
+
+    private static parseGroupBayLabel(label: string | null | undefined): { group: number; bay: number } | null {
+        if (!label)
+            return null;
+        const match = /^(\d+)\.(\d+)$/.exec(label);
+        if (!match)
+            return null;
+        return { group: Number(match[1]), bay: Number(match[2]) };
+    }
+
     private static async handleNotifyTestRequest(req: HttpRequest): Promise<{ delivered: string[]; failed: { transport: string; error: string }[]; suppressed: boolean; transports: string[] }> {
         const payload = await this.parseJsonBody<{ severity?: unknown; title?: unknown; body?: unknown }>(req);
         // Default to 'warning' so an empty test request exercises Slack, whose
@@ -250,11 +326,18 @@ export class HttpMgmt {
     }
 
     private static async handleVerifyVolumesJobStartRequest(req: HttpRequest): Promise<{ startedAt: string }> {
-        const payload = await this.parseJsonBody<{ volumeIds?: unknown }>(req);
+        const payload = await this.parseJsonBody<{ volumeIds?: unknown; mode?: unknown }>(req);
         const volumeIds = this.normalizeVolumeIdFilter(payload.volumeIds);
-        if (volumeIds)
-            return verifyVolumesJob.start({ volumeIds });
-        return verifyVolumesJob.start();
+        const mode = this.normalizeVerifyMode(payload.mode);
+        return verifyVolumesJob.start({ volumeIds: volumeIds ?? undefined, mode });
+    }
+
+    private static normalizeVerifyMode(raw: unknown): 'light' | 'full' {
+        if (raw === undefined || raw === null)
+            return 'full';
+        if (raw === 'light' || raw === 'full')
+            return raw;
+        throw new HttpBadRequestError("mode must be 'light' or 'full'");
     }
 
     private static resolveSortParam(params: Record<string, unknown>): 'name' | 'sysfsPath' | 'size' | 'volumeId' | 'volumeLabel' {
@@ -280,10 +363,12 @@ export class HttpMgmt {
         return verifyVolumesJob.getStatus();
     }
 
-    private static async handleVerifyFileRequest(_req: HttpRequest, params: VerifyFileRouteParams): Promise<unknown> {
+    private static async handleVerifyFileRequest(req: HttpRequest, params: VerifyFileRouteParams): Promise<unknown> {
         const objectId = this.parseObjectId(params);
+        const payload = await this.parseJsonBody<{ mode?: unknown }>(req);
+        const mode = this.normalizeVerifyMode(payload.mode);
         try {
-            return await verifyFileJob.verify(objectId);
+            return await verifyFileJob.verify(objectId, { mode });
         }
         catch (err) {
             const code = (err as { code?: string })?.code;
@@ -291,8 +376,41 @@ export class HttpMgmt {
                 throw new HttpNotFoundError();
             if (code === 'ENOTFILE')
                 throw new HttpBadRequestError('object is not a file');
+            if (code === 'EMAINTENANCE')
+                throw new HttpBadRequestError('maintenance freeze active; verification disabled');
             throw err;
         }
+    }
+
+    private static async handleMaintenanceFreezeStatusRequest(): Promise<{ frozen: boolean }> {
+        return { frozen: await isMaintenanceFrozen() };
+    }
+
+    // Persist the freeze flag AND apply it to the live services so the change
+    // takes effect immediately (not just on the next restart). Freezing stops the
+    // scheduler/worker and asks any in-flight verify run to stop while preserving
+    // its persisted progress; unfreezing restarts them mirroring core.ts's boot
+    // config so behaviour matches a fresh, unfrozen start.
+    private static async handleMaintenanceFreezeSetRequest(req: HttpRequest): Promise<{ frozen: boolean }> {
+        const payload = await this.parseJsonBody<{ frozen?: unknown }>(req);
+        if (typeof payload.frozen !== 'boolean')
+            throw new HttpBadRequestError('frozen must be a boolean');
+        const frozen = payload.frozen;
+        await setMaintenanceFrozen(frozen);
+        if (frozen) {
+            verifyScheduler.stop();
+            repairWorker.stop();
+            await verifyVolumesJob.stop({ preserveState: true });
+        }
+        else {
+            verifyScheduler.start(config.scrubIntervalMs);
+            repairWorker.start(config.repairIntervalMs, {
+                batchSize: config.repairBatchSize,
+                backlogDelayMs: config.repairBacklogDelayMs,
+                blockedRetryMs: config.repairBlockedRetryMs
+            });
+        }
+        return { frozen };
     }
 
     private static async handleStatusRequest(): Promise<StatusResponse> {
@@ -411,10 +529,10 @@ export class HttpMgmt {
     }
 
     private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
-        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; label?: unknown }>(req);
+        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; label?: unknown; comment?: unknown }>(req);
         const id = this.parseVolumeId(params);
 
-        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null } = {};
+        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null; comment?: string | null } = {};
         let shouldSoftDelete = false;
 
         if (payload.isEnabled !== undefined) {
@@ -448,6 +566,12 @@ export class HttpMgmt {
             if (payload.label !== null && typeof payload.label !== 'string')
                 throw new HttpBadRequestError('label must be a string or null');
             updates.label = payload.label as string | null;
+        }
+
+        if (payload.comment !== undefined) {
+            if (payload.comment !== null && typeof payload.comment !== 'string')
+                throw new HttpBadRequestError('comment must be a string or null');
+            updates.comment = payload.comment as string | null;
         }
 
         if (!shouldSoftDelete && !Object.keys(updates).length)
@@ -493,6 +617,7 @@ export class HttpMgmt {
             partitionUuid: volume.partitionUuid,
             busGroup: volume.deviceGroup ?? null,
             label: volume.label ?? null,
+            comment: volume.comment ?? null,
             bytesTotal: volume.bytesTotal,
             bytesFree: volume.bytesFree,
             verifyErrors: volume.verifyErrors,
@@ -650,6 +775,16 @@ export class HttpMgmt {
                 method: 'DELETE',
                 match: url => url === '/$/verify-volumes' ? {} : null,
                 handler: async () => this.handleVerifyVolumesJobStopRequest()
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/maintenance-freeze' ? {} : null,
+                handler: async () => this.handleMaintenanceFreezeStatusRequest()
+            },
+            {
+                method: 'PUT',
+                match: url => url === '/$/maintenance-freeze' ? {} : null,
+                handler: async req => this.handleMaintenanceFreezeSetRequest(req)
             },
             {
                 method: 'POST',

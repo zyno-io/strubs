@@ -123,7 +123,7 @@ describe('Slice error enrichment', () => {
             () => { throw new Error('expected open to reject'); },
             (e: any) => e
         );
-        expect(err.code).toBe('EOPEN');
+        expect(err.code).toBe('EHEADER');
         expect(String(err.cause ?? err)).toContain('slice index mismatch');
     });
 

@@ -1,15 +1,17 @@
 import os from 'os';
 import PQueue from 'p-queue';
 import { database, type SliceErrorInfo } from '../database';
+import { categorizeSliceError } from '../slice-error';
 import { runtimeConfig } from '../runtime-config';
 import { fileObjectService, type FileObjectService } from '../io/file-object/service';
 import type { StoredObjectRecord, FileObject } from '../io/file-object';
 import { ioManager } from '../io/manager';
 import { createLogger } from '../log';
 import type { Volume } from '../io/volume';
-import { FileObjectSliceVerifier } from '../io/file-object/slice-verifier';
+import { FileObjectSliceVerifier, type VerifyMode } from '../io/file-object/slice-verifier';
 import { remediationService } from '../remediation/service';
 import { buildObjectVerificationStateUpdate } from '../verification-state';
+import { isMaintenanceFrozen } from '../maintenance';
 
 type VolumeErrorCounters = {
     checksum: number;
@@ -22,7 +24,7 @@ type VerifyVolumesJobDeps = {
     fileObjectService: FileObjectService;
     ioManager: typeof ioManager;
     createLogger: typeof createLogger;
-    createSliceVerifier: (object: FileObject) => { verifySlice: (sliceIndex: number) => Promise<void> };
+    createSliceVerifier: (object: FileObject, mode: VerifyMode) => { verifySlice: (sliceIndex: number) => Promise<void> };
     remediationService: typeof remediationService;
 };
 
@@ -38,6 +40,7 @@ export type VerifyVolumesStatus = {
     errors: VerifyVolumesErrorSnapshot;
     concurrency: number;
     scope: 'full' | 'targeted';
+    mode: VerifyMode;
     volumeIds: number[];
 };
 
@@ -55,13 +58,14 @@ const defaultDeps: VerifyVolumesJobDeps = {
     fileObjectService,
     ioManager,
     createLogger,
-    createSliceVerifier: (object: FileObject) => new FileObjectSliceVerifier(object),
+    createSliceVerifier: (object: FileObject, mode: VerifyMode) => new FileObjectSliceVerifier(object, { mode }),
     remediationService
 };
 
 const VERIFY_BATCH_SIZE = 25;
 const VERIFY_VOLUME_IDS_KEY = 'verifyVolumeIds';
 const VERIFY_CURSOR_ID_KEY = 'verifyCursorId';
+const VERIFY_MODE_KEY = 'verifyMode';
 // How long stop() waits for the run to drain in-flight work before giving up.
 // A read against a failing drive can wedge in the kernel (its libuv threadpool
 // thread never returns), so a cooperative cancel may never complete. After this
@@ -77,6 +81,7 @@ interface ActiveRun {
     cancelled: boolean;
     coordinator: VolumeReadCoordinator;
     cursorId: string | null;
+    mode: VerifyMode;
 }
 const envConcurrency = process.env.STRUBS_VERIFY_PARALLEL ? Number.parseInt(process.env.STRUBS_VERIFY_PARALLEL, 10) : NaN;
 const cpuCount = os.cpus?.().length ?? 1;
@@ -166,14 +171,20 @@ export class VerifyVolumesJob {
     };
     private progressLogger: NodeJS.Timeout | null = null;
     private currentConcurrency = 0;
+    private currentMode: VerifyMode = 'full';
 
     constructor(deps?: Partial<VerifyVolumesJobDeps>) {
         this.deps = { ...defaultDeps, ...deps };
         this.log = this.deps.createLogger('verify-job');
     }
 
-    async start(options?: { volumeIds?: number[] }): Promise<VerifyStartResult> {
+    async start(options?: { volumeIds?: number[]; mode?: VerifyMode }): Promise<VerifyStartResult> {
+        if (await isMaintenanceFrozen()) {
+            this.log('maintenance freeze active: not starting verify run');
+            return { startedAt: this.startedAt ?? '', accepted: false };
+        }
         const requestedFilter = this.normalizeVolumeIds(options?.volumeIds);
+        const requestedMode = this.normalizeMode(options?.mode);
         if (this.running)
             return { startedAt: this.startedAt as string, accepted: this.activeRunCoversRequest(requestedFilter) };
         // Synchronous guard: start() awaits runtime-config/persistence before
@@ -187,17 +198,19 @@ export class VerifyVolumesJob {
             if (typeof existing === 'string' && existing.length) {
                 const persistedFilter = await this.loadPersistedVolumeFilter();
                 const persistedCursorId = await this.loadPersistedCursorId();
+                const persistedMode = await this.loadPersistedMode();
                 const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
-                this.launch(existing, true, persistedFilter, restoredCount, persistedCursorId);
+                this.launch(existing, true, persistedFilter, restoredCount, persistedCursorId, persistedMode);
                 return { startedAt: existing, accepted: this.filterCoversRequest(persistedFilter, requestedFilter) };
             }
 
             await this.persistVolumeFilter(requestedFilter);
+            await this.persistMode(requestedMode);
             await this.deps.runtimeConfig.delete(VERIFY_CURSOR_ID_KEY);
 
             const startedAt = new Date().toISOString();
             await this.deps.runtimeConfig.set('verifyStartedAt', startedAt);
-            this.launch(startedAt, false, requestedFilter, 0, null);
+            this.launch(startedAt, false, requestedFilter, 0, null, requestedMode);
             return { startedAt, accepted: true };
         }
         finally {
@@ -208,6 +221,10 @@ export class VerifyVolumesJob {
     async resumePendingJob(): Promise<void> {
         if (this.running || this.startGuard)
             return;
+        if (await isMaintenanceFrozen()) {
+            this.log('maintenance freeze active: not resuming pending verify run');
+            return;
+        }
         this.startGuard = true;
         try {
             const existing = await this.deps.runtimeConfig.get('verifyStartedAt');
@@ -216,8 +233,9 @@ export class VerifyVolumesJob {
             this.log('resuming verify job started at %s', existing);
             const persistedFilter = await this.loadPersistedVolumeFilter();
             const persistedCursorId = await this.loadPersistedCursorId();
+            const persistedMode = await this.loadPersistedMode();
             const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
-            this.launch(existing, true, persistedFilter, restoredCount, persistedCursorId);
+            this.launch(existing, true, persistedFilter, restoredCount, persistedCursorId, persistedMode);
         }
         finally {
             this.startGuard = false;
@@ -250,6 +268,7 @@ export class VerifyVolumesJob {
             this.running = null;
             this.startedAt = null;
             this.currentConcurrency = 0;
+            this.currentMode = 'full';
             this.volumeFilter = null;
         }
 
@@ -257,6 +276,7 @@ export class VerifyVolumesJob {
             await this.deps.runtimeConfig.delete('verifyStartedAt');
             await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
             await this.deps.runtimeConfig.delete(VERIFY_CURSOR_ID_KEY);
+            await this.deps.runtimeConfig.delete(VERIFY_MODE_KEY);
         }
     }
 
@@ -296,15 +316,17 @@ export class VerifyVolumesJob {
             errors: this.progress.errors,
             concurrency: this.currentConcurrency,
             scope: volumeIds.length ? 'targeted' : 'full',
+            mode: this.currentMode,
             volumeIds
         };
     }
 
-    private launch(startedAt: string, isResume: boolean, volumeIds: number[] | null, initialObjectsVerified: number, cursorId: string | null): void {
+    private launch(startedAt: string, isResume: boolean, volumeIds: number[] | null, initialObjectsVerified: number, cursorId: string | null, mode: VerifyMode): void {
         if (this.running)
             return;
 
         this.startedAt = startedAt;
+        this.currentMode = mode;
         this.applyVolumeFilter(volumeIds);
         const concurrency = this.resolveConcurrency();
         this.currentConcurrency = concurrency;
@@ -312,7 +334,7 @@ export class VerifyVolumesJob {
             this.log('starting verification (resume) at %s', startedAt);
         else
             this.log('starting verification at %s', startedAt);
-        const run: ActiveRun = { token: ++this.runToken, cancelled: false, coordinator: new VolumeReadCoordinator(), cursorId };
+        const run: ActiveRun = { token: ++this.runToken, cancelled: false, coordinator: new VolumeReadCoordinator(), cursorId, mode };
         this.activeRun = run;
         this.progress.objectsVerified = initialObjectsVerified;
         this.progress.errors = { total: 0, volumes: {} };
@@ -331,6 +353,7 @@ export class VerifyVolumesJob {
                 this.running = null;
                 this.activeRun = null;
                 this.currentConcurrency = 0;
+                this.currentMode = 'full';
                 this.volumeFilter = null;
             });
     }
@@ -371,6 +394,14 @@ export class VerifyVolumesJob {
 
         try {
             while (!run.cancelled) {
+                // Per-batch freeze checkpoint: if maintenance freeze is turned on
+                // mid-run, stop gracefully WITHOUT finalizing (completed stays
+                // false), leaving persisted progress intact so the run can resume
+                // once the freeze is lifted.
+                if (await isMaintenanceFrozen()) {
+                    this.log('maintenance freeze activated mid-run: stopping verify run');
+                    break;
+                }
                 const batch = await this.fetchBatch(run, startedAtDate);
                 if (!batch.length) {
                     completed = true;
@@ -426,6 +457,7 @@ export class VerifyVolumesJob {
                 await this.deps.runtimeConfig.delete('verifyStartedAt');
                 await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
                 await this.deps.runtimeConfig.delete(VERIFY_CURSOR_ID_KEY);
+                await this.deps.runtimeConfig.delete(VERIFY_MODE_KEY);
             }
             if (shouldFinalize && !this.isTargetedRun) {
                 const finishedAt = new Date().toISOString();
@@ -492,7 +524,7 @@ export class VerifyVolumesJob {
 
             const requestId = typeof lane === 'number' ? `verify:${lane}` : 'verify';
             const object = await this.deps.fileObjectService.load(record, { requestId, priority: 'low' });
-            const verifier = this.deps.createSliceVerifier(object);
+            const verifier = this.deps.createSliceVerifier(object, run.mode);
 
             const totalSlices = record.dataVolumes.length + record.parityVolumes.length;
             const sliceErrors: Record<string, SliceErrorInfo> = {};
@@ -652,9 +684,15 @@ export class VerifyVolumesJob {
         const sliceIndex = typeof errorObj.sliceIndex === 'number' ? errorObj.sliceIndex : null;
         const descriptor = this.describeSlice(record, sliceIndex);
         const isChecksum = errorObj.code === 'ECHECKSUM';
-        const info: SliceErrorInfo = isChecksum
-            ? { checksum: true }
-            : { err: errorObj.message ?? String(err) };
+        const message = errorObj.message ?? String(err);
+        const info: SliceErrorInfo = {
+            code: errorObj.code,
+            category: categorizeSliceError(errorObj.code, message)
+        };
+        if (isChecksum)
+            info.checksum = true;
+        else
+            info.err = message;
         if (descriptor.type === 'data' || descriptor.type === 'parity')
             info.type = descriptor.type;
         const volumeId = errorObj.volumeId ?? descriptor.volumeId;
@@ -746,6 +784,22 @@ export class VerifyVolumesJob {
     private async loadPersistedCursorId(): Promise<string | null> {
         const stored = await this.deps.runtimeConfig.get(VERIFY_CURSOR_ID_KEY);
         return typeof stored === 'string' && stored.length ? stored : null;
+    }
+
+    private async loadPersistedMode(): Promise<VerifyMode> {
+        const stored = await this.deps.runtimeConfig.get(VERIFY_MODE_KEY);
+        return this.normalizeMode(stored);
+    }
+
+    private async persistMode(mode: VerifyMode): Promise<void> {
+        if (mode === 'light')
+            await this.deps.runtimeConfig.set(VERIFY_MODE_KEY, mode);
+        else
+            await this.deps.runtimeConfig.delete(VERIFY_MODE_KEY);
+    }
+
+    private normalizeMode(value: unknown): VerifyMode {
+        return value === 'light' ? 'light' : 'full';
     }
 
     private async persistVolumeFilter(volumeIds: number[] | null): Promise<void> {

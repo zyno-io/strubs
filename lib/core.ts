@@ -14,6 +14,7 @@ import { configureNotifications } from './notify/bootstrap';
 import { remediationService } from './remediation/service';
 import { repairWorker } from './remediation/repair-worker';
 import { storageStatsTracker } from './storage/stats-tracker';
+import { isMaintenanceFrozen } from './maintenance';
 
 const log = createLogger('core');
 
@@ -66,13 +67,22 @@ export class Core {
             // verify/scrub request can't race the resume for job state.
             await verifyVolumesJob.resumePendingJob();
             await serverManager.start();
-            verifyScheduler.start(config.scrubIntervalMs);
+            // Maintenance freeze gates ALL automatic verify+repair at startup: with
+            // the flag set we never start the scheduler or repair worker, so the
+            // persisted freeze survives a restart.
+            const frozen = await isMaintenanceFrozen();
+            if (frozen)
+                log('maintenance freeze active: NOT starting verify scheduler or repair worker');
+            else
+                verifyScheduler.start(config.scrubIntervalMs);
             systemLogWatcher.start(config.systemLogWatchIntervalMs);
-            repairWorker.start(config.repairIntervalMs, {
-                batchSize: config.repairBatchSize,
-                backlogDelayMs: config.repairBacklogDelayMs,
-                blockedRetryMs: config.repairBlockedRetryMs
-            });
+            if (!frozen) {
+                repairWorker.start(config.repairIntervalMs, {
+                    batchSize: config.repairBatchSize,
+                    backlogDelayMs: config.repairBacklogDelayMs,
+                    blockedRetryMs: config.repairBlockedRetryMs
+                });
+            }
             volumeHealthMonitor.start(config.volumeHealthIntervalMs, config.volumeFaultThreshold);
             storageStatsTracker.start({
                 reconcileIntervalMs: config.storageStatsIntervalMs,

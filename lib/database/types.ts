@@ -25,8 +25,22 @@ export interface ContentDocument {
     [key: string]: any;
 }
 
+// Coarse cause of a slice failure, derived from the error code at the source.
+// Lets analysis/remediation separate recoverable mis-stamps and transient
+// volume outages from genuine data corruption or loss without parsing messages.
+export type SliceErrorCategory =
+    | 'checksum'            // ECHECKSUM — chunk data failed its stored hash
+    | 'header-mismatch'     // EHEADER — header intact but describes another object/slice
+    | 'volume-unavailable'  // EUNAVAIL — volume offline/unmounted (transient, clears on remount)
+    | 'missing'             // ENOENT — slice file absent on a mounted volume
+    | 'io'                  // EIO and other native read errors
+    | 'timeout'             // ETIMEOUT — slice I/O timed out
+    | 'unknown';            // EOPEN/unclassified
+
 export type SliceErrorInfo = {
     checksum?: boolean;
+    code?: string;
+    category?: SliceErrorCategory;
     err?: string;
     type?: 'data' | 'parity';
 };

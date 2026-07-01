@@ -4,9 +4,14 @@ import { createLogger } from '../../log';
 import { volumePriorityManager } from '../volume-priority-manager';
 import { config } from '../../config';
 
+export type VerifyMode = 'light' | 'full';
+
 type FileObjectSliceVerifierDeps = {
     readDelayMs: number;
     sleep: (ms: number) => Promise<void>;
+    // 'full' (default) reads and checksums every chunk; 'light' only opens the
+    // slice (existence + 48-byte header validation) and skips the chunk reads.
+    mode: VerifyMode;
 };
 
 const defaultDeps: FileObjectSliceVerifierDeps = {
@@ -14,7 +19,8 @@ const defaultDeps: FileObjectSliceVerifierDeps = {
     sleep: (ms: number) => new Promise(resolve => {
         const timer = setTimeout(resolve, ms);
         timer.unref?.();
-    })
+    }),
+    mode: 'full'
 };
 
 export class FileObjectSliceVerifier extends Base {
@@ -22,6 +28,7 @@ export class FileObjectSliceVerifier extends Base {
     private prepared = false;
     private readonly logger: ReturnType<typeof createLogger>;
     private readonly readDelayMs: number;
+    private readonly mode: VerifyMode;
     private lastLogTimestamp = 0;
     private totalVerifiedBytes = 0;
 
@@ -29,6 +36,7 @@ export class FileObjectSliceVerifier extends Base {
         super(fileObject);
         this.deps = { ...defaultDeps, ...deps };
         this.readDelayMs = this.normalizeDelayMs(this.deps.readDelayMs);
+        this.mode = this.deps.mode === 'light' ? 'light' : 'full';
         this.logger = createLogger(`${this.fileObject.getLoggerPrefix()}:slice-verifier`);
     }
 
@@ -45,10 +53,15 @@ export class FileObjectSliceVerifier extends Base {
         let opened = false;
         try {
             await this.waitForPriorityWindow(sliceIndex);
+            // open() reads the 48-byte header and runs _validateHeader, surfacing
+            // existence/availability/header faults via the same error pipeline. In
+            // light mode that header check is the whole verification; only full
+            // mode also reads (and checksums) every chunk.
             await slice.open();
             opened = true;
-            await this.verifyOpenSlice(sliceIndex, slice);
-            this.logger('%s slice %s verified', descriptor.type, descriptor.key);
+            if (this.mode === 'full')
+                await this.verifyOpenSlice(sliceIndex, slice);
+            this.logger('%s slice %s verified (%s)', descriptor.type, descriptor.key, this.mode);
         }
         catch (err) {
             const enriched = err as Error & { sliceIndex?: number; volumeId?: number };

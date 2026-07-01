@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
 import type { VolumeStatus, BlockDevice } from '@strubs/server/http/mgmt';
 
 const volumes = ref<VolumeStatus[]>([]);
@@ -10,7 +10,49 @@ const showModal = ref<boolean>(false);
 const selectedDevices = ref<Set<string>>(new Set());
 const wipeDevices = ref<Set<string>>(new Set());
 const creatingVolumes = ref<boolean>(false);
-const sortBy = ref<'volumeLabel' | 'volumeId' | 'name' | 'path'>('volumeLabel');
+
+// Persisted UI preferences (survive reload). Read once on init, written by the
+// watcher below. Kept tolerant of unavailable/throwing localStorage.
+const SORT_BY_KEY = 'strubs.volumes.sortBy';
+const STORAGE_TAB_KEY = 'strubs.storage.tab';
+const VOLUMES_VIEW_KEY = 'strubs.volumes.view';
+
+function loadPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const stored = localStorage.getItem(key);
+    if (stored && (allowed as readonly string[]).includes(stored)) return stored as T;
+  } catch {
+    // Ignore unavailable localStorage (private mode, etc.)
+  }
+  return fallback;
+}
+
+// Shared sort state driving BOTH the volumes table and the volumes grid view.
+const sortBy = ref<'volumeLabel' | 'volumeId' | 'name' | 'path'>(
+  loadPref(SORT_BY_KEY, ['volumeLabel', 'volumeId', 'name', 'path'] as const, 'volumeLabel')
+);
+
+// Active tab within the Storage panel
+const storageTab = ref<'overview' | 'volumes'>(
+  loadPref(STORAGE_TAB_KEY, ['overview', 'volumes'] as const, 'overview')
+);
+
+// Which rendering of the volumes list is active: 'table' or 'grid' (the tiles).
+// Both render the same unified row list (sortedStorageRows).
+const volumesView = ref<'table' | 'grid'>(
+  loadPref(VOLUMES_VIEW_KEY, ['table', 'grid'] as const, 'table')
+);
+
+// Persist the view/tab/sort preferences whenever they change.
+watch([sortBy, storageTab, volumesView], () => {
+  try {
+    localStorage.setItem(SORT_BY_KEY, sortBy.value);
+    localStorage.setItem(STORAGE_TAB_KEY, storageTab.value);
+    localStorage.setItem(VOLUMES_VIEW_KEY, volumesView.value);
+  } catch {
+    // Ignore persistence failures
+  }
+});
 
 // Context menu state
 const contextMenu = ref<{ x: number; y: number; volumeId: number | null }>({ x: 0, y: 0, volumeId: null });
@@ -18,6 +60,10 @@ const showEditLabelModal = ref<boolean>(false);
 const editingVolumeId = ref<number | null>(null);
 const editLabelValue = ref<string>('');
 const savingLabel = ref<boolean>(false);
+const showEditCommentModal = ref<boolean>(false);
+const editingCommentVolumeId = ref<number | null>(null);
+const editCommentValue = ref<string>('');
+const savingComment = ref<boolean>(false);
 
 // Determine API base URL based on environment
 const getApiBaseUrl = (): string => {
@@ -158,17 +204,251 @@ const verifyTargetVolumes = computed<Array<{ id: number; label: string }>>(() =>
   });
 });
 
-const storageVolumeRows = computed<Array<{ id: number; label: string; stats: StorageCounters }>>(() => {
-  const entries = Object.entries(storageStats.value?.volumes ?? {});
-  return entries
-    .map(([id, stats]) => {
-      const volumeId = Number(id);
-      const volume = volumes.value.find(candidate => candidate.id === volumeId);
-      const suffix = volume?.label ? ` (${volume.label})` : '';
-      return { id: volumeId, label: `vol ${volumeId}${suffix}`, stats };
-    })
-    .sort((a, b) => a.id - b.id);
+// Derive a short device name (e.g. "sda") from a block path like "/dev/sda1"
+function deviceNameFromBlockPath(blockPath: string | null): string | null {
+  if (!blockPath) return null;
+  return blockPath.replace(/^\/dev\//, '');
+}
+
+type StorageVolumeRow = {
+  // Unique row key (volumes keyed by id, unassigned drives by device path)
+  key: string;
+  // Volume id, or null for an unassigned (non-volumed) physical drive
+  id: number | null;
+  groupLabel: string | null;
+  // Hardware-derived bus group (physical enclosure/HBA), present on volumes and
+  // unassigned drives alike; used to slot unassigned drives next to their siblings
+  busGroup: number | null;
+  color: string;
+  device: string | null;
+  // Underlying sysfs path of the backing block device, when known (used for the
+  // "path" sort and as a tile detail). Null for offline/diskless volumes.
+  sysfsPath: string | null;
+  // True when the row is a physical drive not assigned to any volume
+  unassigned: boolean;
+  // The live volume record (null for unassigned drives). Carries the flags the
+  // grid/table need to show and the action handlers need to mutate (isReadOnly,
+  // isEnabled, SMART, verify errors, etc.).
+  volume: VolumeStatus | null;
+  // The matching block device, when one is present (null for offline volumes).
+  blockDevice: BlockDevice | null;
+  // vendor/model/serial tooltip text, when identity info is available
+  identityTitle: string | null;
+  stats: StorageCounters;
+  bytesTotal: number;
+  bytesFree: number | null;
+  usedFraction: number | null;
+};
+
+const EMPTY_STORAGE_COUNTERS: StorageCounters = {
+  objectCount: 0,
+  logicalBytes: 0,
+  dataSliceCount: 0,
+  paritySliceCount: 0,
+  dataBytes: 0,
+  parityBytes: 0,
+  physicalBytes: 0
+};
+
+// Parse a "group.index" label (e.g. "3.3") into numeric [group, index] for sorting
+function parseGroupIndex(label: string | null): [number, number] | null {
+  if (!label) return null;
+  const match = /^(\d+)\.(\d+)$/.exec(label.trim());
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2])];
+}
+
+// Build a vendor/model/serial tooltip string from a block device's identity fields
+function deviceIdentityTitle(device: BlockDevice | undefined | null): string | null {
+  if (!device) return null;
+  const parts: string[] = [];
+  if (device.vendor) parts.push(`Vendor: ${device.vendor}`);
+  if (device.model) parts.push(`Model: ${device.model}`);
+  if (device.serial) parts.push(`Serial: ${device.serial}`);
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+// Summed capacity of online, assigned volumes. A started volume is mounted,
+// verified, and serving, which naturally excludes deleted/offline volumes.
+const onlineAssignedCapacity = computed<number>(() =>
+  volumes.value.filter(v => v.isStarted).reduce((sum, v) => sum + (v.bytesTotal || 0), 0)
+);
+
+const storageVolumeRows = computed<StorageVolumeRow[]>(() => {
+  const statsByVolume = storageStats.value?.volumes ?? {};
+  // Union of all configured volume ids and any volume id that only appears in
+  // storage stats (e.g. deleted-but-still-referenced volumes that hold data but
+  // are no longer in the live config). This way enabled-but-diskless volumes,
+  // which carry no stats, still get a row.
+  const volumeIds = new Set<number>();
+  for (const volume of volumes.value) volumeIds.add(volume.id);
+  for (const id of Object.keys(statsByVolume)) volumeIds.add(Number(id));
+
+  const volumeRows: StorageVolumeRow[] = [...volumeIds].map(volumeId => {
+    const stats = statsByVolume[volumeId] ?? EMPTY_STORAGE_COUNTERS;
+    const volume = volumes.value.find(candidate => candidate.id === volumeId) ?? null;
+    // group.index physical label (e.g. "3.3"), kept separate from the numeric id
+    const groupLabel = volume?.label ?? null;
+    // Reuse the same per-volume status color as the Block Devices table
+    const color = getVolumeBackgroundColor(volume);
+    // Prefer the matching block device's short name (sda, sdb); fall back to the volume's block path
+    const blockDevice = blockDevices.value.find(bd => bd.volumeId === volumeId);
+    const device = blockDevice?.name ?? deviceNameFromBlockPath(volume?.blockPath ?? null);
+    const bytesTotal = volume?.bytesTotal ?? 0;
+    const bytesFree = volume?.bytesFree ?? null;
+    const usedFraction =
+      bytesTotal > 0 && bytesFree !== null
+        ? Math.min(1, Math.max(0, (bytesTotal - bytesFree) / bytesTotal))
+        : null;
+    return {
+      key: `vol-${volumeId}`,
+      id: volumeId,
+      groupLabel,
+      busGroup: volume?.busGroup ?? blockDevice?.busGroup ?? null,
+      color,
+      device,
+      sysfsPath: blockDevice?.sysfsPath ?? null,
+      unassigned: false,
+      volume,
+      blockDevice: blockDevice ?? null,
+      identityTitle: deviceIdentityTitle(blockDevice),
+      stats,
+      bytesTotal,
+      bytesFree,
+      usedFraction
+    };
+  });
+
+  // Unassigned (non-volumed) physical drives: block devices with no volume
+  // assignment. These hold no slices, so their stats are zeroed. They have no
+  // human-assigned "group.index" label (that's set per volume), but they DO carry
+  // the same hardware-derived busGroup as the volumes, so we can slot them next to
+  // their physical enclosure siblings instead of dumping them at the bottom.
+  const unassignedRows: StorageVolumeRow[] = blockDevices.value
+    .filter(bd => !bd.volumeId)
+    .map(bd => ({
+      key: `dev-${bd.path}`,
+      id: null,
+      // Backend-derived "group.bay" label (e.g. "3.2") for unassigned enclosure
+      // drives, inferred from the labeled bridge sibling. When present, the
+      // group.index sort below slots the drive inline with its labeled siblings;
+      // when null, it falls back to busGroup placement after the labeled volumes.
+      groupLabel: bd.derivedGroupLabel ?? null,
+      busGroup: bd.busGroup ?? null,
+      color: getVolumeBackgroundColor(null),
+      device: bd.name,
+      sysfsPath: bd.sysfsPath,
+      unassigned: true,
+      volume: null,
+      blockDevice: bd,
+      identityTitle: deviceIdentityTitle(bd),
+      stats: EMPTY_STORAGE_COUNTERS,
+      bytesTotal: bd.size,
+      bytesFree: bd.size,
+      usedFraction: bd.size > 0 ? 0 : null
+    }));
+
+  // Learn the busGroup -> label-group mapping from labeled volumes. busGroup tracks
+  // the physical enclosure/HBA; the "group" part of a volume's manual label names
+  // that same enclosure. So a drive sharing a bus group with a labeled volume
+  // belongs to that label group, even though (being unassigned) it has no label.
+  // The per-bay ".index" is NOT derivable from hardware, so unassigned drives sort
+  // after the labeled volumes within their group rather than getting a fake index.
+  const labelGroupByBus = new Map<number, number>();
+  for (const row of volumeRows) {
+    const parsed = parseGroupIndex(row.groupLabel);
+    if (parsed && row.busGroup !== null && !labelGroupByBus.has(row.busGroup))
+      labelGroupByBus.set(row.busGroup, parsed[0]);
+  }
+
+  // Unified sort key: [tier, group, index, deviceName, id].
+  // tier 0 = placed within a known label group (labeled volumes + their unassigned
+  // bus-group siblings); tier 1 = no label group derivable (a bus group with no
+  // labeled volume), ordered by busGroup then device name after the grouped rows.
+  const sortKey = (row: StorageVolumeRow): [number, number, number, string, number] => {
+    const parsed = parseGroupIndex(row.groupLabel);
+    if (parsed)
+      return [0, parsed[0], parsed[1], row.device ?? '', row.id ?? 0];
+    const mappedGroup = row.busGroup !== null ? labelGroupByBus.get(row.busGroup) : undefined;
+    if (mappedGroup !== undefined)
+      // Slot inline within the enclosure's group, after labeled volumes (index ∞)
+      return [0, mappedGroup, Number.POSITIVE_INFINITY, row.device ?? '', row.id ?? 0];
+    return [1, row.busGroup ?? Number.POSITIVE_INFINITY, 0, row.device ?? '', row.id ?? 0];
+  };
+
+  const rows = [...volumeRows, ...unassignedRows];
+  rows.sort((a, b) => {
+    const ka = sortKey(a);
+    const kb = sortKey(b);
+    for (let i = 0; i < ka.length; i++) {
+      if (typeof ka[i] === 'string') {
+        const cmp = (ka[i] as string).localeCompare(kb[i] as string);
+        if (cmp !== 0) return cmp;
+      } else if (ka[i] !== kb[i]) {
+        return (ka[i] as number) - (kb[i] as number);
+      }
+    }
+    return 0;
+  });
+
+  return rows;
 });
+
+// The unified volume rows ordered by the shared `sortBy`. Drives BOTH the table
+// and the grid view so the two are genuinely two renderings of one sorted list.
+// 'volumeLabel' keeps the careful group.index ordering computed above; the other
+// modes re-sort, pushing rows without the sort field (unassigned/diskless) last.
+const sortedStorageRows = computed<StorageVolumeRow[]>(() => {
+  const rows = storageVolumeRows.value;
+  if (sortBy.value === 'volumeLabel') return rows;
+
+  const sorted = [...rows];
+  sorted.sort((a, b) => {
+    switch (sortBy.value) {
+      case 'volumeId': {
+        if (a.id !== null && b.id !== null) {
+          if (a.id !== b.id) return a.id - b.id;
+        } else if (a.id === null && b.id !== null) {
+          return 1;
+        } else if (a.id !== null && b.id === null) {
+          return -1;
+        }
+        break;
+      }
+      case 'name': {
+        const av = a.device ?? '';
+        const bv = b.device ?? '';
+        if (av !== bv) return av.localeCompare(bv);
+        break;
+      }
+      case 'path': {
+        const av = a.sysfsPath ?? '';
+        const bv = b.sysfsPath ?? '';
+        if (av === '' && bv !== '') return 1;
+        if (av !== '' && bv === '') return -1;
+        if (av !== bv) return av.localeCompare(bv);
+        break;
+      }
+    }
+    // Stable tiebreak so equal keys keep a deterministic order
+    return a.key.localeCompare(b.key);
+  });
+  return sorted;
+});
+
+// Color band for a fullness bar based on how full the drive is
+function fullnessClass(fraction: number): string {
+  if (fraction >= 0.9) return 'fullness-critical';
+  if (fraction >= 0.7) return 'fullness-warn';
+  return 'fullness-ok';
+}
+
+// Tooltip text describing used / total capacity for a storage row
+function fullnessTitle(row: StorageVolumeRow): string {
+  if (row.bytesFree === null || row.bytesTotal <= 0) return 'Capacity unknown';
+  const used = row.bytesTotal - row.bytesFree;
+  return `${formatBytes(used)} used of ${formatBytes(row.bytesTotal)} (${formatBytes(row.bytesFree)} free)`;
+}
 
 // Fetch data from APIs
 async function fetchData(): Promise<void> {
@@ -219,74 +499,9 @@ async function refreshDevices(): Promise<void> {
   }
 }
 
-// Find matching volume for a block device
-function findVolumeForBlockDevice(blockDevice: BlockDevice): VolumeStatus | null {
-  if (!blockDevice.volumeId) return null;
-  return volumes.value.find(v => v.id === blockDevice.volumeId) ?? null;
-}
-
-// Compute offline volumes (volumes without matching block devices)
-const offlineVolumes = computed<VolumeStatus[]>(() => {
-  const onlineVolumeIds = new Set(
-    blockDevices.value
-      .filter(bd => bd.volumeId)
-      .map(bd => bd.volumeId!)
-  );
-  return volumes.value.filter(v => !onlineVolumeIds.has(v.id));
-});
-
 // Get block devices without volume IDs (available for provisioning)
 const availableDevices = computed<BlockDevice[]>(() => {
   return blockDevices.value.filter(bd => !bd.volumeId);
-});
-
-// Sort block devices based on selected sort option
-const sortedBlockDevices = computed<BlockDevice[]>(() => {
-  const devices = [...blockDevices.value];
-
-  return devices.sort((a, b) => {
-    let aValue: string | number | null;
-    let bValue: string | number | null;
-
-    switch (sortBy.value) {
-      case 'volumeLabel':
-        aValue = a.volumeLabel ?? '';
-        bValue = b.volumeLabel ?? '';
-        break;
-      case 'volumeId':
-        aValue = a.volumeId ?? null;
-        bValue = b.volumeId ?? null;
-        // Special handling for volumeId: null values go to the end
-        if (aValue === null && bValue === null) return 0;
-        if (aValue === null) return 1;
-        if (bValue === null) return -1;
-        // Both have values, compare them
-        if (aValue < bValue) return -1;
-        if (aValue > bValue) return 1;
-        return 0;
-      case 'name':
-        aValue = a.name;
-        bValue = b.name;
-        break;
-      case 'path':
-        aValue = a.sysfsPath;
-        bValue = b.sysfsPath;
-        break;
-      default:
-        return 0;
-    }
-
-    // Handle null/empty values - push them to the end
-    const aIsEmpty = aValue === null || aValue === '' || (typeof aValue === 'number' && aValue < 0);
-    const bIsEmpty = bValue === null || bValue === '' || (typeof bValue === 'number' && bValue < 0);
-    if (aIsEmpty && !bIsEmpty) return 1;
-    if (!aIsEmpty && bIsEmpty) return -1;
-
-    // Compare values
-    if (aValue < bValue) return -1;
-    if (aValue > bValue) return 1;
-    return 0;
-  });
 });
 
 // Check if a device has any mounted partitions
@@ -514,6 +729,57 @@ async function saveLabel(): Promise<void> {
   }
 }
 
+// Open edit comment modal
+function openEditCommentModal(): void {
+  if (contextMenu.value.volumeId === null) return;
+  const volume = volumes.value.find(v => v.id === contextMenu.value.volumeId);
+  if (!volume) return;
+
+  editingCommentVolumeId.value = contextMenu.value.volumeId;
+  editCommentValue.value = volume.comment ?? '';
+  showEditCommentModal.value = true;
+  hideContextMenu();
+}
+
+// Close edit comment modal
+function closeEditCommentModal(): void {
+  showEditCommentModal.value = false;
+  editingCommentVolumeId.value = null;
+  editCommentValue.value = '';
+}
+
+// Save comment
+async function saveComment(): Promise<void> {
+  if (editingCommentVolumeId.value === null || savingComment.value) return;
+
+  savingComment.value = true;
+  try {
+    const response = await fetch(`${apiBaseUrl}/$/volumes/${editingCommentVolumeId.value}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment: editCommentValue.value || null })
+    });
+
+    if (!response.ok) {
+      let errorMessage = `Failed to update comment (HTTP ${response.status})`;
+      try {
+        const text = await response.text();
+        if (text) errorMessage += `: ${text}`;
+      } catch {
+        // Ignore error reading response body
+      }
+      throw new Error(errorMessage);
+    }
+
+    await fetchData();
+    closeEditCommentModal();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to update comment';
+  } finally {
+    savingComment.value = false;
+  }
+}
+
 // Enable or disable the volume targeted by the context menu
 async function toggleVolumeEnabled(): Promise<void> {
   const volume = contextMenuVolume.value;
@@ -549,6 +815,52 @@ async function toggleVolumeEnabled(): Promise<void> {
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to update volume';
   }
+}
+
+// Toggle the read-only flag on the volume targeted by the context menu. PUTs the
+// new flag to /$/volumes/{id} and refreshes. Available from both table and grid.
+async function toggleVolumeReadOnly(): Promise<void> {
+  const volume = contextMenuVolume.value;
+  if (volume === null) return;
+
+  const volumeId = volume.id;
+  const nextReadOnly = !volume.isReadOnly;
+  hideContextMenu();
+
+  try {
+    const response = await fetch(`${apiBaseUrl}/$/volumes/${volumeId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isReadOnly: nextReadOnly })
+    });
+
+    if (!response.ok) {
+      let errorMessage = `Failed to ${nextReadOnly ? 'set' : 'clear'} read-only (HTTP ${response.status})`;
+      try {
+        const text = await response.text();
+        if (text) errorMessage += `: ${text}`;
+      } catch {
+        // Ignore error reading response body
+      }
+      throw new Error(errorMessage);
+    }
+
+    await fetchData();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to update volume';
+  }
+}
+
+// Set the shared sort field (used by the clickable table headers)
+function setSort(field: 'volumeLabel' | 'volumeId' | 'name' | 'path'): void {
+  sortBy.value = field;
+}
+
+// Open the volume action menu for a row via a left-click on its action button.
+// Mirrors the right-click context menu the grid tiles use. `.stop` on the caller
+// prevents the document click handler from immediately closing the menu.
+function openRowMenu(event: MouseEvent, volumeId: number): void {
+  contextMenu.value = { x: event.clientX, y: event.clientY, volumeId };
 }
 
 // Delete volume with confirmation
@@ -688,77 +1000,90 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section v-if="storageStats" class="section storage-panel">
+    <section
+      v-if="storageStats || volumes.length > 0 || blockDevices.length > 0"
+      class="section storage-panel"
+    >
       <div class="section-header">
         <h2>Storage</h2>
-        <span class="storage-updated">Updated {{ formatDateTime(String(storageStats.updatedAt)) }}</span>
+        <span v-if="storageStats" class="storage-updated">Updated {{ formatDateTime(String(storageStats.updatedAt)) }}</span>
       </div>
-      <div class="storage-stats">
-        <div class="storage-stat">
-          <span class="storage-stat-label">Files</span>
-          <span class="storage-stat-value">{{ storageStats.system.objectCount.toLocaleString() }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Logical Data</span>
-          <span class="storage-stat-value">{{ formatBytes(storageStats.system.logicalBytes) }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Data Slices</span>
-          <span class="storage-stat-value">{{ formatBytes(storageStats.system.dataBytes) }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Parity Slices</span>
-          <span class="storage-stat-value">{{ formatBytes(storageStats.system.parityBytes) }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Physical Total</span>
-          <span class="storage-stat-value">{{ formatBytes(storageStats.system.physicalBytes) }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Unavailable</span>
-          <span class="storage-stat-value" :class="{ 'error-text': storageStats.system.unavailableObjectCount > 0 }">
-            {{ storageStats.system.unavailableObjectCount.toLocaleString() }} / {{ formatBytes(storageStats.system.unavailableLogicalBytes) }}
-          </span>
-        </div>
+      <div class="storage-tabs" role="tablist">
+        <button
+          type="button"
+          class="storage-tab"
+          :class="{ active: storageTab === 'overview' }"
+          @click="storageTab = 'overview'"
+        >
+          Overview
+        </button>
+        <button
+          type="button"
+          class="storage-tab"
+          :class="{ active: storageTab === 'volumes' }"
+          @click="storageTab = 'volumes'"
+        >
+          Volumes
+        </button>
       </div>
-      <div v-if="storageVolumeRows.length > 0" class="storage-table-wrap">
-        <table class="storage-table">
-          <thead>
-            <tr>
-              <th>Volume</th>
-              <th>Files</th>
-              <th>Logical Data</th>
-              <th>Data Slices</th>
-              <th>Parity Slices</th>
-              <th>Physical Total</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="entry in storageVolumeRows" :key="entry.id">
-              <td>{{ entry.label }}</td>
-              <td>{{ entry.stats.objectCount.toLocaleString() }}</td>
-              <td>{{ formatBytes(entry.stats.logicalBytes) }}</td>
-              <td>{{ formatBytes(entry.stats.dataBytes) }}</td>
-              <td>{{ formatBytes(entry.stats.parityBytes) }}</td>
-              <td>{{ formatBytes(entry.stats.physicalBytes) }}</td>
-            </tr>
-          </tbody>
-        </table>
+      <div v-show="storageTab === 'overview'">
+        <div v-if="storageStats" class="storage-stats">
+          <div class="storage-stat">
+            <span class="storage-stat-label">Files</span>
+            <span class="storage-stat-value">{{ storageStats.system.objectCount.toLocaleString() }}</span>
+          </div>
+          <div class="storage-stat">
+            <span class="storage-stat-label">Logical Data</span>
+            <span class="storage-stat-value">{{ formatBytes(storageStats.system.logicalBytes) }}</span>
+          </div>
+          <div class="storage-stat">
+            <span class="storage-stat-label">Data Slices</span>
+            <span class="storage-stat-value">{{ formatBytes(storageStats.system.dataBytes) }}</span>
+          </div>
+          <div class="storage-stat">
+            <span class="storage-stat-label">Parity Slices</span>
+            <span class="storage-stat-value">{{ formatBytes(storageStats.system.parityBytes) }}</span>
+          </div>
+          <div class="storage-stat">
+            <span class="storage-stat-label">Physical Total</span>
+            <span class="storage-stat-value">{{ formatBytes(storageStats.system.physicalBytes) }}</span>
+          </div>
+          <div class="storage-stat">
+            <span class="storage-stat-label">Total Capacity</span>
+            <span class="storage-stat-value">{{ formatBytes(onlineAssignedCapacity) }}</span>
+          </div>
+          <div class="storage-stat">
+            <span class="storage-stat-label">Unavailable</span>
+            <span class="storage-stat-value" :class="{ 'error-text': storageStats.system.unavailableObjectCount > 0 }">
+              {{ storageStats.system.unavailableObjectCount.toLocaleString() }} / {{ formatBytes(storageStats.system.unavailableLogicalBytes) }}
+            </span>
+          </div>
+        </div>
+        <p v-else class="storage-empty">Storage statistics are not available yet.</p>
       </div>
-    </section>
-
-    <div v-if="error" class="error">
-      Error: {{ error }}
-    </div>
-
-    <div v-else-if="!loading || blockDevices.length > 0">
-      <!-- Block Devices Section -->
-      <section class="section">
-        <div class="section-header">
-          <h2>Block Devices</h2>
+      <div v-show="storageTab === 'volumes'" class="volumes-view">
+        <div class="volumes-toolbar">
+          <div class="view-toggle" role="group" aria-label="Volumes view">
+            <button
+              type="button"
+              class="view-toggle-btn"
+              :class="{ active: volumesView === 'table' }"
+              @click="volumesView = 'table'"
+            >
+              Table
+            </button>
+            <button
+              type="button"
+              class="view-toggle-btn"
+              :class="{ active: volumesView === 'grid' }"
+              @click="volumesView = 'grid'"
+            >
+              Grid
+            </button>
+          </div>
           <div class="sort-controls">
-            <label for="sort-select" class="sort-label">Sort by:</label>
-            <select id="sort-select" v-model="sortBy" class="sort-select">
+            <label for="volumes-sort" class="sort-label">Sort by:</label>
+            <select id="volumes-sort" v-model="sortBy" class="sort-select">
               <option value="volumeLabel">Volume Label</option>
               <option value="volumeId">Volume ID</option>
               <option value="name">Device Name</option>
@@ -766,124 +1091,198 @@ onUnmounted(() => {
             </select>
           </div>
         </div>
-        <div class="devices-list">
-          <div
-            v-for="device in sortedBlockDevices"
-            :key="device.sysfsPath"
-            class="device-card"
-            :style="{ opacity: device.volumeId ? 1 : 0.5 }"
-            @contextmenu="device.volumeId ? showContextMenu($event, device.volumeId) : null"
-          >
-            <div
-              class="device-header"
-              :style="{ backgroundColor: getVolumeBackgroundColor(findVolumeForBlockDevice(device)) }"
-            >
-              <div class="device-name">
-                <span v-if="device.volumeLabel" class="label-prefix">{{ device.volumeLabel }}</span>
-                {{ device.name }}
-              </div>
-              <div class="header-badges">
-                <div v-if="device.busGroup !== null" class="badge">Bus {{ device.busGroup }}</div>
-                <div class="badge">{{ formatBytes(device.size) }}</div>
-              </div>
-            </div>
-            <div class="device-body">
-              <div class="device-info">
-                <div class="info-row">
-                  <span class="label">Volume ID:</span>
-                  <span class="value">{{ device.volumeId ?? 'N/A' }}</span>
-                </div>
-                <div class="info-row" v-if="findVolumeForBlockDevice(device)">
-                  <span class="label">SMART Status:</span>
-                  <span class="value" :class="{ 'error-text': findVolumeForBlockDevice(device)?.isSmartHealthy === false }">
-                    {{ formatSmartStatus(findVolumeForBlockDevice(device)) }}
-                  </span>
-                </div>
-                <div class="info-row" v-if="findVolumeForBlockDevice(device)?.verifyErrors && getVerifyErrorCount(findVolumeForBlockDevice(device)?.verifyErrors) > 0">
-                  <span class="label">Verify Errors:</span>
-                  <span class="value error-text">{{ getVerifyErrorCount(findVolumeForBlockDevice(device)?.verifyErrors) }}</span>
-                </div>
-                <div class="info-row">
-                  <span class="label">Model:</span>
-                  <span class="value">{{ device.model ?? 'N/A' }}</span>
-                </div>
-                <div class="info-row">
-                  <span class="label">Vendor:</span>
-                  <span class="value">{{ device.vendor ?? 'N/A' }}</span>
-                </div>
-                <div class="info-row">
-                  <span class="label">Serial:</span>
-                  <span class="value">{{ device.serial ?? 'N/A' }}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
 
-      <!-- Offline Volumes Section -->
-      <section class="section" v-if="offlineVolumes.length > 0">
-        <h2>Offline Volumes</h2>
-        <div class="devices-list">
+        <p v-if="sortedStorageRows.length === 0" class="volumes-empty">
+          {{ loading ? 'Loading…' : 'No volumes or drives found.' }}
+        </p>
+
+        <!-- TABLE VIEW -->
+        <div v-else-if="volumesView === 'table'" class="storage-table-wrap">
+          <table class="storage-table">
+            <thead>
+              <tr>
+                <th
+                  class="sortable"
+                  :class="{ 'sort-active': sortBy === 'volumeLabel' }"
+                  @click="setSort('volumeLabel')"
+                >
+                  Volume<span v-if="sortBy === 'volumeLabel'" class="sort-arrow">▲</span>
+                </th>
+                <th
+                  class="sortable"
+                  :class="{ 'sort-active': sortBy === 'name' }"
+                  @click="setSort('name')"
+                >
+                  Device<span v-if="sortBy === 'name'" class="sort-arrow">▲</span>
+                </th>
+                <th>Comment</th>
+                <th>Status</th>
+                <th>Files</th>
+                <th>Data Slices</th>
+                <th>Parity Slices</th>
+                <th>Physical Total</th>
+                <th>Capacity</th>
+                <th>Fullness</th>
+                <th class="actions-col"></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="entry in sortedStorageRows"
+                :key="entry.key"
+                :class="{ 'storage-row-unassigned': entry.unassigned }"
+                @contextmenu="entry.id !== null ? showContextMenu($event, entry.id) : null"
+              >
+                <td>
+                  <div class="vol-id-cell">
+                    <template v-if="!entry.unassigned">
+                      <span class="vol-id-badge" :style="{ backgroundColor: entry.color }">{{ entry.id }}</span>
+                      <span v-if="entry.groupLabel" class="vol-group-label">{{ entry.groupLabel }}</span>
+                    </template>
+                    <span v-else class="vol-unassigned-badge">unassigned</span>
+                  </div>
+                </td>
+                <td class="device-cell" :title="entry.identityTitle ?? undefined">{{ entry.device ?? '—' }}</td>
+                <td class="comment-cell" :title="entry.volume?.comment ?? undefined">
+                  <span v-if="entry.volume?.comment" class="comment-text">{{ entry.volume.comment }}</span>
+                  <span v-else class="state-muted">—</span>
+                </td>
+                <td>
+                  <div class="status-cell">
+                    <span v-if="entry.volume?.isReadOnly" class="state-badge ro" title="Read-only">RO</span>
+                    <span v-if="entry.volume && !entry.volume.isEnabled" class="state-badge disabled" title="Disabled">Disabled</span>
+                    <span
+                      v-else-if="entry.volume && !entry.blockDevice"
+                      class="state-badge offline"
+                      title="Volume has no online block device"
+                    >Offline</span>
+                    <span v-if="entry.volume?.isSmartHealthy === false" class="state-badge err" title="SMART failed">SMART</span>
+                    <span
+                      v-if="entry.volume && getVerifyErrorCount(entry.volume.verifyErrors) > 0"
+                      class="state-badge err"
+                      :title="getVerifyErrorCount(entry.volume.verifyErrors) + ' verify errors'"
+                    >Errors</span>
+                    <span v-if="!entry.volume" class="state-muted">—</span>
+                  </div>
+                </td>
+                <td>{{ entry.stats.objectCount.toLocaleString() }}</td>
+                <td>{{ entry.stats.dataSliceCount.toLocaleString() }}</td>
+                <td>{{ entry.stats.paritySliceCount.toLocaleString() }}</td>
+                <td>{{ formatBytes(entry.stats.physicalBytes) }}</td>
+                <td>{{ entry.bytesTotal > 0 ? formatBytes(entry.bytesTotal) : '—' }}</td>
+                <td class="fullness-cell">
+                  <div v-if="entry.usedFraction !== null" class="fullness" :title="fullnessTitle(entry)">
+                    <div class="fullness-bar" :class="fullnessClass(entry.usedFraction)">
+                      <div class="fullness-fill" :style="{ width: (entry.usedFraction * 100).toFixed(1) + '%' }"></div>
+                    </div>
+                    <span class="fullness-label">{{ Math.round(entry.usedFraction * 100) }}%</span>
+                  </div>
+                  <span v-else class="fullness-unknown" title="Capacity unknown">—</span>
+                </td>
+                <td class="actions-col">
+                  <button
+                    v-if="entry.id !== null"
+                    type="button"
+                    class="row-action-btn"
+                    title="Volume actions"
+                    @click.stop="openRowMenu($event, entry.id)"
+                  >⋮</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- GRID VIEW (tiles) -->
+        <div v-else class="devices-list">
           <div
-            v-for="volume in offlineVolumes"
-            :key="volume.id"
-            class="device-card offline"
-            @contextmenu="showContextMenu($event, volume.id)"
+            v-for="entry in sortedStorageRows"
+            :key="entry.key"
+            class="device-card"
+            :class="{ offline: entry.volume && !entry.blockDevice }"
+            :style="{ opacity: entry.unassigned ? 0.6 : 1 }"
+            @contextmenu="entry.id !== null ? showContextMenu($event, entry.id) : null"
           >
-            <div
-              class="device-header"
-              :style="{ backgroundColor: getVolumeBackgroundColor(volume) }"
-            >
+            <div class="device-header" :style="{ backgroundColor: entry.color }">
               <div class="device-name">
-                <span v-if="volume.label" class="label-prefix">{{ volume.label }}</span>
-                Volume {{ volume.id }}
+                <span v-if="entry.groupLabel" class="label-prefix">{{ entry.groupLabel }}</span>
+                {{ entry.unassigned ? (entry.device ?? 'Drive') : ('Volume ' + entry.id) }}
               </div>
               <div class="header-badges">
-                <div v-if="volume.busGroup !== null" class="badge">Bus {{ volume.busGroup }}</div>
-                <div class="badge offline-badge">OFFLINE</div>
+                <button
+                  v-if="entry.id !== null"
+                  type="button"
+                  class="tile-action-btn"
+                  title="Volume actions"
+                  @click.stop="openRowMenu($event, entry.id)"
+                >⋮</button>
+                <div v-if="entry.busGroup !== null" class="badge">Bus {{ entry.busGroup }}</div>
+                <div class="badge">{{ formatBytes(entry.bytesTotal) }}</div>
+                <div v-if="entry.volume?.isReadOnly" class="badge ro-badge">READ-ONLY</div>
+                <div v-if="entry.volume && !entry.volume.isEnabled" class="badge offline-badge">DISABLED</div>
+                <div v-else-if="entry.volume && !entry.blockDevice" class="badge offline-badge">OFFLINE</div>
+                <div v-if="entry.unassigned" class="badge offline-badge">UNASSIGNED</div>
               </div>
             </div>
             <div class="device-body">
               <div class="device-info">
                 <div class="info-row">
+                  <span class="label">Device:</span>
+                  <span class="value">{{ entry.device ?? 'N/A' }}</span>
+                </div>
+                <div class="info-row" v-if="!entry.unassigned">
+                  <span class="label">Read Only:</span>
+                  <span class="value">{{ entry.volume?.isReadOnly ? 'Yes' : 'No' }}</span>
+                </div>
+                <div class="info-row" v-if="entry.volume">
+                  <span class="label">Enabled:</span>
+                  <span class="value">{{ entry.volume.isEnabled ? 'Yes' : 'No' }}</span>
+                </div>
+                <div class="info-row" v-if="entry.volume">
                   <span class="label">SMART Status:</span>
-                  <span class="value" :class="{ 'error-text': volume.isSmartHealthy === false }">
-                    {{ formatSmartStatus(volume) }}
+                  <span class="value" :class="{ 'error-text': entry.volume.isSmartHealthy === false }">
+                    {{ formatSmartStatus(entry.volume) }}
                   </span>
                 </div>
-                <div class="info-row" v-if="volume.verifyErrors && getVerifyErrorCount(volume.verifyErrors) > 0">
+                <div class="info-row" v-if="entry.volume && getVerifyErrorCount(entry.volume.verifyErrors) > 0">
                   <span class="label">Verify Errors:</span>
-                  <span class="value error-text">{{ getVerifyErrorCount(volume.verifyErrors) }}</span>
+                  <span class="value error-text">{{ getVerifyErrorCount(entry.volume.verifyErrors) }}</span>
+                </div>
+                <div class="info-row" v-if="entry.blockDevice?.model ?? entry.volume?.deviceModel">
+                  <span class="label">Model:</span>
+                  <span class="value">{{ entry.blockDevice?.model ?? entry.volume?.deviceModel }}</span>
+                </div>
+                <div class="info-row" v-if="entry.blockDevice?.serial ?? entry.volume?.deviceSerial">
+                  <span class="label">Serial:</span>
+                  <span class="value">{{ entry.blockDevice?.serial ?? entry.volume?.deviceSerial }}</span>
                 </div>
                 <div class="info-row">
-                  <span class="label">UUID:</span>
-                  <span class="value small">{{ volume.uuid }}</span>
+                  <span class="label">Files:</span>
+                  <span class="value">{{ entry.stats.objectCount.toLocaleString() }}</span>
                 </div>
-                <div class="info-row">
-                  <span class="label">Partition UUID:</span>
-                  <span class="value small">{{ volume.partitionUuid ?? 'N/A' }}</span>
+                <div class="info-row" v-if="entry.usedFraction !== null">
+                  <span class="label">Fullness:</span>
+                  <span class="value">{{ Math.round(entry.usedFraction * 100) }}%</span>
                 </div>
-                <div class="info-row">
-                  <span class="label">Enabled:</span>
-                  <span class="value">{{ volume.isEnabled ? 'Yes' : 'No' }}</span>
-                </div>
-                <div class="info-row">
-                  <span class="label">Started:</span>
-                  <span class="value">{{ volume.isStarted ? 'Yes' : 'No' }}</span>
-                </div>
-                <div class="info-row">
-                  <span class="label">Read Only:</span>
-                  <span class="value">{{ volume.isReadOnly ? 'Yes' : 'No' }}</span>
+                <div class="info-row" v-if="entry.volume?.comment">
+                  <span class="label">Comment:</span>
+                  <span class="value comment-value" :title="entry.volume.comment">{{ entry.volume.comment }}</span>
                 </div>
               </div>
             </div>
           </div>
         </div>
-      </section>
+      </div>
+    </section>
+
+    <div v-if="error" class="error">
+      Error: {{ error }}
     </div>
 
-    <div v-else class="loading">
+    <div
+      v-else-if="loading && !storageStats && volumes.length === 0 && blockDevices.length === 0"
+      class="loading"
+    >
       Loading...
     </div>
 
@@ -960,6 +1359,14 @@ onUnmounted(() => {
       @click.stop
     >
       <div class="context-menu-item" @click="openEditLabelModal">Edit Label</div>
+      <div class="context-menu-item" @click="openEditCommentModal">Edit Comment</div>
+      <div
+        v-if="contextMenuVolume"
+        class="context-menu-item"
+        @click="toggleVolumeReadOnly"
+      >
+        {{ contextMenuVolume.isReadOnly ? 'Clear Read-Only' : 'Set Read-Only' }}
+      </div>
       <div
         v-if="contextMenuVolume"
         class="context-menu-item"
@@ -991,6 +1398,31 @@ onUnmounted(() => {
           <button @click="closeEditLabelModal" class="cancel-btn" :disabled="savingLabel">Cancel</button>
           <button @click="saveLabel" class="create-btn" :disabled="savingLabel">
             {{ savingLabel ? 'Saving...' : 'Save' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Edit Comment Modal -->
+    <div v-if="showEditCommentModal" class="modal-overlay" @click="closeEditCommentModal">
+      <div class="modal" @click.stop style="max-width: 400px;">
+        <div class="modal-header">
+          <h2>Edit Comment</h2>
+          <button @click="closeEditCommentModal" class="close-btn">&times;</button>
+        </div>
+        <div class="modal-body">
+          <label class="form-label">Volume Comment</label>
+          <textarea
+            v-model="editCommentValue"
+            class="form-input"
+            rows="4"
+            placeholder="Enter comment (optional)"
+          ></textarea>
+        </div>
+        <div class="modal-footer">
+          <button @click="closeEditCommentModal" class="cancel-btn" :disabled="savingComment">Cancel</button>
+          <button @click="saveComment" class="create-btn" :disabled="savingComment">
+            {{ savingComment ? 'Saving...' : 'Save' }}
           </button>
         </div>
       </div>
@@ -1394,6 +1826,87 @@ h2 {
   font-weight: 500;
 }
 
+.storage-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.storage-tab {
+  padding: 8px 16px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  color: #888;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  font-family: inherit;
+}
+
+.storage-tab:hover {
+  color: #555;
+}
+
+.storage-tab.active {
+  color: #2196F3;
+  border-bottom-color: #2196F3;
+}
+
+/* Volume id + group.index label cell */
+.vol-id-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vol-id-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  color: white;
+  font-weight: 700;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.vol-group-label {
+  background-color: #eceff1;
+  color: #555;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.vol-unassigned-badge {
+  display: inline-flex;
+  align-items: center;
+  background-color: #eceff1;
+  color: #888;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* Non-volumed drives are visually muted and pinned to the bottom of the list */
+.storage-table tr.storage-row-unassigned td {
+  color: #999;
+}
+
+.storage-table tr.storage-row-unassigned td.device-cell {
+  color: #999;
+}
+
 .storage-stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -1428,7 +1941,7 @@ h2 {
 .storage-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 720px;
+  min-width: 860px;
 }
 
 .storage-table th,
@@ -1455,6 +1968,239 @@ h2 {
 .storage-table td {
   color: #333;
   font-size: 14px;
+}
+
+.storage-table td.device-cell {
+  text-align: left;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #555;
+}
+
+.storage-table td.comment-cell {
+  text-align: left;
+  max-width: 200px;
+}
+
+.comment-cell .comment-text {
+  display: block;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #777;
+  font-size: 13px;
+}
+
+.comment-value {
+  display: inline-block;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.fullness-cell {
+  min-width: 150px;
+}
+
+.fullness {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.fullness-bar {
+  position: relative;
+  flex: 1;
+  max-width: 110px;
+  height: 8px;
+  background-color: #e8e8e8;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.fullness-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.fullness-ok .fullness-fill {
+  background-color: #2e9e5b;
+}
+
+.fullness-warn .fullness-fill {
+  background-color: #d9a400;
+}
+
+.fullness-critical .fullness-fill {
+  background-color: #d64545;
+}
+
+.fullness-label {
+  min-width: 36px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #333;
+}
+
+.fullness-unknown {
+  color: #999;
+}
+
+/* Volumes view: shared toolbar + view toggle */
+.volumes-view {
+  margin-top: 18px;
+}
+
+.volumes-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.view-toggle {
+  display: inline-flex;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  overflow: hidden;
+  background-color: white;
+}
+
+.view-toggle-btn {
+  padding: 6px 16px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: #666;
+  font-family: inherit;
+}
+
+.view-toggle-btn + .view-toggle-btn {
+  border-left: 1px solid #ddd;
+}
+
+.view-toggle-btn:hover {
+  background-color: #f5f5f5;
+}
+
+.view-toggle-btn.active {
+  background-color: #2196F3;
+  color: white;
+}
+
+.volumes-empty,
+.storage-empty {
+  color: #888;
+  font-size: 14px;
+  padding: 16px 0;
+}
+
+/* Sortable table headers */
+.storage-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.storage-table th.sortable:hover {
+  color: #2196F3;
+}
+
+.storage-table th.sort-active {
+  color: #2196F3;
+}
+
+.sort-arrow {
+  margin-left: 4px;
+  font-size: 10px;
+}
+
+/* Status badges (table view) */
+.status-cell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
+.state-badge {
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: white;
+  white-space: nowrap;
+}
+
+.state-badge.ro {
+  background-color: #f9a825;
+}
+
+.state-badge.disabled {
+  background-color: #757575;
+}
+
+.state-badge.offline {
+  background-color: #f44336;
+}
+
+.state-badge.err {
+  background-color: #ff9800;
+}
+
+.state-muted {
+  color: #bbb;
+}
+
+/* Per-row / per-tile action buttons */
+.actions-col {
+  width: 36px;
+  text-align: center !important;
+}
+
+.row-action-btn {
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  color: #888;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: inherit;
+}
+
+.row-action-btn:hover {
+  background-color: #f0f0f0;
+  color: #333;
+}
+
+.tile-action-btn {
+  border: none;
+  background-color: rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  color: white;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 700;
+  font-family: inherit;
+}
+
+.tile-action-btn:hover {
+  background-color: rgba(0, 0, 0, 0.45);
+}
+
+.ro-badge {
+  background-color: rgba(0, 0, 0, 0.4);
 }
 
 /* Modal Styles */

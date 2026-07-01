@@ -5,6 +5,7 @@ import type { Severity } from '../notify/notifier';
 import { notificationService, NotificationService } from '../notify/service';
 import { remediationService, RemediationService } from './service';
 import type { RepairBlockDetails, SliceFault } from './fault';
+import { isMaintenanceFrozen } from '../maintenance';
 
 type VerifySliceResult = { ok: boolean; volumeId: number | null };
 type VerifyResult = Record<string, VerifySliceResult>;
@@ -167,6 +168,12 @@ export class RepairWorker {
     }
 
     async processFaults(): Promise<void> {
+        // Single convergence point for ALL repair work — covers the periodic
+        // poll, fault subscriptions, and wake()/scheduleProcess() callers (e.g.
+        // io/manager on volume register/availability changes). Gating here keeps
+        // every repair path off while frozen, even when start() was never called.
+        if (await isMaintenanceFrozen())
+            return;
         if (this.stopping)
             return;
         if (this.running) {

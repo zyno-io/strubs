@@ -1,16 +1,18 @@
 import { database, type SliceErrorInfo } from '../database';
+import { categorizeSliceError } from '../slice-error';
 import { createLogger } from '../log';
 import { fileObjectService, type FileObjectService } from '../io/file-object/service';
 import type { FileObject, StoredObjectRecord } from '../io/file-object';
-import { FileObjectSliceVerifier } from '../io/file-object/slice-verifier';
+import { FileObjectSliceVerifier, type VerifyMode } from '../io/file-object/slice-verifier';
 import { createError } from '../helpers';
 import { buildObjectVerificationStateUpdate } from '../verification-state';
+import { isMaintenanceFrozen } from '../maintenance';
 
 type VerifyFileJobDeps = {
     database: typeof database;
     fileObjectService: FileObjectService;
     createLogger: typeof createLogger;
-    createSliceVerifier: (object: FileObject) => { verifySlice: (sliceIndex: number) => Promise<void> };
+    createSliceVerifier: (object: FileObject, mode: VerifyMode) => { verifySlice: (sliceIndex: number) => Promise<void> };
 };
 
 type SliceVerifier = ReturnType<VerifyFileJobDeps['createSliceVerifier']>;
@@ -29,7 +31,7 @@ const defaultDeps: VerifyFileJobDeps = {
     database,
     fileObjectService,
     createLogger,
-    createSliceVerifier: (object: FileObject) => new FileObjectSliceVerifier(object)
+    createSliceVerifier: (object: FileObject, mode: VerifyMode) => new FileObjectSliceVerifier(object, { mode })
 };
 
 export class VerifyFileJob {
@@ -41,7 +43,14 @@ export class VerifyFileJob {
         this.log = this.deps.createLogger('verify-file');
     }
 
-    async verify(objectId: string): Promise<VerifyFileJobResult> {
+    async verify(objectId: string, opts?: { mode?: VerifyMode }): Promise<VerifyFileJobResult> {
+        const mode: VerifyMode = opts?.mode === 'light' ? 'light' : 'full';
+        // Respected by both the on-demand mgmt API and the repair worker's
+        // re-verify path: a clear error (rather than a no-op empty result, which
+        // would read as "all slices bad") keeps callers from acting on a frozen
+        // system.
+        if (await isMaintenanceFrozen())
+            throw createError('EMAINTENANCE', 'maintenance freeze active; verification disabled');
         const record = await this.loadFileRecord(objectId);
         this.log('verifying object %s', record.id);
 
@@ -59,7 +68,7 @@ export class VerifyFileJob {
             tasks.push(
                 this.verifySliceIndex(
                     record,
-                    () => this.deps.createSliceVerifier(object),
+                    () => this.deps.createSliceVerifier(object, mode),
                     sliceIndex,
                     sliceResults,
                     sliceErrors
@@ -123,9 +132,15 @@ export class VerifyFileJob {
         const sliceIndex = typeof errorObj.sliceIndex === 'number' ? errorObj.sliceIndex : null;
         const descriptor = this.describeSlice(record, sliceIndex);
         const isChecksum = errorObj.code === 'ECHECKSUM';
-        const info: SliceErrorInfo = isChecksum
-            ? { checksum: true }
-            : { err: errorObj.message ?? String(err) };
+        const message = errorObj.message ?? String(err);
+        const info: SliceErrorInfo = {
+            code: errorObj.code,
+            category: categorizeSliceError(errorObj.code, message)
+        };
+        if (isChecksum)
+            info.checksum = true;
+        else
+            info.err = message;
         if (descriptor.type === 'data' || descriptor.type === 'parity')
             info.type = descriptor.type;
         const volumeId = errorObj.volumeId ?? descriptor.volumeId ?? null;
