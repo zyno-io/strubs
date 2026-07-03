@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
+import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue';
 import type { VolumeStatus, BlockDevice } from '@strubs/server/http/mgmt';
 
 const volumes = ref<VolumeStatus[]>([]);
@@ -667,10 +667,29 @@ const contextMenuVolume = computed<VolumeStatus | null>(() => {
   return volumes.value.find(v => v.id === contextMenu.value.volumeId) ?? null;
 });
 
+const contextMenuEl = ref<HTMLElement | null>(null);
+
+// Open the menu at the click point, then (once it has rendered and we know its real size) nudge it
+// back inside the viewport so it never falls off the right or bottom edge.
+function openContextMenuAt(x: number, y: number, volumeId: number): void {
+  contextMenu.value = { x, y, volumeId };
+  nextTick(() => {
+    const el = contextMenuEl.value;
+    if (!el) return;
+    const margin = 8;
+    const maxX = window.innerWidth - el.offsetWidth - margin;
+    const maxY = window.innerHeight - el.offsetHeight - margin;
+    const nx = Math.max(margin, Math.min(x, maxX));
+    const ny = Math.max(margin, Math.min(y, maxY));
+    if (nx !== x || ny !== y)
+      contextMenu.value = { x: nx, y: ny, volumeId };
+  });
+}
+
 // Show context menu on right-click
 function showContextMenu(event: MouseEvent, volumeId: number): void {
   event.preventDefault();
-  contextMenu.value = { x: event.clientX, y: event.clientY, volumeId };
+  openContextMenuAt(event.clientX, event.clientY, volumeId);
 }
 
 // Hide context menu
@@ -897,7 +916,7 @@ function setSort(field: 'volumeLabel' | 'volumeId' | 'name' | 'path'): void {
 // Mirrors the right-click context menu the grid tiles use. `.stop` on the caller
 // prevents the document click handler from immediately closing the menu.
 function openRowMenu(event: MouseEvent, volumeId: number): void {
-  contextMenu.value = { x: event.clientX, y: event.clientY, volumeId };
+  openContextMenuAt(event.clientX, event.clientY, volumeId);
 }
 
 // Delete volume with confirmation
@@ -1400,6 +1419,7 @@ onUnmounted(() => {
     <!-- Context Menu -->
     <div
       v-if="contextMenu.volumeId !== null"
+      ref="contextMenuEl"
       class="context-menu"
       :style="{ top: `${contextMenu.y}px`, left: `${contextMenu.x}px` }"
       @click.stop
