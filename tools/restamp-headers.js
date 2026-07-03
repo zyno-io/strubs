@@ -111,7 +111,13 @@ async function dataHashesOk(fh, sz, cs){ if(!(cs>FH+CH))return null; const lay=l
     if(APPLY && batch.length>=1000) await flush();
   };
 
-  const q={ isFile:true, sliceErrors:{$exists:true} };
+  // Default scope = the light-verify-flagged set (sliceErrors). --missed targets the cohort light-verify
+  // never covered (lastVerifiedAt before the light run, or absent) -- discovered by the full verify to
+  // carry the same re-stampable id-mismatch. Data is verified before any patch either way.
+  const MISSED = process.argv.includes('--missed');
+  const q = MISSED
+    ? { isFile:true, $or:[ { lastVerifiedAt:{ $lt:new Date('2026-06-30T02:00:00Z') } }, { lastVerifiedAt:{ $exists:false } } ] }
+    : { isFile:true, sliceErrors:{$exists:true} };
   if(CONTAINER){ try{ q.containerId=new ObjectId(CONTAINER); }catch{ q.containerId=CONTAINER; } }
   const cur=C.find(q,{projection:{dataVolumes:1,parityVolumes:1,chunkSize:1}}).batchSize(2000).addCursorFlag('noCursorTimeout',true);
   const inflight=new Set();
