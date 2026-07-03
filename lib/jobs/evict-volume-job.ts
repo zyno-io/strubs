@@ -33,49 +33,13 @@ type EvictVolumeJobDeps = {
     delayMs: number;
 };
 
-async function copyFile(sourceVol: Volume, targetVol: Volume, fileName: string): Promise<boolean> {
-    let src; let dst;
-    try { src = await sourceVol.openCommittedFh(fileName); }
-    catch { return false; }                              // offline / missing -> reconstruct instead
-    try {
-        dst = await targetVol.createTemporaryFh(fileName);
-        const buf = Buffer.allocUnsafe(1 << 20);
-        let pos = 0;
-        for (;;) {
-            const { bytesRead } = await src.read(buf, 0, buf.length, pos);
-            if (!bytesRead) break;
-            let written = 0;
-            while (written < bytesRead) { const r = await dst.write(buf, written, bytesRead - written); written += r.bytesWritten; }
-            pos += bytesRead;
-        }
-        await dst.close(); dst = undefined;
-        await targetVol.commitTemporaryFile(fileName);
-        return true;
-    }
-    catch { if (dst) await dst.close().catch(() => undefined); return false; }
-    finally { await src.close().catch(() => undefined); }
-}
-
 const defaultDeps: EvictVolumeJobDeps = {
     database,
     getWritableVolumes: () => ioManager.getWritableVolumes(),
     getVolume: (id: number) => ioManager.getVolume(id),
     tryCopyRelocate: async (object: LoadedObject, sliceIndex: number, fileName: string, sourceVol: Volume, targetVol: Volume) => {
-        if (!sourceVol.isReadable || !targetVol.isWritable)
-            return false;
-        if (!await copyFile(sourceVol, targetVol, fileName))
-            return false;
-        // Validate the copied slice (the object's ref for this index now points at the target): open +
-        // checksum every chunk. If the copy doesn't validate, drop it and fall back to reconstruct.
-        try {
-            const { FileObjectSliceVerifier } = require('../io/file-object/slice-verifier') as typeof import('../io/file-object/slice-verifier');
-            await new FileObjectSliceVerifier(object as never).verifySlice(sliceIndex);
-            return true;
-        }
-        catch {
-            await targetVol.deleteCommittedFile(fileName).catch(() => undefined);
-            return false;
-        }
+        const { relocateByCopy } = require('../io/slice-relocator') as typeof import('../io/slice-relocator');
+        return relocateByCopy(object as never, sliceIndex, fileName, sourceVol, targetVol);
     },
     // Lazily required so importing this module (and mgmt/core) never pulls the native reed-solomon
     // binding via the reader unless a real drain actually runs.
@@ -272,7 +236,7 @@ export class EvictVolumeJob {
                 throw err;
             }
         }
-        const flipped = placed && await this.deps.database.replaceObjectVolumeRef(doc._id, volumeId, object.dataSliceVolumeIds, object.paritySliceVolumeIds);
+        const flipped = placed && await this.deps.database.replaceObjectVolumeRef(doc._id, volumeId, object.dataSliceVolumeIds, object.paritySliceVolumeIds, target.id);
         if (flipped)
             s.relocated++;
     }

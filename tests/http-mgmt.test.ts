@@ -84,6 +84,18 @@ vi.mock('../lib/jobs/evict-volume-job', () => ({
     }
 }));
 
+const rebalanceStartMock = vi.fn().mockResolvedValue(undefined);
+const rebalanceCancelMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('../lib/jobs/rebalance-job', () => ({
+    rebalanceJob: {
+        start: rebalanceStartMock,
+        cancel: rebalanceCancelMock,
+        stop: vi.fn(),
+        isRunning: () => false,
+        resumePendingJob: vi.fn()
+    }
+}));
+
 vi.mock('../lib/io/volume-smart-monitor', () => ({
     volumeSmartMonitor: volumeSmartMonitorMock
 }));
@@ -1081,6 +1093,27 @@ describe('HttpMgmt.handle', () => {
         expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(7, { isEvicting: true });
         expect(ioManagerMock.updateVolumeFlags).toHaveBeenCalledWith(7, { isEvicting: true });
         expect(evictStartMock).toHaveBeenCalledWith(7);
+    });
+
+    it('starts a rebalance via POST /$/rebalance with options', async () => {
+        rebalanceStartMock.mockClear();
+        const req = createRequest('POST', '/$/rebalance', { deadband: 0.03, maxMoves: 1000 });
+        const response = await HttpMgmt.handle(18, req, nullResponse);
+        expect(response).toEqual({ rebalancing: true });
+        expect(rebalanceStartMock).toHaveBeenCalledWith({ deadband: 0.03, maxMoves: 1000 });
+    });
+
+    it('rejects an out-of-range rebalance deadband', async () => {
+        const req = createRequest('POST', '/$/rebalance', { deadband: 0.9 });
+        await expect(HttpMgmt.handle(18, req, nullResponse)).rejects.toBeInstanceOf(HttpBadRequestError);
+    });
+
+    it('cancels a rebalance via DELETE /$/rebalance', async () => {
+        rebalanceCancelMock.mockClear();
+        const req = createRequest('DELETE', '/$/rebalance');
+        const response = await HttpMgmt.handle(19, req, nullResponse);
+        expect(response).toEqual({ rebalancing: false });
+        expect(rebalanceCancelMock).toHaveBeenCalled();
     });
 
     it('updates volume flags via PUT', async () => {

@@ -53,7 +53,7 @@ describe('EvictVolumeJob', () => {
         const [relocatedObject, sliceIndex] = deps.repairSlice.mock.calls[0];
         expect(sliceIndex).toBe(0);
         expect(relocatedObject.dataSliceVolumeIds[0]).toBe(21); // repointed off volume 5 before rebuild
-        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, [21, 10, 11, 12], [13, 14]);
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, [21, 10, 11, 12], [13, 14], 21);
     });
 
     it('uses copy-first when the source is online and the copy validates (no reconstruction)', async () => {
@@ -62,7 +62,7 @@ describe('EvictVolumeJob', () => {
 
         expect(deps.tryCopyRelocate).toHaveBeenCalledTimes(1);
         expect(deps.repairSlice).not.toHaveBeenCalled(); // copy succeeded -> no RS
-        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, [21, 10, 11, 12], [13, 14]);
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, [21, 10, 11, 12], [13, 14], 21);
     });
 
     it('falls back to reconstruction when the copy declines or fails', async () => {

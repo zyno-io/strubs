@@ -6,6 +6,7 @@ import { ioManager } from './io/manager';
 import { serverManager } from './server/manager';
 import { verifyVolumesJob } from './jobs/verify-volumes-job';
 import { evictVolumeJob } from './jobs/evict-volume-job';
+import { rebalanceJob } from './jobs/rebalance-job';
 import { verifyScheduler } from './jobs/verify-scheduler';
 import { createLogger } from './log';
 import { volumeSmartMonitor } from './io/volume-smart-monitor';
@@ -87,6 +88,8 @@ export class Core {
                     backlogDelayMs: config.repairBacklogDelayMs,
                     blockedRetryMs: config.repairBlockedRetryMs
                 });
+                // Rebalance is optional housekeeping — resume last, after evict + verify + repair.
+                await rebalanceJob.resumePendingJob();
             }
             volumeHealthMonitor.start(config.volumeHealthIntervalMs, config.volumeFaultThreshold);
             storageStatsTracker.start({

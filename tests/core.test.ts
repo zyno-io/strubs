@@ -48,6 +48,15 @@ vi.mock('../lib/jobs/evict-volume-job', () => ({
     }
 }));
 
+const rebalanceResumeMock = vi.fn();
+const rebalanceStopMock = vi.fn();
+vi.mock('../lib/jobs/rebalance-job', () => ({
+    rebalanceJob: {
+        resumePendingJob: rebalanceResumeMock,
+        stop: rebalanceStopMock
+    }
+}));
+
 const smartMonitorStartMock = vi.fn();
 const smartMonitorStopMock = vi.fn();
 vi.mock('../lib/io/volume-smart-monitor', () => ({

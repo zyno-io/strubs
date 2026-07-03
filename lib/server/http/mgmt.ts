@@ -8,6 +8,7 @@ import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
 import { evictVolumeJob } from '../../jobs/evict-volume-job';
+import { rebalanceJob } from '../../jobs/rebalance-job';
 import { verifyFileJob } from '../../jobs/verify-file-job';
 import { verifyScheduler } from '../../jobs/verify-scheduler';
 import { repairWorker } from '../../remediation/repair-worker';
@@ -403,10 +404,11 @@ export class HttpMgmt {
             verifyScheduler.stop();
             repairWorker.stop();
             evictVolumeJob.stop();
+            rebalanceJob.stop();
             await verifyVolumesJob.stop({ preserveState: true });
         }
         else {
-            // Evictions run before routine maintenance: resume any pending drain first.
+            // Evictions run before routine maintenance; rebalance (housekeeping) resumes last.
             await evictVolumeJob.resumePendingJob();
             verifyScheduler.start(config.scrubIntervalMs);
             repairWorker.start(config.repairIntervalMs, {
@@ -414,6 +416,7 @@ export class HttpMgmt {
                 backlogDelayMs: config.repairBacklogDelayMs,
                 blockedRetryMs: config.repairBlockedRetryMs
             });
+            await rebalanceJob.resumePendingJob();
         }
         return { frozen };
     }
@@ -560,6 +563,32 @@ export class HttpMgmt {
         await database.updateVolumeFlags(id, { isEvicting: false });
         await ioManager.updateVolumeFlags(id, { isEvicting: false });
         return { evicting: false, volumeId: id };
+    }
+
+    private static async handleRebalanceStartRequest(req: HttpRequest): Promise<{ rebalancing: boolean }> {
+        const payload = await this.parseJsonBody<{ deadband?: unknown; maxMoves?: unknown }>(req);
+        const options: { deadband?: number; maxMoves?: number } = {};
+        if (payload.deadband !== undefined) {
+            if (typeof payload.deadband !== 'number' || payload.deadband < 0 || payload.deadband > 0.5)
+                throw new HttpBadRequestError('deadband must be a number in [0, 0.5]');
+            options.deadband = payload.deadband;
+        }
+        if (payload.maxMoves !== undefined) {
+            if (typeof payload.maxMoves !== 'number' || payload.maxMoves <= 0)
+                throw new HttpBadRequestError('maxMoves must be a positive number');
+            options.maxMoves = payload.maxMoves;
+        }
+        await rebalanceJob.start(options);
+        return { rebalancing: true };
+    }
+
+    private static async handleRebalanceStatusRequest(): Promise<{ running: boolean }> {
+        return { running: rebalanceJob.isRunning() };
+    }
+
+    private static async handleRebalanceCancelRequest(): Promise<{ rebalancing: boolean }> {
+        await rebalanceJob.cancel();
+        return { rebalancing: false };
     }
 
     private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
@@ -810,6 +839,21 @@ export class HttpMgmt {
                 method: 'DELETE',
                 match: url => this.matchVolumeEvictRoute(url),
                 handler: async (_req, params) => this.handleVolumeEvictCancelRequest(params)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/rebalance' ? {} : null,
+                handler: async req => this.handleRebalanceStartRequest(req)
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/rebalance' ? {} : null,
+                handler: async () => this.handleRebalanceStatusRequest()
+            },
+            {
+                method: 'DELETE',
+                match: url => url === '/$/rebalance' ? {} : null,
+                handler: async () => this.handleRebalanceCancelRequest()
             },
             {
                 method: 'POST',
