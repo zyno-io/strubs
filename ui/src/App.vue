@@ -465,7 +465,9 @@ async function fetchData(): Promise<void> {
       throw new Error('Failed to fetch data');
     }
 
-    volumes.value = await volumesRes.json();
+    // Never show soft-deleted volumes, even if the API returns one (e.g. a live delete whose
+    // in-memory flag hasn't propagated yet -- it only reliably drops out after a restart).
+    volumes.value = (await volumesRes.json() as VolumeStatus[]).filter(v => !v.isDeleted);
     blockDevices.value = await blockDevicesRes.json();
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Unknown error';
@@ -490,7 +492,9 @@ async function refreshDevices(): Promise<void> {
       throw new Error('Failed to refresh data');
     }
 
-    volumes.value = await volumesRes.json();
+    // Never show soft-deleted volumes, even if the API returns one (e.g. a live delete whose
+    // in-memory flag hasn't propagated yet -- it only reliably drops out after a restart).
+    volumes.value = (await volumesRes.json() as VolumeStatus[]).filter(v => !v.isDeleted);
     blockDevices.value = await blockDevicesRes.json();
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Unknown error';
