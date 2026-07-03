@@ -31,6 +31,7 @@ export interface VolumeConfig {
     label?: string | null;
     comment?: string | null;
     is_deleted?: boolean;
+    is_evicting?: boolean;
 }
 
 export type PersistedVolumeConfig = VolumeConfig & { is_deleted?: boolean };
@@ -49,6 +50,10 @@ export class Volume extends EventEmitter {
     public isHealthy: boolean;
     public isReadOnly: boolean;
     public isDeleted: boolean;
+    // Evicting: the operator has asked to remove this drive. Its slices are being reconstructed and
+    // relocated onto healthy volumes. It stays READABLE (reads still serve during the drain) but is
+    // NOT writable (no new placement, no in-place repair) so the drain is the only thing moving it.
+    public isEvicting: boolean;
     public deviceSerial: string | null;
     public deviceModel: string | null = null;
     public deviceVendor: string | null = null;
@@ -73,6 +78,7 @@ export class Volume extends EventEmitter {
         this.uuid = inConfig.uuid;
 
         this.isDeleted = inConfig.is_deleted === true;
+        this.isEvicting = inConfig.is_evicting === true;
         this.isEnabled = inConfig.enabled && !this.isDeleted;
         this.isHealthy = inConfig.healthy;
         this.isReadOnly = inConfig.read_only;
@@ -115,6 +121,10 @@ export class Volume extends EventEmitter {
 
     setEnabled(flag: boolean): void {
         this.isEnabled = flag && !this.isDeleted;
+    }
+
+    setEvicting(flag: boolean): void {
+        this.isEvicting = flag;
     }
 
     setVerifyErrors(errors: VolumeVerifyErrors | null): void {
@@ -375,7 +385,7 @@ export class Volume extends EventEmitter {
     }
 
     get isWritable() {
-        return this.isStarted && this.isEnabled && this.isHealthy && !this.isReadOnly;
+        return this.isStarted && this.isEnabled && this.isHealthy && !this.isReadOnly && !this.isEvicting;
     }
 
     async createTemporaryFh(fileName: string): Promise<FileHandle> {

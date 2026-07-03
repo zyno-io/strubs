@@ -319,6 +319,45 @@ export class ContentRepository {
         );
     }
 
+    // --- drain/evict support ---
+
+    // Objects with a slice on any of the given volumes, _id-ordered for cursor resume.
+    async findObjectsOnVolume(volumeIds: number[], limit: number, afterId?: ObjectIdentifier): Promise<ContentDocument[]> {
+        if (!volumeIds.length)
+            return [];
+        const afterFilter = this.idAfterFilter(afterId);
+        const query: Filter<ContentDocument> = {
+            isFile: true,
+            ...(afterFilter ?? {}),
+            $or: [{ dataVolumes: { $in: volumeIds } }, { parityVolumes: { $in: volumeIds } }]
+        };
+        const objects = await this.collection.find<ContentDocument>(query, { sort: { _id: 1 }, limit }).toArray();
+        return objects.map(object => this.normalize(object));
+    }
+
+    // Count objects with a slice on the volume. excludeDead omits recoveryComment'd objects
+    // (documented-unrecoverable / accepted-loss), so a fully-drained volume whose only remaining
+    // refs are dead objects reports 0 -> removable.
+    async countObjectsOnVolume(volumeId: number, opts?: { excludeDead?: boolean }): Promise<number> {
+        const query: Filter<ContentDocument> = {
+            isFile: true,
+            $or: [{ dataVolumes: volumeId }, { parityVolumes: volumeId }]
+        };
+        if (opts?.excludeDead)
+            (query as Record<string, unknown>).recoveryComment = { $exists: false };
+        return this.collection.countDocuments(query);
+    }
+
+    // Atomic ref-flip after a slice is relocated + verified: only applies if the object still
+    // references the source volume (safe against re-runs and concurrent changes). move-then-flip.
+    async replaceObjectVolumeRef(id: ObjectIdentifier, fromVolumeId: number, dataVolumes: number[], parityVolumes: number[]): Promise<boolean> {
+        const result = await this.collection.updateOne(
+            { _id: this.toMongoId(id) as ObjectId, $or: [{ dataVolumes: fromVolumeId }, { parityVolumes: fromVolumeId }] },
+            { $set: { dataVolumes, parityVolumes } }
+        );
+        return result.modifiedCount === 1;
+    }
+
     private async populateVolumeStorageStats(snapshot: StorageStatsSnapshot, field: 'dataVolumes' | 'parityVolumes', type: 'data' | 'parity'): Promise<void> {
         const rows = await this.collection.aggregate<{
             volumeId: number;

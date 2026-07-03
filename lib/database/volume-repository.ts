@@ -27,7 +27,7 @@ export class VolumeRepository {
         );
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isEvicting?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
         const set: Record<string, unknown> = {};
         const unset: Record<string, unknown> = {};
         if (changes.isEnabled !== undefined)
@@ -36,6 +36,8 @@ export class VolumeRepository {
             set.read_only = changes.isReadOnly;
         if (changes.isDeleted !== undefined)
             set.is_deleted = changes.isDeleted;
+        if (changes.isEvicting !== undefined)
+            set.is_evicting = changes.isEvicting;
         if (changes.isHealthy !== undefined)
             set.healthy = changes.isHealthy;
         if (changes.label !== undefined) {

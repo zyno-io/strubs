@@ -64,10 +64,23 @@ vi.mock('../lib/storage/stats-tracker', () => ({
     storageStatsTracker: storageStatsTrackerMock
 }));
 
+const databaseCountOnVolumeMock = vi.fn().mockResolvedValue(0);
 vi.mock('../lib/database', () => ({
     database: {
         softDeleteVolume: databaseSoftDeleteMock,
-        updateVolumeFlags: databaseUpdateFlagsMock
+        updateVolumeFlags: databaseUpdateFlagsMock,
+        countObjectsOnVolume: databaseCountOnVolumeMock
+    }
+}));
+
+const evictStartMock = vi.fn().mockResolvedValue(undefined);
+const evictStopMock = vi.fn();
+vi.mock('../lib/jobs/evict-volume-job', () => ({
+    evictVolumeJob: {
+        start: evictStartMock,
+        stop: evictStopMock,
+        evictingVolumeId: () => null,
+        resumePendingJob: vi.fn()
     }
 }));
 
@@ -1041,11 +1054,33 @@ describe('HttpMgmt.handle', () => {
     it('soft deletes volumes via DELETE', async () => {
         const req = createRequest('DELETE', '/$/volumes/3');
         databaseSoftDeleteMock.mockResolvedValue(undefined);
+        databaseCountOnVolumeMock.mockResolvedValue(0);
         ioManagerMock.softDeleteVolume.mockResolvedValue(undefined);
         const response = await HttpMgmt.handle(15, req, nullResponse);
         expect(response).toEqual({ deleted: true });
         expect(databaseSoftDeleteMock).toHaveBeenCalledWith(3);
         expect(ioManagerMock.softDeleteVolume).toHaveBeenCalledWith(3);
+    });
+
+    it('blocks deleting a volume that still holds live object slices (evict first)', async () => {
+        const req = createRequest('DELETE', '/$/volumes/3');
+        databaseSoftDeleteMock.mockClear();
+        databaseCountOnVolumeMock.mockResolvedValue(1200);
+        await expect(HttpMgmt.handle(15, req, nullResponse)).rejects.toBeInstanceOf(HttpBadRequestError);
+        expect(databaseCountOnVolumeMock).toHaveBeenCalledWith(3, { excludeDead: true });
+        expect(databaseSoftDeleteMock).not.toHaveBeenCalled();
+    });
+
+    it('evicts a volume via POST /$/volumes/{id}/evict', async () => {
+        const req = createRequest('POST', '/$/volumes/7/evict');
+        databaseUpdateFlagsMock.mockResolvedValue(undefined);
+        ioManagerMock.updateVolumeFlags.mockResolvedValue(undefined);
+        evictStartMock.mockClear();
+        const response = await HttpMgmt.handle(17, req, nullResponse);
+        expect(response).toEqual({ evicting: true, volumeId: 7 });
+        expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(7, { isEvicting: true });
+        expect(ioManagerMock.updateVolumeFlags).toHaveBeenCalledWith(7, { isEvicting: true });
+        expect(evictStartMock).toHaveBeenCalledWith(7);
     });
 
     it('updates volume flags via PUT', async () => {

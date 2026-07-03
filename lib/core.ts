@@ -5,6 +5,7 @@ import { database } from './database';
 import { ioManager } from './io/manager';
 import { serverManager } from './server/manager';
 import { verifyVolumesJob } from './jobs/verify-volumes-job';
+import { evictVolumeJob } from './jobs/evict-volume-job';
 import { verifyScheduler } from './jobs/verify-scheduler';
 import { createLogger } from './log';
 import { volumeSmartMonitor } from './io/volume-smart-monitor';
@@ -73,8 +74,12 @@ export class Core {
             const frozen = await isMaintenanceFrozen();
             if (frozen)
                 log('maintenance freeze active: NOT starting verify scheduler or repair worker');
-            else
+            else {
+                // Evictions run BEFORE routine maintenance: resume a pending drain first so the
+                // scrub/repair doesn't fight it, then start the scheduler.
+                await evictVolumeJob.resumePendingJob();
                 verifyScheduler.start(config.scrubIntervalMs);
+            }
             systemLogWatcher.start(config.systemLogWatchIntervalMs);
             if (!frozen) {
                 repairWorker.start(config.repairIntervalMs, {

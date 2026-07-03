@@ -7,6 +7,7 @@ import { deviceProvisioner } from '../../io/device-provisioner';
 import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
+import { evictVolumeJob } from '../../jobs/evict-volume-job';
 import { verifyFileJob } from '../../jobs/verify-file-job';
 import { verifyScheduler } from '../../jobs/verify-scheduler';
 import { repairWorker } from '../../remediation/repair-worker';
@@ -47,6 +48,7 @@ export type VolumeStatus = {
     verifyErrors: Volume['verifyErrors'];
     mountError: string | null;
     isDeleted: boolean;
+    isEvicting: boolean;
     isSmartHealthy: boolean | null;
     smartInfoSummary: VolumeSmartSummary | null;
 };
@@ -400,9 +402,12 @@ export class HttpMgmt {
         if (frozen) {
             verifyScheduler.stop();
             repairWorker.stop();
+            evictVolumeJob.stop();
             await verifyVolumesJob.stop({ preserveState: true });
         }
         else {
+            // Evictions run before routine maintenance: resume any pending drain first.
+            await evictVolumeJob.resumePendingJob();
             verifyScheduler.start(config.scrubIntervalMs);
             repairWorker.start(config.repairIntervalMs, {
                 batchSize: config.repairBatchSize,
@@ -523,17 +528,42 @@ export class HttpMgmt {
 
     private static async handleVolumeDeleteRequest(params: RouteParams): Promise<{ deleted: boolean }> {
         const id = this.parseVolumeId(params);
+        await this.assertVolumeRemovable(id);
         await database.softDeleteVolume(id);
         await ioManager.softDeleteVolume(id).catch(() => undefined);
         return { deleted: true };
     }
 
+    // A volume may only be removed once no LIVE object references its slices. Documented-dead objects
+    // (recoveryComment) are excluded (accepted loss). This forces an evict-first workflow so a drive is
+    // never pulled with recoverable data still on it.
+    private static async assertVolumeRemovable(id: number): Promise<void> {
+        const liveRefs = await database.countObjectsOnVolume(id, { excludeDead: true });
+        if (liveRefs > 0)
+            throw new HttpBadRequestError(`volume ${id} still holds ${liveRefs} live object slice(s); evict it first: POST /$/volumes/${id}/evict`);
+    }
+
+    private static async handleVolumeEvictRequest(params: RouteParams): Promise<{ evicting: boolean; volumeId: number }> {
+        const id = this.parseVolumeId(params);
+        // Mark evicting (excluded from placement, still readable) + persist, then start the drain.
+        await database.updateVolumeFlags(id, { isEvicting: true });
+        await ioManager.updateVolumeFlags(id, { isEvicting: true });
+        await evictVolumeJob.start(id);
+        return { evicting: true, volumeId: id };
+    }
+
     private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
-        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; label?: unknown; comment?: unknown }>(req);
+        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; isEvicting?: unknown; label?: unknown; comment?: unknown }>(req);
         const id = this.parseVolumeId(params);
 
-        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null; comment?: string | null } = {};
+        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isEvicting?: boolean; label?: string | null; comment?: string | null } = {};
         let shouldSoftDelete = false;
+
+        if (payload.isEvicting !== undefined) {
+            if (typeof payload.isEvicting !== 'boolean')
+                throw new HttpBadRequestError('isEvicting must be a boolean');
+            updates.isEvicting = payload.isEvicting;
+        }
 
         if (payload.isEnabled !== undefined) {
             if (typeof payload.isEnabled !== 'boolean')
@@ -577,6 +607,9 @@ export class HttpMgmt {
         if (!shouldSoftDelete && !Object.keys(updates).length)
             throw new HttpBadRequestError('no valid fields to update');
 
+        if (shouldSoftDelete)
+            await this.assertVolumeRemovable(id);
+
         if (shouldSoftDelete) {
             await database.softDeleteVolume(id);
             await ioManager.softDeleteVolume(id).catch(() => undefined);
@@ -586,6 +619,12 @@ export class HttpMgmt {
             await database.updateVolumeFlags(id, updates);
             await ioManager.updateVolumeFlags(id, updates);
         }
+
+        // Start the drain when eviction is turned on; cancel it when turned off.
+        if (updates.isEvicting === true)
+            await evictVolumeJob.start(id);
+        else if (updates.isEvicting === false && evictVolumeJob.evictingVolumeId() === id)
+            evictVolumeJob.stop();
 
         return { updated: true };
     }
@@ -622,6 +661,7 @@ export class HttpMgmt {
             bytesFree: volume.bytesFree,
             verifyErrors: volume.verifyErrors,
             isDeleted: volume.isDeleted,
+            isEvicting: volume.isEvicting,
             mountError: volume.mountError,
             isSmartHealthy: supportsSmart ? smartInfoSummary.isHealthy : null,
             smartInfoSummary: supportsSmart ? smartInfoSummary : null
@@ -750,6 +790,11 @@ export class HttpMgmt {
                 method: 'DELETE',
                 match: url => this.matchVolumeIdRoute(url),
                 handler: async (_req, params) => this.handleVolumeDeleteRequest(params)
+            },
+            {
+                method: 'POST',
+                match: url => this.matchVolumeEvictRoute(url),
+                handler: async (_req, params) => this.handleVolumeEvictRequest(params)
             },
             {
                 method: 'POST',
@@ -918,6 +963,13 @@ export class HttpMgmt {
 
     private static matchVolumeIdRoute(url: string): RouteParams | null {
         const match = /^\/\$\/volumes\/(\d+)$/.exec(url);
+        if (!match)
+            return null;
+        return { id: match[1] };
+    }
+
+    private static matchVolumeEvictRoute(url: string): RouteParams | null {
+        const match = /^\/\$\/volumes\/(\d+)\/evict$/.exec(url);
         if (!match)
             return null;
         return { id: match[1] };

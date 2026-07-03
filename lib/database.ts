@@ -99,7 +99,7 @@ export class Database {
         await this.volumeRepository.softDeleteVolume(id);
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isEvicting?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
         await this.volumeRepository.updateVolumeFlags(id, changes);
     }
 
@@ -155,6 +155,18 @@ export class Database {
 
     async countObjectsVerifiedSince(startedAt: Date, volumeIds?: number[]): Promise<number> {
         return this.contentRepository.countObjectsVerifiedSince(startedAt, volumeIds);
+    }
+
+    async findObjectsOnVolume(volumeIds: number[], limit: number, afterId?: ObjectIdentifier): Promise<ContentDocument[]> {
+        return this.contentRepository.findObjectsOnVolume(volumeIds, limit, afterId);
+    }
+
+    async countObjectsOnVolume(volumeId: number, opts?: { excludeDead?: boolean }): Promise<number> {
+        return this.contentRepository.countObjectsOnVolume(volumeId, opts);
+    }
+
+    async replaceObjectVolumeRef(id: ObjectIdentifier, fromVolumeId: number, dataVolumes: number[], parityVolumes: number[]): Promise<boolean> {
+        return this.contentRepository.replaceObjectVolumeRef(id, fromVolumeId, dataVolumes, parityVolumes);
     }
 
     async updateObjectVerificationState(
