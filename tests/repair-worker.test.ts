@@ -157,6 +157,24 @@ describe('RepairWorker', () => {
         expect(deps.remediationService.markRepairFailed).not.toHaveBeenCalled();
     });
 
+    it('blocks (reconstruction-mismatch) and alerts when the rebuilt object fails the md5 gate', async () => {
+        const corrupt = Object.assign(new Error('reconstruction does not match stored object md5'), { code: 'ECORRUPT' });
+        const { worker, deps } = makeWorker({
+            verifyObject: vi.fn().mockResolvedValue({ '0': { ok: false, volumeId: 1 } }),
+            repairSlice: vi.fn().mockRejectedValue(corrupt)
+        });
+        await worker.processFaults();
+
+        expect(deps.remediationService.clearFault).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairFailed).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairBlocked).toHaveBeenCalledWith(
+            '1:obj1:0',
+            'reconstruction-mismatch',
+            expect.objectContaining({ message: expect.stringContaining('does not match stored object md5') })
+        );
+        expect(deps.notificationService.notify).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }));
+    });
+
     it('records non-quorum repair failures without marking the fault blocked', async () => {
         const failure = new Error('write failed');
         const { worker, deps } = makeWorker({

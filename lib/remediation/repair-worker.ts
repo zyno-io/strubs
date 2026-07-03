@@ -417,6 +417,14 @@ export class RepairWorker {
             else if (code === 'EVOLUMEUNWRITABLE') {
                 await this.markTargetUnwritable(fault, this.repairBlockDetails(err, message, { targetVolumeId: fault.volumeId ?? undefined }));
             }
+            else if (code === 'ECORRUPT') {
+                // Reconstruction produced bytes that don't match the stored whole-object md5 (foreign/
+                // corrupt surviving slice). The repairer already refused to commit; block so we don't
+                // tight-loop, and alert -- this object's integrity cannot be restored from the array.
+                this.log.error('cannot repair %s slice %d: reconstruction does not match stored object md5', fault.objectId, fault.sliceIndex);
+                await this.deps.remediationService.markRepairBlocked(fault.key, 'reconstruction-mismatch', this.repairBlockDetails(err, message));
+                await this.notify('critical', `Cannot repair object ${fault.objectId}: reconstruction does not match stored checksum (data integrity)`, fault);
+            }
             else {
                 this.log.error('repair failed for %s slice %d: %s', fault.objectId, fault.sliceIndex, message);
                 await this.deps.remediationService.markRepairFailed(fault.key, message);
