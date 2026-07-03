@@ -264,6 +264,7 @@ describe('HttpMgmt.handle', () => {
                 bytesFree: 512,
                 verifyErrors: null,
                 isDeleted: false,
+                stateUpdatedAt: null,
                 mountError: null,
                 isSmartHealthy: true,
                 smartInfoSummary: {

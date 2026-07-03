@@ -50,6 +50,7 @@ export type VolumeStatus = {
     mountError: string | null;
     isDeleted: boolean;
     isEvicting: boolean;
+    stateUpdatedAt: string | null;
     isSmartHealthy: boolean | null;
     smartInfoSummary: VolumeSmartSummary | null;
 };
@@ -701,6 +702,7 @@ export class HttpMgmt {
             verifyErrors: volume.verifyErrors,
             isDeleted: volume.isDeleted,
             isEvicting: volume.isEvicting,
+            stateUpdatedAt: volume.stateUpdatedAt ? volume.stateUpdatedAt.toISOString() : null,
             mountError: volume.mountError,
             isSmartHealthy: supportsSmart ? smartInfoSummary.isHealthy : null,
             smartInfoSummary: supportsSmart ? smartInfoSummary : null

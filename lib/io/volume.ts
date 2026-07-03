@@ -32,6 +32,7 @@ export interface VolumeConfig {
     comment?: string | null;
     is_deleted?: boolean;
     is_evicting?: boolean;
+    state_updated_at?: Date | string | null;
 }
 
 export type PersistedVolumeConfig = VolumeConfig & { is_deleted?: boolean };
@@ -50,6 +51,8 @@ export class Volume extends EventEmitter {
     public isHealthy: boolean;
     public isReadOnly: boolean;
     public isDeleted: boolean;
+    // Timestamp of the last operational STATE change (enabled/read-only/deleted/evicting/healthy).
+    public stateUpdatedAt: Date | null;
     // Evicting: the operator has asked to remove this drive. Its slices are being reconstructed and
     // relocated onto healthy volumes. It stays READABLE (reads still serve during the drain) but is
     // NOT writable (no new placement, no in-place repair) so the drain is the only thing moving it.
@@ -78,6 +81,7 @@ export class Volume extends EventEmitter {
         this.uuid = inConfig.uuid;
 
         this.isDeleted = inConfig.is_deleted === true;
+        this.stateUpdatedAt = inConfig.state_updated_at ? new Date(inConfig.state_updated_at) : null;
         this.isEvicting = inConfig.is_evicting === true;
         this.isEnabled = inConfig.enabled && !this.isDeleted;
         this.isHealthy = inConfig.healthy;
@@ -125,6 +129,10 @@ export class Volume extends EventEmitter {
 
     setEvicting(flag: boolean): void {
         this.isEvicting = flag;
+    }
+
+    setStateUpdatedAt(when: Date): void {
+        this.stateUpdatedAt = when;
     }
 
     setVerifyErrors(errors: VolumeVerifyErrors | null): void {

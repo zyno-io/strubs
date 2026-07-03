@@ -102,6 +102,20 @@ describe('VolumeRepository.updateVolumeFlags', () => {
         const collection = { updateOne: vi.fn().mockResolvedValue(undefined) };
         const repo = new VolumeRepository(collection as any);
         await repo.updateVolumeFlags(4, { isReadOnly: true, isHealthy: false });
-        expect(collection.updateOne).toHaveBeenCalledWith({ id: 4 }, { $set: { read_only: true, healthy: false } });
+        expect(collection.updateOne).toHaveBeenCalledWith({ id: 4 }, { $set: { read_only: true, healthy: false, state_updated_at: expect.any(Date) } });
+    });
+
+    it('does NOT stamp state_updated_at for a label-only edit (annotation, not state)', async () => {
+        const collection = { updateOne: vi.fn().mockResolvedValue(undefined) };
+        const repo = new VolumeRepository(collection as any);
+        await repo.updateVolumeFlags(4, { label: 'renamed' });
+        expect(collection.updateOne).toHaveBeenCalledWith({ id: 4 }, { $set: { label: 'renamed' } });
+    });
+
+    it('stamps state_updated_at on soft delete', async () => {
+        const collection = { updateOne: vi.fn().mockResolvedValue(undefined) };
+        const repo = new VolumeRepository(collection as any);
+        await repo.softDeleteVolume(9);
+        expect(collection.updateOne).toHaveBeenCalledWith({ id: 9 }, { $set: { enabled: false, is_deleted: true, state_updated_at: expect.any(Date) } });
     });
 });

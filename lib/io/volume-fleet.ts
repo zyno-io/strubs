@@ -222,29 +222,34 @@ export class VolumeFleet {
             throw new Error('volume configuration not found');
 
         let volume: Volume | undefined = this._volumes[id];
+        let stateChanged = false;
 
         if (changes.isEvicting !== undefined) {
             config.is_evicting = changes.isEvicting;
             volume?.setEvicting(changes.isEvicting);
+            stateChanged = true;
         }
 
         if (changes.isDeleted !== undefined) {
             if (changes.isDeleted) {
-                await this.softDeleteVolume(id);
+                await this.softDeleteVolume(id);   // stamps state_updated_at itself
                 return;
             }
             config.is_deleted = false;
             volume?.unmarkDeleted();
+            stateChanged = true;
         }
 
         if (changes.isReadOnly !== undefined) {
             config.read_only = changes.isReadOnly;
             volume?.setReadOnly(changes.isReadOnly);
+            stateChanged = true;
         }
 
         if (changes.isHealthy !== undefined) {
             config.healthy = changes.isHealthy;
             volume?.setHealthy(changes.isHealthy);
+            stateChanged = true;
         }
 
         if (changes.label !== undefined) {
@@ -277,6 +282,13 @@ export class VolumeFleet {
                     await volume.stop().catch(() => undefined);
                 volume?.setEnabled(false);
             }
+            stateChanged = true;
+        }
+
+        if (stateChanged) {
+            const now = new Date();
+            config.state_updated_at = now;
+            volume?.setStateUpdatedAt(now);
         }
     }
 
@@ -286,10 +298,13 @@ export class VolumeFleet {
             return;
         await volume.stop().catch(() => undefined);
         volume.markDeleted();
+        const now = new Date();
+        volume.setStateUpdatedAt(now);
         const config = this._volumeConfig.find(cfg => cfg.id === id);
         if (config) {
             config.enabled = false;
             (config as PersistedVolumeConfig).is_deleted = true;
+            (config as PersistedVolumeConfig).state_updated_at = now;
         }
         this.deps.log('volume%d: marked as deleted', id);
     }

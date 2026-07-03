@@ -5,6 +5,9 @@ export type VolumeVerifyErrors = {
     total: number;
 };
 
+// DB keys that represent a volume's operational STATE (a change to any of these stamps state_updated_at).
+const STATE_KEYS = ['enabled', 'read_only', 'is_deleted', 'is_evicting', 'healthy'];
+
 export class VolumeRepository {
     constructor(private readonly collection: Collection<any>) {}
 
@@ -13,7 +16,7 @@ export class VolumeRepository {
     }
 
     async createVolume(volume: any): Promise<void> {
-        await this.collection.insertOne(volume);
+        await this.collection.insertOne({ state_updated_at: new Date(), ...volume });
     }
 
     async deleteVolume(id: number): Promise<void> {
@@ -23,7 +26,7 @@ export class VolumeRepository {
     async softDeleteVolume(id: number): Promise<void> {
         await this.collection.updateOne(
             { id },
-            { $set: { enabled: false, is_deleted: true } }
+            { $set: { enabled: false, is_deleted: true, state_updated_at: new Date() } }
         );
     }
 
@@ -52,6 +55,10 @@ export class VolumeRepository {
             else
                 set.comment = changes.comment;
         }
+        // Stamp state_updated_at whenever an operational STATE flag changes (not for pure label/comment
+        // edits, which are annotations rather than state).
+        if (STATE_KEYS.some(k => k in set))
+            set.state_updated_at = new Date();
         const update: Record<string, Record<string, unknown>> = {};
         if (Object.keys(set).length)
             update.$set = set;
