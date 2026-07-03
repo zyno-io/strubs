@@ -80,6 +80,10 @@ export class VerifyFileJob {
                 : record.parityVolumes[sliceIndex - record.dataVolumes.length] ?? null;
             if (this.deps.isVolumeEvicting(sliceVolumeId)) {
                 this.log('skipping slice %d of object %s: volume %s is evicting', sliceIndex, record.id, sliceVolumeId);
+                // Still mark it verified-now so lastVerifiedAt (the min across slices) advances and the
+                // object doesn't churn to the front of the scrub queue for the whole eviction; the slice
+                // is re-verified on its new volume after the drain relocates it.
+                sliceResults[String(sliceIndex)] = { ok: true, type: sliceIndex < record.dataVolumes.length ? 'data' : 'parity', volumeId: sliceVolumeId };
                 continue;
             }
             tasks.push(

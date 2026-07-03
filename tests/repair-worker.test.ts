@@ -304,6 +304,18 @@ describe('RepairWorker', () => {
         expect(deps.remediationService.markRepairBlocked).not.toHaveBeenCalled();
     });
 
+    it('never retries a reconstruction-mismatch blocked fault (no re-reconstruct / alert spam)', async () => {
+        const blocked = fault({ repairStatus: 'blocked', repairBlockedReason: 'reconstruction-mismatch', lastRepairAttemptAt: 0 });
+        const { worker, deps } = makeWorker({ blockedRetryMs: 500 });
+        deps.remediationService.listFaults.mockReturnValue([blocked]);
+
+        await worker.processFaults();
+
+        expect(deps.database.getObjectById).not.toHaveBeenCalled();
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.notificationService.notify).not.toHaveBeenCalled();
+    });
+
     it('skips repair of below-quorum objects (more bad slices than parity) without reconstructing', async () => {
         const { worker, deps } = makeWorker({
             database: { getObjectById: vi.fn().mockResolvedValue({

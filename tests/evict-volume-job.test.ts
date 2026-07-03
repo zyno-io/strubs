@@ -31,6 +31,7 @@ const makeJob = (overrides?: any) => {
         tryCopyRelocate: vi.fn().mockResolvedValue(false), // default: copy declines -> reconstruct path
         loadObject: vi.fn().mockResolvedValue(loadedObject()),
         repairSlice: vi.fn().mockResolvedValue(undefined),
+        deleteSlice: vi.fn().mockResolvedValue(undefined),
         runtimeConfig: { get: vi.fn(), set: vi.fn(), delete: vi.fn() },
         isFrozen: vi.fn().mockResolvedValue(false),
         createLogger: loggerFactory(),
@@ -53,7 +54,7 @@ describe('EvictVolumeJob', () => {
         const [relocatedObject, sliceIndex] = deps.repairSlice.mock.calls[0];
         expect(sliceIndex).toBe(0);
         expect(relocatedObject.dataSliceVolumeIds[0]).toBe(21); // repointed off volume 5 before rebuild
-        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, [21, 10, 11, 12], [13, 14], 21);
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, 21);
     });
 
     it('uses copy-first when the source is online and the copy validates (no reconstruction)', async () => {
@@ -62,7 +63,7 @@ describe('EvictVolumeJob', () => {
 
         expect(deps.tryCopyRelocate).toHaveBeenCalledTimes(1);
         expect(deps.repairSlice).not.toHaveBeenCalled(); // copy succeeded -> no RS
-        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, [21, 10, 11, 12], [13, 14], 21);
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, 21);
     });
 
     it('falls back to reconstruction when the copy declines or fails', async () => {
@@ -74,11 +75,39 @@ describe('EvictVolumeJob', () => {
         expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalled();
     });
 
+    it('recomputes (reconstructs) a parity slice instead of copying it', async () => {
+        const parityDoc = objectDoc({ dataVolumes: [10, 11, 12, 15], parityVolumes: [5, 14] });
+        const { job, deps } = makeJob({
+            database: { findObjectsOnVolume: vi.fn().mockResolvedValueOnce([parityDoc]).mockResolvedValue([]), replaceObjectVolumeRef: vi.fn().mockResolvedValue(true), getObjectById: vi.fn() },
+            loadObject: vi.fn().mockResolvedValue({ dataSliceVolumeIds: [10, 11, 12, 15], paritySliceVolumeIds: [5, 14], dataSliceCount: 4, sliceSize: 1000 }),
+            tryCopyRelocate: vi.fn().mockResolvedValue(true)
+        });
+        await runDrain(job, 5);
+        expect(deps.tryCopyRelocate).not.toHaveBeenCalled();   // parity never byte-copied
+        expect(deps.repairSlice).toHaveBeenCalledTimes(1);
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, 21);
+    });
+
+    it('drops the orphaned target copy when the flip loses a race', async () => {
+        const { job, deps } = makeJob({
+            tryCopyRelocate: vi.fn().mockResolvedValue(true),
+            database: { findObjectsOnVolume: vi.fn().mockResolvedValueOnce([objectDoc()]).mockResolvedValue([]), replaceObjectVolumeRef: vi.fn().mockResolvedValue(false), getObjectById: vi.fn() }
+        });
+        await runDrain(job, 5);
+        expect(deps.deleteSlice).toHaveBeenCalledWith(expect.objectContaining({ id: 21 }), 'obj1.0'); // clean up target orphan
+    });
+
     it('cancel() clears persisted evict state so it does not resume', async () => {
         const { job, deps } = makeJob();
         await job.cancel(5);
         expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('evictVolumeId');
         expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('evictCursorId');
+    });
+
+    it('cancel(otherVolume) does NOT clear a different volume paused/pending drain state', async () => {
+        const { job, deps } = makeJob({ runtimeConfig: { get: vi.fn().mockResolvedValue(7), set: vi.fn(), delete: vi.fn() } });
+        await job.cancel(9);   // cancel an unrelated volume; volume 7 is persisted-pending
+        expect(deps.runtimeConfig.delete).not.toHaveBeenCalled();
     });
 
     it('skips documented-dead (recoveryComment) objects without attempting reconstruction', async () => {

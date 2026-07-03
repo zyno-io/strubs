@@ -274,8 +274,9 @@ export class RepairWorker {
         if (fault.repairStatus !== 'blocked')
             return true;
 
-        // Objects marked unrecoverable never become repairable — do not retry.
-        if (fault.repairBlockedReason === 'unrecoverable')
+        // Terminal block reasons never become repairable from the array — do not retry (retrying just
+        // re-runs the same failing reconstruction and re-fires the critical alert).
+        if (fault.repairBlockedReason === 'unrecoverable' || fault.repairBlockedReason === 'reconstruction-mismatch')
             return false;
 
         if (fault.repairBlockedReason === 'target-unwritable') {

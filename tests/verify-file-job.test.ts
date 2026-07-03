@@ -110,10 +110,16 @@ describe('VerifyFileJob', () => {
 
         const result = await evictJob.verify(record.id);
 
-        expect(result['1']).toBeUndefined();          // slice on the evicting volume is skipped
+        // The evicting-volume slice is not read, but is marked verified-now (so the object doesn't churn
+        // in the scrub queue) — it never goes through the slice verifier.
+        expect(result['1']).toEqual({ ok: true, type: 'data', volumeId: 2 });
         expect(result['0']).toBeDefined();
         expect(result['2']).toBeDefined();
         expect(createSliceVerifierMock).toHaveBeenCalledTimes(2);
+        // its verification time advanced (included in the state update's verified slices)
+        expect(databaseMock.updateObjectVerificationState).toHaveBeenCalledWith(record.id, expect.objectContaining({
+            sliceVerificationTimes: { data: [expect.any(Date), expect.any(Date)], parity: [expect.any(Date)] }
+        }));
     });
 
     it('records slice errors when verification fails', async () => {

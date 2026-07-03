@@ -53,7 +53,7 @@ describe('RebalanceJob', () => {
         expect(deps.tryCopyRelocate).toHaveBeenCalledTimes(1);          // data slice -> copy-first
         expect(deps.repairSlice).not.toHaveBeenCalled();
         // flip: source 1 -> target 2, with the distinct-volume (toVolumeId) guard
-        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 1, [2, 10, 11, 12], [13, 14], 2);
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 1, 2);
         expect(deps.deleteSourceSlice).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }), 'obj1.0');
     });
 
@@ -64,7 +64,7 @@ describe('RebalanceJob', () => {
 
         expect(deps.tryCopyRelocate).not.toHaveBeenCalled();            // parity is never byte-copied
         expect(deps.repairSlice).toHaveBeenCalledTimes(1);
-        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 1, [10, 11, 12, 15], [2, 14], 2);
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 1, 2);
     });
 
     it('does nothing when the pool is already balanced (no source over the deadband)', async () => {

@@ -348,17 +348,22 @@ export class ContentRepository {
         return this.collection.countDocuments(query);
     }
 
-    // Atomic ref-flip after a slice is relocated + verified: only applies if the object still
-    // references the source volume AND (when toVolumeId is given) does not already reference the
-    // target -- enforcing the distinct-volume constraint at commit time (selection may be stale).
-    // Safe against re-runs/concurrent changes. move-then-flip.
-    async replaceObjectVolumeRef(id: ObjectIdentifier, fromVolumeId: number, dataVolumes: number[], parityVolumes: number[], toVolumeId?: number): Promise<boolean> {
-        const filter: Filter<ContentDocument> = { _id: this.toMongoId(id) as ObjectId, $or: [{ dataVolumes: fromVolumeId }, { parityVolumes: fromVolumeId }] };
-        if (typeof toVolumeId === 'number') {
-            (filter as Record<string, unknown>).dataVolumes = { $ne: toVolumeId };
-            (filter as Record<string, unknown>).parityVolumes = { $ne: toVolumeId };
-        }
-        const result = await this.collection.updateOne(filter, { $set: { dataVolumes, parityVolumes } });
+    // Atomic ref-flip after a slice is relocated + verified. POSITIONAL update (arrayFilters): rewrites
+    // only the array element(s) equal to fromVolumeId -> toVolumeId, leaving every OTHER slice position
+    // untouched, so a concurrent relocation of a DIFFERENT slice of the same object can't be clobbered
+    // by a stale whole-array write. Conditional: applies only if the object still references the source
+    // AND does not already reference the target (distinct-volume at commit). move-then-flip.
+    async replaceObjectVolumeRef(id: ObjectIdentifier, fromVolumeId: number, toVolumeId: number): Promise<boolean> {
+        const result = await this.collection.updateOne(
+            {
+                _id: this.toMongoId(id) as ObjectId,
+                dataVolumes: { $ne: toVolumeId },
+                parityVolumes: { $ne: toVolumeId },
+                $or: [{ dataVolumes: fromVolumeId }, { parityVolumes: fromVolumeId }]
+            },
+            { $set: { 'dataVolumes.$[e]': toVolumeId, 'parityVolumes.$[e]': toVolumeId } },
+            { arrayFilters: [{ e: fromVolumeId }] }
+        );
         return result.modifiedCount === 1;
     }
 

@@ -162,8 +162,7 @@ export class RebalanceJob {
                 if (this.deps.delayMs > 0)
                     await new Promise(r => setTimeout(r, this.deps.delayMs));
             }
-            cursor = String(batch[batch.length - 1]._id);
-            await this.deps.runtimeConfig.set(REBALANCE_CURSOR_KEY, `${source.id}:${cursor}`);
+            cursor = String(batch[batch.length - 1]._id); // in-source pagination only
         }
     }
 
@@ -175,7 +174,8 @@ export class RebalanceJob {
         if (idx < 0) return;
 
         const objectVols = new Set(all);
-        const sliceBytes = (doc as { sliceSize?: number }).sliceSize || Math.ceil(((doc as { size?: number }).size ?? 0) / Math.max(1, dataVols.length)) || 5e6;
+        const declared = (doc as { sliceSize?: number }).sliceSize;
+        const sliceBytes = typeof declared === 'number' ? declared : Math.ceil(((doc as { size?: number }).size ?? 0) / Math.max(1, dataVols.length));
         const dest = this.pickTarget(objectVols, sliceBytes, target);
         if (!dest) { s.noDest++; return; } // no under-target healthy volume this object can use
 
@@ -196,8 +196,9 @@ export class RebalanceJob {
             catch (err) { const code = (err as { code?: string } | undefined)?.code; if (code === 'EQUORUM' || code === 'ECORRUPT') { s.unrecoverable++; return; } throw err; }
         }
 
-        // Conditional atomic flip (target must be absent from the object -> distinct-volume at commit).
-        const flipped = await this.deps.database.replaceObjectVolumeRef(doc._id, source.id, object.dataSliceVolumeIds, object.paritySliceVolumeIds, dest.id);
+        // Positional atomic flip (only this slice's ref, source->dest; target must be absent ->
+        // distinct-volume at commit; other slice positions untouched so a concurrent move can't clobber).
+        const flipped = await this.deps.database.replaceObjectVolumeRef(doc._id, source.id, dest.id);
         if (!flipped) {
             // Someone else changed the object; drop the copy we placed and leave the source alone.
             await this.deps.deleteSourceSlice(dest, fileName).catch(() => undefined);

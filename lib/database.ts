@@ -165,8 +165,8 @@ export class Database {
         return this.contentRepository.countObjectsOnVolume(volumeId, opts);
     }
 
-    async replaceObjectVolumeRef(id: ObjectIdentifier, fromVolumeId: number, dataVolumes: number[], parityVolumes: number[], toVolumeId?: number): Promise<boolean> {
-        return this.contentRepository.replaceObjectVolumeRef(id, fromVolumeId, dataVolumes, parityVolumes, toVolumeId);
+    async replaceObjectVolumeRef(id: ObjectIdentifier, fromVolumeId: number, toVolumeId: number): Promise<boolean> {
+        return this.contentRepository.replaceObjectVolumeRef(id, fromVolumeId, toVolumeId);
     }
 
     async updateObjectVerificationState(

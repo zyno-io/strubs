@@ -22,7 +22,7 @@ async function copyFile(sourceVol: Volume, targetVol: Volume, fileName: string):
         await targetVol.commitTemporaryFile(fileName);
         return true;
     }
-    catch { if (dst) await dst.close().catch(() => undefined); return false; }
+    catch { if (dst) await dst.close().catch(() => undefined); await targetVol.deleteTemporaryFile(fileName).catch(() => undefined); return false; }
     finally { await src.close().catch(() => undefined); }
 }
 

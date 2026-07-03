@@ -26,6 +26,7 @@ type EvictVolumeJobDeps = {
     // back to reconstruct) if the source is offline/unreadable or the copy doesn't validate.
     tryCopyRelocate: (object: LoadedObject, sliceIndex: number, fileName: string, sourceVol: Volume, targetVol: Volume) => Promise<boolean>;
     repairSlice: (object: LoadedObject, sliceIndex: number) => Promise<void>;
+    deleteSlice: (vol: Volume, fileName: string) => Promise<void>;
     runtimeConfig: typeof runtimeConfig;
     isFrozen: () => Promise<boolean>;
     createLogger: typeof createLogger;
@@ -51,6 +52,7 @@ const defaultDeps: EvictVolumeJobDeps = {
         const { sliceRepairer } = require('../io/file-object/slice-repairer') as typeof import('../io/file-object/slice-repairer');
         await sliceRepairer.repair(object as never, sliceIndex);
     },
+    deleteSlice: async (vol: Volume, fileName: string) => { await vol.deleteCommittedFile(fileName); },
     runtimeConfig,
     isFrozen: isMaintenanceFrozen,
     createLogger,
@@ -116,10 +118,12 @@ export class EvictVolumeJob {
     // Operator cancel: abort the drain AND clear the persisted state so it does NOT resume. The volume
     // stays isEvicting=false is the caller's job (mgmt). Already-relocated slices keep their new homes.
     async cancel(volumeId?: number): Promise<void> {
-        if (volumeId !== undefined && this.activeVolumeId !== null && this.activeVolumeId !== volumeId) {
-            // A different drain is running; only clear any persisted pending state for the named volume.
+        if (volumeId !== undefined) {
+            // Abort/clear ONLY if the named volume is the one actually being (or pending) evicted --
+            // otherwise cancelling volume B must not wipe volume A's running or paused drain state.
             const pending = await this.deps.runtimeConfig.get(EVICT_VOLUME_ID_KEY);
-            if (pending !== volumeId)
+            const activeOrPending = this.activeVolumeId ?? (typeof pending === 'number' ? pending : null);
+            if (activeOrPending !== null && activeOrPending !== volumeId)
                 return;
         }
         this.cancelled = true;
@@ -209,21 +213,26 @@ export class EvictVolumeJob {
             return; // no longer here (already relocated / concurrent change)
 
         const objectVols = new Set(all);
-        const sliceBytes = (doc as { sliceSize?: number }).sliceSize || Math.ceil(((doc as { size?: number }).size ?? 0) / Math.max(1, dataVols.length)) || 5e6;
+        // Keep a legitimately-zero slice size as 0 (a zero-byte object needs ~no space) instead of
+        // defaulting it to a bogus large requirement that would falsely block relocation.
+        const declared = (doc as { sliceSize?: number }).sliceSize;
+        const sliceBytes = typeof declared === 'number' ? declared : Math.ceil(((doc as { size?: number }).size ?? 0) / Math.max(1, dataVols.length));
         const target = this.pickTarget(objectVols, sliceBytes);
         if (!target) { s.noDest++; this.log('no relocation target for object %s (all healthy volumes in use or full)', String((doc as { _id?: unknown })._id)); return; }
 
         const object = await this.deps.loadObject(doc);
+        const isParity = idx >= object.dataSliceCount;
         if (idx < object.dataSliceCount)
             object.dataSliceVolumeIds[idx] = target.id;
         else
             object.paritySliceVolumeIds[idx - object.dataSliceCount] = target.id;
 
-        // Copy-first (fast, healthy/online source), else reconstruct (md5-gated, works even offline).
+        // Copy-first for DATA (fast); PARITY is always RECOMPUTED (a byte-copy would preserve known-bad
+        // /foreign parity). Reconstruct is whole-object md5-gated and works even when the source is offline.
         const fileName = `${String(doc._id)}.${idx}`;
         const sourceVol = this.deps.getVolume(volumeId);
         let placed = false;
-        if (sourceVol)
+        if (sourceVol && !isParity)
             placed = await this.deps.tryCopyRelocate(object, idx, fileName, sourceVol, target);
         if (!placed) {
             try {
@@ -236,9 +245,18 @@ export class EvictVolumeJob {
                 throw err;
             }
         }
-        const flipped = placed && await this.deps.database.replaceObjectVolumeRef(doc._id, volumeId, object.dataSliceVolumeIds, object.paritySliceVolumeIds, target.id);
-        if (flipped)
-            s.relocated++;
+        if (!placed) return;
+        // Positional flip: rewrites only this slice's ref (source->target), so a concurrent relocation
+        // of another slice of the same object can't be clobbered.
+        const flipped = await this.deps.database.replaceObjectVolumeRef(doc._id, volumeId, target.id);
+        if (!flipped) {
+            await this.deps.deleteSlice(target, fileName).catch(() => undefined); // drop the orphan copy; evict keeps the source
+            return;
+        }
+        s.relocated++;
+        // Account the write so pickTarget spreads within the run (loadFromRecord objects don't
+        // self-account on commit). Evict keeps the source, so only the target changes.
+        if (typeof target.bytesFree === 'number') target.bytesFree -= sliceBytes;
     }
 
     // Emptiest healthy WRITABLE volume the object doesn't already use (evicting volumes are already
