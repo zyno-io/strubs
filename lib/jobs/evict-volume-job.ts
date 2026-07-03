@@ -19,7 +19,12 @@ type EvictSummary = { objects: number; relocated: number; unrecoverable: number;
 type EvictVolumeJobDeps = {
     database: Pick<typeof database, 'findObjectsOnVolume' | 'replaceObjectVolumeRef' | 'getObjectById'>;
     getWritableVolumes: () => Volume[];
+    getVolume: (id: number) => Volume | undefined;
     loadObject: (record: unknown) => Promise<LoadedObject>;
+    // Copy-first fast path: if the source drive is online, copy the slice file to the target and
+    // validate it (chunk checksums) -- far cheaper than RS for a HEALTHY drain. Returns false (falls
+    // back to reconstruct) if the source is offline/unreadable or the copy doesn't validate.
+    tryCopyRelocate: (object: LoadedObject, sliceIndex: number, fileName: string, sourceVol: Volume, targetVol: Volume) => Promise<boolean>;
     repairSlice: (object: LoadedObject, sliceIndex: number) => Promise<void>;
     runtimeConfig: typeof runtimeConfig;
     isFrozen: () => Promise<boolean>;
@@ -28,9 +33,50 @@ type EvictVolumeJobDeps = {
     delayMs: number;
 };
 
+async function copyFile(sourceVol: Volume, targetVol: Volume, fileName: string): Promise<boolean> {
+    let src; let dst;
+    try { src = await sourceVol.openCommittedFh(fileName); }
+    catch { return false; }                              // offline / missing -> reconstruct instead
+    try {
+        dst = await targetVol.createTemporaryFh(fileName);
+        const buf = Buffer.allocUnsafe(1 << 20);
+        let pos = 0;
+        for (;;) {
+            const { bytesRead } = await src.read(buf, 0, buf.length, pos);
+            if (!bytesRead) break;
+            let written = 0;
+            while (written < bytesRead) { const r = await dst.write(buf, written, bytesRead - written); written += r.bytesWritten; }
+            pos += bytesRead;
+        }
+        await dst.close(); dst = undefined;
+        await targetVol.commitTemporaryFile(fileName);
+        return true;
+    }
+    catch { if (dst) await dst.close().catch(() => undefined); return false; }
+    finally { await src.close().catch(() => undefined); }
+}
+
 const defaultDeps: EvictVolumeJobDeps = {
     database,
     getWritableVolumes: () => ioManager.getWritableVolumes(),
+    getVolume: (id: number) => ioManager.getVolume(id),
+    tryCopyRelocate: async (object: LoadedObject, sliceIndex: number, fileName: string, sourceVol: Volume, targetVol: Volume) => {
+        if (!sourceVol.isReadable || !targetVol.isWritable)
+            return false;
+        if (!await copyFile(sourceVol, targetVol, fileName))
+            return false;
+        // Validate the copied slice (the object's ref for this index now points at the target): open +
+        // checksum every chunk. If the copy doesn't validate, drop it and fall back to reconstruct.
+        try {
+            const { FileObjectSliceVerifier } = require('../io/file-object/slice-verifier') as typeof import('../io/file-object/slice-verifier');
+            await new FileObjectSliceVerifier(object as never).verifySlice(sliceIndex);
+            return true;
+        }
+        catch {
+            await targetVol.deleteCommittedFile(fileName).catch(() => undefined);
+            return false;
+        }
+    },
     // Lazily required so importing this module (and mgmt/core) never pulls the native reed-solomon
     // binding via the reader unless a real drain actually runs.
     loadObject: async (record: unknown) => {
@@ -48,17 +94,20 @@ const defaultDeps: EvictVolumeJobDeps = {
     delayMs: config.verifyReadDelayMs
 };
 
-// Reconstruct-and-relocate every slice a volume holds onto healthy volumes, rewriting object refs, so
-// the drive can be removed with no data loss. Reconstruct-only (no read of the source), so it works
-// even when the drive is OFFLINE. Each rebuild is whole-object md5-gated by the SliceRepairer; slices
-// that can't be reconstructed correctly (below quorum / foreign parity) are left in place and reported
-// -- they block removal until the operator accepts the loss (recoveryComment). Gated by the maintenance
-// freeze; resumes on restart ahead of the routine scrub/repair.
+// Relocate every slice a volume holds onto healthy volumes, rewriting object refs, so the drive can be
+// removed with no data loss. Per slice: COPY-FIRST (fast — copy the file off an online source and
+// validate its chunk checksums), falling back to RECONSTRUCT (rebuild from peers, whole-object md5-gated
+// by the SliceRepairer) — which needs no read of the source, so it works even when the drive is OFFLINE.
+// move-then-flip: write+verify the new slice, then flip the ref (reads never see a gap). Slices that
+// can't be rebuilt correctly (below quorum / foreign parity) are left in place and reported -- they block
+// removal until the operator accepts the loss (recoveryComment). Documented-dead objects are skipped.
+// Gated by the maintenance freeze; resumes on restart ahead of the routine scrub/repair.
 export class EvictVolumeJob {
     private readonly deps: EvictVolumeJobDeps;
     private readonly log: ReturnType<typeof createLogger>;
     private running = false;
-    private cancelled = false;
+    private cancelled = false; // paused (freeze) — persisted state kept so it resumes
+    private aborted = false;   // operator cancel — persisted state cleared so it does NOT resume
     private activeVolumeId: number | null = null;
 
     constructor(deps?: Partial<EvictVolumeJobDeps>) {
@@ -96,20 +145,44 @@ export class EvictVolumeJob {
         void this.run(volumeId, typeof cursor === 'string' ? cursor : undefined);
     }
 
+    // Pause (e.g. maintenance freeze): stop processing but KEEP the persisted evict state so the drain
+    // resumes later (resumePendingJob).
     stop(): void { this.cancelled = true; }
+
+    // Operator cancel: abort the drain AND clear the persisted state so it does NOT resume. The volume
+    // stays isEvicting=false is the caller's job (mgmt). Already-relocated slices keep their new homes.
+    async cancel(volumeId?: number): Promise<void> {
+        if (volumeId !== undefined && this.activeVolumeId !== null && this.activeVolumeId !== volumeId) {
+            // A different drain is running; only clear any persisted pending state for the named volume.
+            const pending = await this.deps.runtimeConfig.get(EVICT_VOLUME_ID_KEY);
+            if (pending !== volumeId)
+                return;
+        }
+        this.cancelled = true;
+        this.aborted = true;
+        await this.clearState();
+        this.log('eviction cancelled for volume %s', volumeId ?? this.activeVolumeId ?? '?');
+    }
+
+    private async clearState(): Promise<void> {
+        await this.deps.runtimeConfig.delete(EVICT_VOLUME_ID_KEY);
+        await this.deps.runtimeConfig.delete(EVICT_CURSOR_ID_KEY);
+    }
 
     private async run(volumeId: number, afterId: string | undefined): Promise<void> {
         if (this.running)
             return;
         this.running = true;
         this.cancelled = false;
+        this.aborted = false;
         this.activeVolumeId = volumeId;
         const s: EvictSummary = { objects: 0, relocated: 0, unrecoverable: 0, skippedDead: 0, noDest: 0 };
         this.log('evicting volume %d — reconstructing and relocating its slices', volumeId);
         try {
             let cursor = afterId;
             for (;;) {
-                if (this.cancelled) { this.log('eviction of volume %d cancelled', volumeId); return; }
+                if (this.aborted) { this.log('eviction of volume %d cancelled', volumeId); return; }
+                if (this.cancelled) { this.log('eviction of volume %d paused', volumeId); return; }
                 if (await this.deps.isFrozen()) { this.log('maintenance freeze active: pausing eviction of volume %d', volumeId); return; }
 
                 const batch = await this.deps.database.findObjectsOnVolume([volumeId], BATCH_SIZE, cursor);
@@ -117,6 +190,8 @@ export class EvictVolumeJob {
                     break;
 
                 await this.processBatch(batch, volumeId, s);
+                if (this.aborted)
+                    return;
                 cursor = String(batch[batch.length - 1]._id);
                 await this.deps.runtimeConfig.set(EVICT_CURSOR_ID_KEY, cursor);
                 if (s.objects % 1000 === 0)
@@ -124,7 +199,8 @@ export class EvictVolumeJob {
                 if (this.deps.delayMs > 0)
                     await new Promise(r => setTimeout(r, this.deps.delayMs));
             }
-            await this.finalize(volumeId, s);
+            if (!this.cancelled && !this.aborted)
+                await this.finalize(volumeId, s);
         }
         catch (err) {
             this.log.error('eviction of volume %d failed: %s', volumeId, err instanceof Error ? err.message : String(err));
@@ -132,13 +208,17 @@ export class EvictVolumeJob {
         finally {
             this.running = false;
             this.activeVolumeId = null;
+            // If an operator cancel raced a cursor write, make sure the persisted state is gone so a
+            // cancelled drain never resumes.
+            if (this.aborted)
+                await this.clearState().catch(() => undefined);
         }
     }
 
     private async processBatch(batch: ContentDocument[], volumeId: number, s: EvictSummary): Promise<void> {
         const inflight = new Set<Promise<void>>();
         for (const doc of batch) {
-            if (this.cancelled)
+            if (this.cancelled || this.aborted)
                 break;
             s.objects++;
             const p = this.drainObject(doc, volumeId, s).catch(err => {
@@ -175,15 +255,24 @@ export class EvictVolumeJob {
         else
             object.paritySliceVolumeIds[idx - object.dataSliceCount] = target.id;
 
-        try {
-            await this.deps.repairSlice(object, idx); // reconstruct from peers, md5-gated, write to target
+        // Copy-first (fast, healthy/online source), else reconstruct (md5-gated, works even offline).
+        const fileName = `${String(doc._id)}.${idx}`;
+        const sourceVol = this.deps.getVolume(volumeId);
+        let placed = false;
+        if (sourceVol)
+            placed = await this.deps.tryCopyRelocate(object, idx, fileName, sourceVol, target);
+        if (!placed) {
+            try {
+                await this.deps.repairSlice(object, idx); // reconstruct from peers, md5-gated, write to target
+                placed = true;
+            }
+            catch (err) {
+                const code = (err as { code?: string } | undefined)?.code;
+                if (code === 'EQUORUM' || code === 'ECORRUPT') { s.unrecoverable++; return; } // can't rebuild correctly; leave ref
+                throw err;
+            }
         }
-        catch (err) {
-            const code = (err as { code?: string } | undefined)?.code;
-            if (code === 'EQUORUM' || code === 'ECORRUPT') { s.unrecoverable++; return; } // can't rebuild correctly; leave ref
-            throw err;
-        }
-        const flipped = await this.deps.database.replaceObjectVolumeRef(doc._id, volumeId, object.dataSliceVolumeIds, object.paritySliceVolumeIds);
+        const flipped = placed && await this.deps.database.replaceObjectVolumeRef(doc._id, volumeId, object.dataSliceVolumeIds, object.paritySliceVolumeIds);
         if (flipped)
             s.relocated++;
     }

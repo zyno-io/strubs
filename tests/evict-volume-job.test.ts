@@ -27,6 +27,8 @@ const makeJob = (overrides?: any) => {
             { id: 20, bytesFree: 5e9, bytesPending: 0 },
             { id: 21, bytesFree: 9e9, bytesPending: 0 }
         ]),
+        getVolume: vi.fn(() => ({ id: 5, isReadable: true })),
+        tryCopyRelocate: vi.fn().mockResolvedValue(false), // default: copy declines -> reconstruct path
         loadObject: vi.fn().mockResolvedValue(loadedObject()),
         repairSlice: vi.fn().mockResolvedValue(undefined),
         runtimeConfig: { get: vi.fn(), set: vi.fn(), delete: vi.fn() },
@@ -52,6 +54,31 @@ describe('EvictVolumeJob', () => {
         expect(sliceIndex).toBe(0);
         expect(relocatedObject.dataSliceVolumeIds[0]).toBe(21); // repointed off volume 5 before rebuild
         expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, [21, 10, 11, 12], [13, 14]);
+    });
+
+    it('uses copy-first when the source is online and the copy validates (no reconstruction)', async () => {
+        const { job, deps } = makeJob({ tryCopyRelocate: vi.fn().mockResolvedValue(true) });
+        await runDrain(job, 5);
+
+        expect(deps.tryCopyRelocate).toHaveBeenCalledTimes(1);
+        expect(deps.repairSlice).not.toHaveBeenCalled(); // copy succeeded -> no RS
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, [21, 10, 11, 12], [13, 14]);
+    });
+
+    it('falls back to reconstruction when the copy declines or fails', async () => {
+        const { job, deps } = makeJob({ tryCopyRelocate: vi.fn().mockResolvedValue(false) });
+        await runDrain(job, 5);
+
+        expect(deps.tryCopyRelocate).toHaveBeenCalledTimes(1);
+        expect(deps.repairSlice).toHaveBeenCalledTimes(1);
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalled();
+    });
+
+    it('cancel() clears persisted evict state so it does not resume', async () => {
+        const { job, deps } = makeJob();
+        await job.cancel(5);
+        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('evictVolumeId');
+        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('evictCursorId');
     });
 
     it('skips documented-dead (recoveryComment) objects without attempting reconstruction', async () => {

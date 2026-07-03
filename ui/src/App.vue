@@ -851,6 +851,43 @@ async function toggleVolumeReadOnly(): Promise<void> {
   }
 }
 
+// Evict (drain) the volume, or cancel an in-progress eviction. Evict reconstructs/relocates every
+// slice the drive holds onto other healthy drives; once drained the drive can be removed. Cancel aborts
+// the drain (already-relocated slices keep their new homes).
+async function toggleVolumeEvict(): Promise<void> {
+  const volume = contextMenuVolume.value;
+  if (volume === null) return;
+
+  const volumeId = volume.id;
+  const cancelling = volume.isEvicting;
+  hideContextMenu();
+
+  if (!cancelling && !confirm(`Evict volume ${volumeId}? Its slices will be reconstructed/relocated to other drives so it can be removed. This can take a while and moves data.`)) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`${apiBaseUrl}/$/volumes/${volumeId}/evict`, {
+      method: cancelling ? 'DELETE' : 'POST'
+    });
+
+    if (!response.ok) {
+      let errorMessage = `Failed to ${cancelling ? 'cancel eviction' : 'evict'} (HTTP ${response.status})`;
+      try {
+        const text = await response.text();
+        if (text) errorMessage += `: ${text}`;
+      } catch {
+        // Ignore error reading response body
+      }
+      throw new Error(errorMessage);
+    }
+
+    await fetchData();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to update eviction';
+  }
+}
+
 // Set the shared sort field (used by the clickable table headers)
 function setSort(field: 'volumeLabel' | 'volumeId' | 'name' | 'path'): void {
   sortBy.value = field;
@@ -884,7 +921,14 @@ async function deleteVolume(): Promise<void> {
     });
 
     if (!response.ok) {
-      throw new Error('Failed to delete volume');
+      let errorMessage = `Failed to delete volume (HTTP ${response.status})`;
+      try {
+        const text = await response.text();
+        if (text) errorMessage += `: ${text}`; // e.g. "evict it first" when the drive still holds live slices
+      } catch {
+        // Ignore error reading response body
+      }
+      throw new Error(errorMessage);
     }
 
     await refreshDevices();
@@ -1150,6 +1194,7 @@ onUnmounted(() => {
                 <td>
                   <div class="status-cell">
                     <span v-if="entry.volume?.isReadOnly" class="state-badge ro" title="Read-only">RO</span>
+                    <span v-if="entry.volume?.isEvicting" class="state-badge evicting" title="Evicting (draining slices to other drives)">Evicting</span>
                     <span v-if="entry.volume && !entry.volume.isEnabled" class="state-badge disabled" title="Disabled">Disabled</span>
                     <span
                       v-else-if="entry.volume && !entry.blockDevice"
@@ -1219,6 +1264,7 @@ onUnmounted(() => {
                 <div v-if="entry.busGroup !== null" class="badge">Bus {{ entry.busGroup }}</div>
                 <div class="badge">{{ formatBytes(entry.bytesTotal) }}</div>
                 <div v-if="entry.volume?.isReadOnly" class="badge ro-badge">READ-ONLY</div>
+                <div v-if="entry.volume?.isEvicting" class="badge evicting-badge">EVICTING</div>
                 <div v-if="entry.volume && !entry.volume.isEnabled" class="badge offline-badge">DISABLED</div>
                 <div v-else-if="entry.volume && !entry.blockDevice" class="badge offline-badge">OFFLINE</div>
                 <div v-if="entry.unassigned" class="badge offline-badge">UNASSIGNED</div>
@@ -1373,6 +1419,13 @@ onUnmounted(() => {
         @click="toggleVolumeEnabled"
       >
         {{ contextMenuVolume.isEnabled ? 'Disable' : 'Enable' }}
+      </div>
+      <div
+        v-if="contextMenuVolume"
+        class="context-menu-item"
+        @click="toggleVolumeEvict"
+      >
+        {{ contextMenuVolume.isEvicting ? 'Cancel Eviction' : 'Evict (drain + remove)' }}
       </div>
       <div class="context-menu-item delete" @click="deleteVolume">Delete</div>
     </div>
@@ -2151,6 +2204,10 @@ h2 {
   background-color: #f44336;
 }
 
+.state-badge.evicting {
+  background-color: #26a69a;
+}
+
 .state-badge.err {
   background-color: #ff9800;
 }
@@ -2201,6 +2258,10 @@ h2 {
 
 .ro-badge {
   background-color: rgba(0, 0, 0, 0.4);
+}
+
+.evicting-badge {
+  background-color: rgba(38, 166, 154, 0.85);
 }
 
 /* Modal Styles */

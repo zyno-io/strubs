@@ -129,7 +129,8 @@ const md5Of = doc => (doc && doc.md5 && doc.md5.buffer) ? doc.md5.buffer : (doc 
     if (batch.length >= 200) await flush();
   };
 
-  const cur = C.find({ isFile: true, sliceErrors: { $exists: true } }).batchSize(500).addCursorFlag('noCursorTimeout', true);
+  // Skip objects already documented as dead (recoveryComment) -- they are unrecoverable from the array.
+  const cur = C.find({ isFile: true, sliceErrors: { $exists: true }, recoveryComment: { $exists: false } }).batchSize(500).addCursorFlag('noCursorTimeout', true);
   const inflight = new Set();
   for await (const doc of cur) {
     if (s.objs >= LIMIT) break; s.objs++;

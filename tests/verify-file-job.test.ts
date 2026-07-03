@@ -52,7 +52,8 @@ describe('VerifyFileJob', () => {
             database: databaseMock as unknown as DatabaseType,
             fileObjectService: fileObjectServiceMock as unknown as FileObjectServiceType,
             createSliceVerifier: createSliceVerifierMock as unknown as SliceVerifierFactory,
-            createLogger: createNoopLogger
+            createLogger: createNoopLogger,
+            isVolumeEvicting: () => false
         });
     });
 
@@ -92,6 +93,27 @@ describe('VerifyFileJob', () => {
             }
         }));
         expect(createSliceVerifierMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('skips slices on an evicting volume (the evict job is relocating them)', async () => {
+        const record = createRecord(); // dataVolumes [1,2], parityVolumes [3]
+        databaseMock.getObjectById.mockResolvedValue(record);
+        fileObjectServiceMock.load.mockResolvedValue({} as FileObject);
+        verifySliceMock.mockResolvedValue(undefined);
+        const evictJob = new VerifyFileJob({
+            database: databaseMock as unknown as DatabaseType,
+            fileObjectService: fileObjectServiceMock as unknown as FileObjectServiceType,
+            createSliceVerifier: createSliceVerifierMock as unknown as SliceVerifierFactory,
+            createLogger: createNoopLogger,
+            isVolumeEvicting: (volumeId) => volumeId === 2 // slice index 1 lives on volume 2
+        });
+
+        const result = await evictJob.verify(record.id);
+
+        expect(result['1']).toBeUndefined();          // slice on the evicting volume is skipped
+        expect(result['0']).toBeDefined();
+        expect(result['2']).toBeDefined();
+        expect(createSliceVerifierMock).toHaveBeenCalledTimes(2);
     });
 
     it('records slice errors when verification fails', async () => {

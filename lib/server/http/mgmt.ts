@@ -552,6 +552,16 @@ export class HttpMgmt {
         return { evicting: true, volumeId: id };
     }
 
+    // Cancel an in-progress eviction: abort the drain (and clear its persisted state so it never
+    // resumes), then clear the volume's evicting flag. Already-relocated slices keep their new homes.
+    private static async handleVolumeEvictCancelRequest(params: RouteParams): Promise<{ evicting: boolean; volumeId: number }> {
+        const id = this.parseVolumeId(params);
+        await evictVolumeJob.cancel(id);
+        await database.updateVolumeFlags(id, { isEvicting: false });
+        await ioManager.updateVolumeFlags(id, { isEvicting: false });
+        return { evicting: false, volumeId: id };
+    }
+
     private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
         const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; isEvicting?: unknown; label?: unknown; comment?: unknown }>(req);
         const id = this.parseVolumeId(params);
@@ -620,11 +630,11 @@ export class HttpMgmt {
             await ioManager.updateVolumeFlags(id, updates);
         }
 
-        // Start the drain when eviction is turned on; cancel it when turned off.
+        // Start the drain when eviction is turned on; cancel it (abort + clear state) when turned off.
         if (updates.isEvicting === true)
             await evictVolumeJob.start(id);
-        else if (updates.isEvicting === false && evictVolumeJob.evictingVolumeId() === id)
-            evictVolumeJob.stop();
+        else if (updates.isEvicting === false)
+            await evictVolumeJob.cancel(id);
 
         return { updated: true };
     }
@@ -795,6 +805,11 @@ export class HttpMgmt {
                 method: 'POST',
                 match: url => this.matchVolumeEvictRoute(url),
                 handler: async (_req, params) => this.handleVolumeEvictRequest(params)
+            },
+            {
+                method: 'DELETE',
+                match: url => this.matchVolumeEvictRoute(url),
+                handler: async (_req, params) => this.handleVolumeEvictCancelRequest(params)
             },
             {
                 method: 'POST',
