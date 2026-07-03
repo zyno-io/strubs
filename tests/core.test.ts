@@ -39,12 +39,12 @@ vi.mock('../lib/jobs/verify-volumes-job', () => ({
     }
 }));
 
-const evictResumeMock = vi.fn();
-const evictStopMock = vi.fn();
-vi.mock('../lib/jobs/evict-volume-job', () => ({
-    evictVolumeJob: {
-        resumePendingJob: evictResumeMock,
-        stop: evictStopMock
+const drainResumeMock = vi.fn();
+const drainStopMock = vi.fn();
+vi.mock('../lib/jobs/drain-volume-job', () => ({
+    drainVolumeJob: {
+        resumePendingJob: drainResumeMock,
+        stop: drainStopMock
     }
 }));
 

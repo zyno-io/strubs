@@ -110,7 +110,7 @@ export class RebalanceJob {
     }
 
     private eligible(v: Volume): boolean {
-        return v.isWritable; // started+enabled+healthy+!readonly+!evicting
+        return v.isWritable; // started+enabled+healthy+!readonly+!draining
     }
 
     private async run(): Promise<void> {

@@ -7,16 +7,16 @@ import { isMaintenanceFrozen } from '../maintenance';
 import type { Volume } from '../io/volume';
 import type { ContentDocument } from '../database/types';
 
-// Persisted evict progress (so a restart resumes the in-flight drain before routine maintenance).
-const EVICT_VOLUME_ID_KEY = 'evictVolumeId';
-const EVICT_CURSOR_ID_KEY = 'evictCursorId';
+// Persisted drain progress (so a restart resumes the in-flight drain before routine maintenance).
+const DRAIN_VOLUME_ID_KEY = 'drainVolumeId';
+const DRAIN_CURSOR_ID_KEY = 'drainCursorId';
 const BATCH_SIZE = 100;
 const DEFAULT_CONCURRENCY = 4;
 
 type LoadedObject = { dataSliceVolumeIds: number[]; paritySliceVolumeIds: number[]; dataSliceCount: number; sliceSize: number };
-type EvictSummary = { objects: number; relocated: number; unrecoverable: number; skippedDead: number; noDest: number };
+type DrainSummary = { objects: number; relocated: number; unrecoverable: number; skippedDead: number; noDest: number };
 
-type EvictVolumeJobDeps = {
+type DrainVolumeJobDeps = {
     database: Pick<typeof database, 'findObjectsOnVolume' | 'replaceObjectVolumeRef' | 'getObjectById'>;
     getWritableVolumes: () => Volume[];
     getVolume: (id: number) => Volume | undefined;
@@ -27,6 +27,9 @@ type EvictVolumeJobDeps = {
     tryCopyRelocate: (object: LoadedObject, sliceIndex: number, fileName: string, sourceVol: Volume, targetVol: Volume) => Promise<boolean>;
     repairSlice: (object: LoadedObject, sliceIndex: number) => Promise<void>;
     deleteSlice: (vol: Volume, fileName: string) => Promise<void>;
+    // Clear the draining flag once the drain job finishes (the drive stays read-only -- the operator
+    // deletes or un-read-onlys it as a separate manual step).
+    markDrainComplete: (volumeId: number) => Promise<void>;
     runtimeConfig: typeof runtimeConfig;
     isFrozen: () => Promise<boolean>;
     createLogger: typeof createLogger;
@@ -34,7 +37,7 @@ type EvictVolumeJobDeps = {
     delayMs: number;
 };
 
-const defaultDeps: EvictVolumeJobDeps = {
+const defaultDeps: DrainVolumeJobDeps = {
     database,
     getWritableVolumes: () => ioManager.getWritableVolumes(),
     getVolume: (id: number) => ioManager.getVolume(id),
@@ -53,6 +56,10 @@ const defaultDeps: EvictVolumeJobDeps = {
         await sliceRepairer.repair(object as never, sliceIndex);
     },
     deleteSlice: async (vol: Volume, fileName: string) => { await vol.deleteCommittedFile(fileName); },
+    markDrainComplete: async (volumeId: number) => {
+        await database.updateVolumeFlags(volumeId, { isDraining: false });
+        await ioManager.updateVolumeFlags(volumeId, { isDraining: false });
+    },
     runtimeConfig,
     isFrozen: isMaintenanceFrozen,
     createLogger,
@@ -68,60 +75,60 @@ const defaultDeps: EvictVolumeJobDeps = {
 // can't be rebuilt correctly (below quorum / foreign parity) are left in place and reported -- they block
 // removal until the operator accepts the loss (recoveryComment). Documented-dead objects are skipped.
 // Gated by the maintenance freeze; resumes on restart ahead of the routine scrub/repair.
-export class EvictVolumeJob {
-    private readonly deps: EvictVolumeJobDeps;
+export class DrainVolumeJob {
+    private readonly deps: DrainVolumeJobDeps;
     private readonly log: ReturnType<typeof createLogger>;
     private running = false;
     private cancelled = false; // paused (freeze) — persisted state kept so it resumes
     private aborted = false;   // operator cancel — persisted state cleared so it does NOT resume
     private activeVolumeId: number | null = null;
 
-    constructor(deps?: Partial<EvictVolumeJobDeps>) {
+    constructor(deps?: Partial<DrainVolumeJobDeps>) {
         this.deps = { ...defaultDeps, ...deps };
-        this.log = this.deps.createLogger('evict-volume-job');
+        this.log = this.deps.createLogger('drain-volume-job');
     }
 
     isRunning(): boolean { return this.running; }
-    evictingVolumeId(): number | null { return this.activeVolumeId; }
+    drainingVolumeId(): number | null { return this.activeVolumeId; }
 
-    // Begin (or restart) evicting a volume. Idempotent while a drain for the same volume is running.
+    // Begin (or restart) draining a volume. Idempotent while a drain for the same volume is running.
     async start(volumeId: number): Promise<void> {
         if (this.running) {
             if (this.activeVolumeId === volumeId)
                 return;
-            this.log('cannot evict volume %d: a drain of volume %d is already running', volumeId, this.activeVolumeId);
+            this.log('cannot drain volume %d: a drain of volume %d is already running', volumeId, this.activeVolumeId);
             return;
         }
-        await this.deps.runtimeConfig.set(EVICT_VOLUME_ID_KEY, volumeId);
-        await this.deps.runtimeConfig.delete(EVICT_CURSOR_ID_KEY);
+        await this.deps.runtimeConfig.set(DRAIN_VOLUME_ID_KEY, volumeId);
+        await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
         void this.run(volumeId, undefined);
     }
 
-    // Resume a persisted, not-yet-finished eviction (called at startup BEFORE the scrub/repair start).
+    // Resume a persisted, not-yet-finished drain (called at startup BEFORE the scrub/repair start).
     async resumePendingJob(): Promise<void> {
-        const volumeId = await this.deps.runtimeConfig.get(EVICT_VOLUME_ID_KEY);
+        const volumeId = await this.deps.runtimeConfig.get(DRAIN_VOLUME_ID_KEY);
         if (typeof volumeId !== 'number')
             return;
         if (await this.deps.isFrozen()) {
-            this.log('maintenance freeze active: not resuming eviction of volume %d', volumeId);
+            this.log('maintenance freeze active: not resuming drain of volume %d', volumeId);
             return;
         }
-        const cursor = await this.deps.runtimeConfig.get(EVICT_CURSOR_ID_KEY);
-        this.log('resuming eviction of volume %d', volumeId);
+        const cursor = await this.deps.runtimeConfig.get(DRAIN_CURSOR_ID_KEY);
+        this.log('resuming drain of volume %d', volumeId);
         void this.run(volumeId, typeof cursor === 'string' ? cursor : undefined);
     }
 
-    // Pause (e.g. maintenance freeze): stop processing but KEEP the persisted evict state so the drain
+    // Pause (e.g. maintenance freeze): stop processing but KEEP the persisted drain state so the drain
     // resumes later (resumePendingJob).
     stop(): void { this.cancelled = true; }
 
     // Operator cancel: abort the drain AND clear the persisted state so it does NOT resume. The volume
-    // stays isEvicting=false is the caller's job (mgmt). Already-relocated slices keep their new homes.
+    // stays isDraining=false is the caller's job (mgmt). Already-relocated slices keep their new homes.
     async cancel(volumeId?: number): Promise<void> {
         if (volumeId !== undefined) {
-            // Abort/clear ONLY if the named volume is the one actually being (or pending) evicted --
+            // Abort/clear ONLY if the named volume is the one actually being (or pending) drained --
             // otherwise cancelling volume B must not wipe volume A's running or paused drain state.
-            const pending = await this.deps.runtimeConfig.get(EVICT_VOLUME_ID_KEY);
+            const pending = await this.deps.runtimeConfig.get(DRAIN_VOLUME_ID_KEY);
             const activeOrPending = this.activeVolumeId ?? (typeof pending === 'number' ? pending : null);
             if (activeOrPending !== null && activeOrPending !== volumeId)
                 return;
@@ -129,12 +136,12 @@ export class EvictVolumeJob {
         this.cancelled = true;
         this.aborted = true;
         await this.clearState();
-        this.log('eviction cancelled for volume %s', volumeId ?? this.activeVolumeId ?? '?');
+        this.log('drain cancelled for volume %s', volumeId ?? this.activeVolumeId ?? '?');
     }
 
     private async clearState(): Promise<void> {
-        await this.deps.runtimeConfig.delete(EVICT_VOLUME_ID_KEY);
-        await this.deps.runtimeConfig.delete(EVICT_CURSOR_ID_KEY);
+        await this.deps.runtimeConfig.delete(DRAIN_VOLUME_ID_KEY);
+        await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
     }
 
     private async run(volumeId: number, afterId: string | undefined): Promise<void> {
@@ -144,14 +151,14 @@ export class EvictVolumeJob {
         this.cancelled = false;
         this.aborted = false;
         this.activeVolumeId = volumeId;
-        const s: EvictSummary = { objects: 0, relocated: 0, unrecoverable: 0, skippedDead: 0, noDest: 0 };
-        this.log('evicting volume %d — reconstructing and relocating its slices', volumeId);
+        const s: DrainSummary = { objects: 0, relocated: 0, unrecoverable: 0, skippedDead: 0, noDest: 0 };
+        this.log('draining volume %d — reconstructing and relocating its slices', volumeId);
         try {
             let cursor = afterId;
             for (;;) {
-                if (this.aborted) { this.log('eviction of volume %d cancelled', volumeId); return; }
-                if (this.cancelled) { this.log('eviction of volume %d paused', volumeId); return; }
-                if (await this.deps.isFrozen()) { this.log('maintenance freeze active: pausing eviction of volume %d', volumeId); return; }
+                if (this.aborted) { this.log('drain of volume %d cancelled', volumeId); return; }
+                if (this.cancelled) { this.log('drain of volume %d paused', volumeId); return; }
+                if (await this.deps.isFrozen()) { this.log('maintenance freeze active: pausing drain of volume %d', volumeId); return; }
 
                 const batch = await this.deps.database.findObjectsOnVolume([volumeId], BATCH_SIZE, cursor);
                 if (!batch.length)
@@ -161,7 +168,7 @@ export class EvictVolumeJob {
                 if (this.aborted)
                     return;
                 cursor = String(batch[batch.length - 1]._id);
-                await this.deps.runtimeConfig.set(EVICT_CURSOR_ID_KEY, cursor);
+                await this.deps.runtimeConfig.set(DRAIN_CURSOR_ID_KEY, cursor);
                 if (s.objects % 1000 === 0)
                     this.log('  ...%d objects, %d relocated, %d unrecoverable, %d dead-skipped', s.objects, s.relocated, s.unrecoverable, s.skippedDead);
                 if (this.deps.delayMs > 0)
@@ -171,7 +178,7 @@ export class EvictVolumeJob {
                 await this.finalize(volumeId, s);
         }
         catch (err) {
-            this.log.error('eviction of volume %d failed: %s', volumeId, err instanceof Error ? err.message : String(err));
+            this.log.error('drain of volume %d failed: %s', volumeId, err instanceof Error ? err.message : String(err));
         }
         finally {
             this.running = false;
@@ -183,7 +190,7 @@ export class EvictVolumeJob {
         }
     }
 
-    private async processBatch(batch: ContentDocument[], volumeId: number, s: EvictSummary): Promise<void> {
+    private async processBatch(batch: ContentDocument[], volumeId: number, s: DrainSummary): Promise<void> {
         const inflight = new Set<Promise<void>>();
         for (const doc of batch) {
             if (this.cancelled || this.aborted)
@@ -199,7 +206,7 @@ export class EvictVolumeJob {
         await Promise.all(inflight);
     }
 
-    private async drainObject(doc: ContentDocument, volumeId: number, s: EvictSummary): Promise<void> {
+    private async drainObject(doc: ContentDocument, volumeId: number, s: DrainSummary): Promise<void> {
         // Documented-dead objects (recoveryComment) can't be relocated (their surviving slices are
         // foreign/insufficient); treat as accepted loss and leave their ref -- deletion is unblocked
         // separately once the operator accepts that loss.
@@ -250,16 +257,16 @@ export class EvictVolumeJob {
         // of another slice of the same object can't be clobbered.
         const flipped = await this.deps.database.replaceObjectVolumeRef(doc._id, volumeId, target.id);
         if (!flipped) {
-            await this.deps.deleteSlice(target, fileName).catch(() => undefined); // drop the orphan copy; evict keeps the source
+            await this.deps.deleteSlice(target, fileName).catch(() => undefined); // drop the orphan copy; drain keeps the source
             return;
         }
         s.relocated++;
         // Account the write so pickTarget spreads within the run (loadFromRecord objects don't
-        // self-account on commit). Evict keeps the source, so only the target changes.
+        // self-account on commit). Drain keeps the source, so only the target changes.
         if (typeof target.bytesFree === 'number') target.bytesFree -= sliceBytes;
     }
 
-    // Emptiest healthy WRITABLE volume the object doesn't already use (evicting volumes are already
+    // Emptiest healthy WRITABLE volume the object doesn't already use (draining volumes are already
     // excluded from getWritableVolumes()). Distinct-volume constraint keeps one slice per drive.
     private pickTarget(objectVols: Set<number>, sliceBytes: number): Volume | null {
         let best: Volume | null = null;
@@ -275,14 +282,17 @@ export class EvictVolumeJob {
         return best;
     }
 
-    private async finalize(volumeId: number, s: EvictSummary): Promise<void> {
-        this.log('eviction of volume %d complete: %d objects, %d relocated, %d unrecoverable, %d dead-skipped, %d no-dest',
+    private async finalize(volumeId: number, s: DrainSummary): Promise<void> {
+        this.log('drain of volume %d complete: %d objects, %d relocated, %d unrecoverable, %d dead-skipped, %d no-dest',
             volumeId, s.objects, s.relocated, s.unrecoverable, s.skippedDead, s.noDest);
         if (s.unrecoverable || s.noDest)
             this.log.error('volume %d still has %d slices that could not be relocated (unrecoverable/no-dest) — removal blocked until resolved', volumeId, s.unrecoverable + s.noDest);
-        await this.deps.runtimeConfig.delete(EVICT_VOLUME_ID_KEY);
-        await this.deps.runtimeConfig.delete(EVICT_CURSOR_ID_KEY);
+        await this.deps.runtimeConfig.delete(DRAIN_VOLUME_ID_KEY);
+        await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
+        // Drain job finished: clear the draining flag (the drive stays read-only + empty, awaiting a
+        // manual delete). Only reached on natural completion -- a freeze-pause returns before here.
+        await this.deps.markDrainComplete(volumeId);
     }
 }
 
-export const evictVolumeJob = new EvictVolumeJob();
+export const drainVolumeJob = new DrainVolumeJob();

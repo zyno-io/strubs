@@ -6,7 +6,7 @@ export type VolumeVerifyErrors = {
 };
 
 // DB keys that represent a volume's operational STATE (a change to any of these stamps state_updated_at).
-const STATE_KEYS = ['enabled', 'read_only', 'is_deleted', 'is_evicting', 'healthy'];
+const STATE_KEYS = ['enabled', 'read_only', 'is_deleted', 'is_draining', 'healthy'];
 
 export class VolumeRepository {
     constructor(private readonly collection: Collection<any>) {}
@@ -30,7 +30,7 @@ export class VolumeRepository {
         );
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isEvicting?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isDraining?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
         const set: Record<string, unknown> = {};
         const unset: Record<string, unknown> = {};
         if (changes.isEnabled !== undefined)
@@ -39,8 +39,8 @@ export class VolumeRepository {
             set.read_only = changes.isReadOnly;
         if (changes.isDeleted !== undefined)
             set.is_deleted = changes.isDeleted;
-        if (changes.isEvicting !== undefined)
-            set.is_evicting = changes.isEvicting;
+        if (changes.isDraining !== undefined)
+            set.is_draining = changes.isDraining;
         if (changes.isHealthy !== undefined)
             set.healthy = changes.isHealthy;
         if (changes.label !== undefined) {

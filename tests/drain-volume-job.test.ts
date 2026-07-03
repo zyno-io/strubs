@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { EvictVolumeJob } from '../lib/jobs/evict-volume-job';
+import { DrainVolumeJob } from '../lib/jobs/drain-volume-job';
 
 const loggerFactory = () => vi.fn(() => Object.assign(vi.fn(), { error: vi.fn() })) as any;
 
-// object with a slice on the evicting volume (index 0 = volume 5)
+// object with a slice on the draining volume (index 0 = volume 5)
 const objectDoc = (overrides?: Record<string, unknown>) => ({
     _id: 'obj1',
     dataVolumes: [5, 10, 11, 12],
@@ -32,6 +32,7 @@ const makeJob = (overrides?: any) => {
         loadObject: vi.fn().mockResolvedValue(loadedObject()),
         repairSlice: vi.fn().mockResolvedValue(undefined),
         deleteSlice: vi.fn().mockResolvedValue(undefined),
+        markDrainComplete: vi.fn().mockResolvedValue(undefined),
         runtimeConfig: { get: vi.fn(), set: vi.fn(), delete: vi.fn() },
         isFrozen: vi.fn().mockResolvedValue(false),
         createLogger: loggerFactory(),
@@ -39,12 +40,12 @@ const makeJob = (overrides?: any) => {
         delayMs: 0,
         ...overrides
     };
-    return { job: new EvictVolumeJob(deps), deps };
+    return { job: new DrainVolumeJob(deps), deps };
 };
 
-const runDrain = (job: EvictVolumeJob, volumeId: number) => (job as unknown as { run(v: number, a?: string): Promise<void> }).run(volumeId, undefined);
+const runDrain = (job: DrainVolumeJob, volumeId: number) => (job as unknown as { run(v: number, a?: string): Promise<void> }).run(volumeId, undefined);
 
-describe('EvictVolumeJob', () => {
+describe('DrainVolumeJob', () => {
     it('reconstructs + relocates a recoverable slice onto an unused healthy volume and flips the ref', async () => {
         const { job, deps } = makeJob();
         await runDrain(job, 5);
@@ -97,11 +98,11 @@ describe('EvictVolumeJob', () => {
         expect(deps.deleteSlice).toHaveBeenCalledWith(expect.objectContaining({ id: 21 }), 'obj1.0'); // clean up target orphan
     });
 
-    it('cancel() clears persisted evict state so it does not resume', async () => {
+    it('cancel() clears persisted drain state so it does not resume', async () => {
         const { job, deps } = makeJob();
         await job.cancel(5);
-        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('evictVolumeId');
-        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('evictCursorId');
+        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('drainVolumeId');
+        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('drainCursorId');
     });
 
     it('cancel(otherVolume) does NOT clear a different volume paused/pending drain state', async () => {
@@ -162,11 +163,17 @@ describe('EvictVolumeJob', () => {
         expect(deps.repairSlice).not.toHaveBeenCalled();
     });
 
-    it('persists a cursor as it advances and clears evict state on completion', async () => {
+    it('persists a cursor as it advances and clears drain state on completion', async () => {
         const { job, deps } = makeJob();
         await runDrain(job, 5);
-        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('evictCursorId', 'obj1');
-        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('evictVolumeId');
-        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('evictCursorId');
+        expect(deps.runtimeConfig.set).toHaveBeenCalledWith('drainCursorId', 'obj1');
+        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('drainVolumeId');
+        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('drainCursorId');
+    });
+
+    it('clears the draining flag when the drain completes (drive stays read-only)', async () => {
+        const { job, deps } = makeJob();
+        await runDrain(job, 5);
+        expect(deps.markDrainComplete).toHaveBeenCalledWith(5);
     });
 });

@@ -45,7 +45,7 @@ describe('VolumeHealthMonitor', () => {
         // Degradation must be persisted (not just in-memory) so it survives restart.
         expect(deps.database.updateVolumeFlags).toHaveBeenCalledWith(1, { isReadOnly: true, isHealthy: false });
         expect(deps.notificationService.notify).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }));
-        // Never auto-disables (eviction is manual).
+        // Never auto-disables (drain is manual).
         expect(deps.ioManager.updateVolumeFlags).not.toHaveBeenCalledWith(1, expect.objectContaining({ isEnabled: false }));
     });
 

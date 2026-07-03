@@ -5,7 +5,7 @@ import { database } from './database';
 import { ioManager } from './io/manager';
 import { serverManager } from './server/manager';
 import { verifyVolumesJob } from './jobs/verify-volumes-job';
-import { evictVolumeJob } from './jobs/evict-volume-job';
+import { drainVolumeJob } from './jobs/drain-volume-job';
 import { rebalanceJob } from './jobs/rebalance-job';
 import { verifyScheduler } from './jobs/verify-scheduler';
 import { createLogger } from './log';
@@ -76,9 +76,9 @@ export class Core {
             if (frozen)
                 log('maintenance freeze active: NOT starting verify scheduler or repair worker');
             else {
-                // Evictions run BEFORE routine maintenance: resume a pending drain first so the
+                // Drains run BEFORE routine maintenance: resume a pending drain first so the
                 // scrub/repair doesn't fight it, then start the scheduler.
-                await evictVolumeJob.resumePendingJob();
+                await drainVolumeJob.resumePendingJob();
                 verifyScheduler.start(config.scrubIntervalMs);
             }
             systemLogWatcher.start(config.systemLogWatchIntervalMs);
@@ -88,7 +88,7 @@ export class Core {
                     backlogDelayMs: config.repairBacklogDelayMs,
                     blockedRetryMs: config.repairBlockedRetryMs
                 });
-                // Rebalance is optional housekeeping — resume last, after evict + verify + repair.
+                // Rebalance is optional housekeeping — resume last, after drain + verify + repair.
                 await rebalanceJob.resumePendingJob();
             }
             volumeHealthMonitor.start(config.volumeHealthIntervalMs, config.volumeFaultThreshold);

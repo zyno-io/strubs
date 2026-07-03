@@ -30,7 +30,7 @@ const DEFAULT_FAULT_THRESHOLD = 10;
 // when a volume crosses a threshold (too many distinct faulted slices, or SMART
 // reports it unhealthy) it is transitioned to READ-ONLY and marked unhealthy:
 // reads keep working (reconstructing as needed) while new writes stop. This is
-// safe and reversible. Eviction (disabling a drive, which can drop objects below
+// safe and reversible. Drain (disabling a drive, which can drop objects below
 // quorum) is deliberately NOT automated — it remains an operator action.
 export class VolumeHealthMonitor {
     private readonly deps: VolumeHealthMonitorDeps;

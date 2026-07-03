@@ -31,7 +31,7 @@ export interface VolumeConfig {
     label?: string | null;
     comment?: string | null;
     is_deleted?: boolean;
-    is_evicting?: boolean;
+    is_draining?: boolean;
     state_updated_at?: Date | string | null;
 }
 
@@ -51,12 +51,12 @@ export class Volume extends EventEmitter {
     public isHealthy: boolean;
     public isReadOnly: boolean;
     public isDeleted: boolean;
-    // Timestamp of the last operational STATE change (enabled/read-only/deleted/evicting/healthy).
+    // Timestamp of the last operational STATE change (enabled/read-only/deleted/draining/healthy).
     public stateUpdatedAt: Date | null;
-    // Evicting: the operator has asked to remove this drive. Its slices are being reconstructed and
+    // Draining: the operator has asked to remove this drive. Its slices are being reconstructed and
     // relocated onto healthy volumes. It stays READABLE (reads still serve during the drain) but is
     // NOT writable (no new placement, no in-place repair) so the drain is the only thing moving it.
-    public isEvicting: boolean;
+    public isDraining: boolean;
     public deviceSerial: string | null;
     public deviceModel: string | null = null;
     public deviceVendor: string | null = null;
@@ -82,7 +82,7 @@ export class Volume extends EventEmitter {
 
         this.isDeleted = inConfig.is_deleted === true;
         this.stateUpdatedAt = inConfig.state_updated_at ? new Date(inConfig.state_updated_at) : null;
-        this.isEvicting = inConfig.is_evicting === true;
+        this.isDraining = inConfig.is_draining === true;
         this.isEnabled = inConfig.enabled && !this.isDeleted;
         this.isHealthy = inConfig.healthy;
         this.isReadOnly = inConfig.read_only;
@@ -127,8 +127,8 @@ export class Volume extends EventEmitter {
         this.isEnabled = flag && !this.isDeleted;
     }
 
-    setEvicting(flag: boolean): void {
-        this.isEvicting = flag;
+    setDraining(flag: boolean): void {
+        this.isDraining = flag;
     }
 
     setStateUpdatedAt(when: Date): void {
@@ -393,7 +393,7 @@ export class Volume extends EventEmitter {
     }
 
     get isWritable() {
-        return this.isStarted && this.isEnabled && this.isHealthy && !this.isReadOnly && !this.isEvicting;
+        return this.isStarted && this.isEnabled && this.isHealthy && !this.isReadOnly && !this.isDraining;
     }
 
     async createTemporaryFh(fileName: string): Promise<FileHandle> {

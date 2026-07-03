@@ -216,7 +216,7 @@ export class VolumeFleet {
         return volume;
     }
 
-    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isEvicting?: boolean; label?: string | null; comment?: string | null }, devices: CachedDevice[]): Promise<void> {
+    async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isDraining?: boolean; label?: string | null; comment?: string | null }, devices: CachedDevice[]): Promise<void> {
         const config = this._volumeConfig.find(cfg => cfg.id === id);
         if (!config)
             throw new Error('volume configuration not found');
@@ -224,9 +224,9 @@ export class VolumeFleet {
         let volume: Volume | undefined = this._volumes[id];
         let stateChanged = false;
 
-        if (changes.isEvicting !== undefined) {
-            config.is_evicting = changes.isEvicting;
-            volume?.setEvicting(changes.isEvicting);
+        if (changes.isDraining !== undefined) {
+            config.is_draining = changes.isDraining;
+            volume?.setDraining(changes.isDraining);
             stateChanged = true;
         }
 

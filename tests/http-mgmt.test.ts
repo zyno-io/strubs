@@ -73,13 +73,13 @@ vi.mock('../lib/database', () => ({
     }
 }));
 
-const evictStartMock = vi.fn().mockResolvedValue(undefined);
-const evictStopMock = vi.fn();
-vi.mock('../lib/jobs/evict-volume-job', () => ({
-    evictVolumeJob: {
-        start: evictStartMock,
-        stop: evictStopMock,
-        evictingVolumeId: () => null,
+const drainStartMock = vi.fn().mockResolvedValue(undefined);
+const drainStopMock = vi.fn();
+vi.mock('../lib/jobs/drain-volume-job', () => ({
+    drainVolumeJob: {
+        start: drainStartMock,
+        stop: drainStopMock,
+        drainingVolumeId: () => null,
         resumePendingJob: vi.fn()
     }
 }));
@@ -1075,7 +1075,7 @@ describe('HttpMgmt.handle', () => {
         expect(ioManagerMock.softDeleteVolume).toHaveBeenCalledWith(3);
     });
 
-    it('blocks deleting a volume that still holds live object slices (evict first)', async () => {
+    it('blocks deleting a volume that still holds live object slices (drain first)', async () => {
         const req = createRequest('DELETE', '/$/volumes/3');
         databaseSoftDeleteMock.mockClear();
         databaseCountOnVolumeMock.mockResolvedValue(1200);
@@ -1084,16 +1084,16 @@ describe('HttpMgmt.handle', () => {
         expect(databaseSoftDeleteMock).not.toHaveBeenCalled();
     });
 
-    it('evicts a volume via POST /$/volumes/{id}/evict', async () => {
-        const req = createRequest('POST', '/$/volumes/7/evict');
+    it('drains a volume via POST /$/volumes/{id}/drain', async () => {
+        const req = createRequest('POST', '/$/volumes/7/drain');
         databaseUpdateFlagsMock.mockResolvedValue(undefined);
         ioManagerMock.updateVolumeFlags.mockResolvedValue(undefined);
-        evictStartMock.mockClear();
+        drainStartMock.mockClear();
         const response = await HttpMgmt.handle(17, req, nullResponse);
-        expect(response).toEqual({ evicting: true, volumeId: 7 });
-        expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(7, { isEvicting: true });
-        expect(ioManagerMock.updateVolumeFlags).toHaveBeenCalledWith(7, { isEvicting: true });
-        expect(evictStartMock).toHaveBeenCalledWith(7);
+        expect(response).toEqual({ draining: true, volumeId: 7 });
+        expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(7, { isDraining: true, isReadOnly: true });
+        expect(ioManagerMock.updateVolumeFlags).toHaveBeenCalledWith(7, { isDraining: true, isReadOnly: true });
+        expect(drainStartMock).toHaveBeenCalledWith(7);
     });
 
     it('starts a rebalance via POST /$/rebalance with options', async () => {

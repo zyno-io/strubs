@@ -319,7 +319,7 @@ export class ContentRepository {
         );
     }
 
-    // --- drain/evict support ---
+    // --- drain/drain support ---
 
     // Objects with a slice on any of the given volumes, _id-ordered for cursor resume.
     async findObjectsOnVolume(volumeIds: number[], limit: number, afterId?: ObjectIdentifier): Promise<ContentDocument[]> {

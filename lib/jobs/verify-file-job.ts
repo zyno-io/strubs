@@ -13,9 +13,9 @@ type VerifyFileJobDeps = {
     fileObjectService: FileObjectService;
     createLogger: typeof createLogger;
     createSliceVerifier: (object: FileObject, mode: VerifyMode) => { verifySlice: (sliceIndex: number) => Promise<void> };
-    // Slices on a draining volume are being relocated by the evict job — the scrub skips them so it
+    // Slices on a draining volume are being relocated by the drain job — the scrub skips them so it
     // doesn't fight the drain or fault a slice that's about to move.
-    isVolumeEvicting: (volumeId: number | null) => boolean;
+    isVolumeDraining: (volumeId: number | null) => boolean;
 };
 
 type SliceVerifier = ReturnType<VerifyFileJobDeps['createSliceVerifier']>;
@@ -35,12 +35,12 @@ const defaultDeps: VerifyFileJobDeps = {
     fileObjectService,
     createLogger,
     createSliceVerifier: (object: FileObject, mode: VerifyMode) => new FileObjectSliceVerifier(object, { mode }),
-    isVolumeEvicting: (volumeId: number | null) => {
+    isVolumeDraining: (volumeId: number | null) => {
         if (volumeId === null)
             return false;
         // Lazy require so this module doesn't pull the io manager graph at import for consumers/tests.
         const { ioManager } = require('../io/manager') as typeof import('../io/manager');
-        return ioManager.getVolume(volumeId)?.isEvicting === true;
+        return ioManager.getVolume(volumeId)?.isDraining === true;
     }
 };
 
@@ -78,10 +78,10 @@ export class VerifyFileJob {
             const sliceVolumeId = sliceIndex < record.dataVolumes.length
                 ? record.dataVolumes[sliceIndex] ?? null
                 : record.parityVolumes[sliceIndex - record.dataVolumes.length] ?? null;
-            if (this.deps.isVolumeEvicting(sliceVolumeId)) {
-                this.log('skipping slice %d of object %s: volume %s is evicting', sliceIndex, record.id, sliceVolumeId);
+            if (this.deps.isVolumeDraining(sliceVolumeId)) {
+                this.log('skipping slice %d of object %s: volume %s is draining', sliceIndex, record.id, sliceVolumeId);
                 // Still mark it verified-now so lastVerifiedAt (the min across slices) advances and the
-                // object doesn't churn to the front of the scrub queue for the whole eviction; the slice
+                // object doesn't churn to the front of the scrub queue for the whole drain; the slice
                 // is re-verified on its new volume after the drain relocates it.
                 sliceResults[String(sliceIndex)] = { ok: true, type: sliceIndex < record.dataVolumes.length ? 'data' : 'parity', volumeId: sliceVolumeId };
                 continue;

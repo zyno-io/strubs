@@ -874,28 +874,29 @@ async function toggleVolumeReadOnly(): Promise<void> {
   }
 }
 
-// Evict (drain) the volume, or cancel an in-progress eviction. Evict reconstructs/relocates every
-// slice the drive holds onto other healthy drives; once drained the drive can be removed. Cancel aborts
-// the drain (already-relocated slices keep their new homes).
-async function toggleVolumeEvict(): Promise<void> {
+// Drain the volume, or cancel an in-progress drain. Drain marks the drive read-only and
+// reconstructs/relocates every slice it holds onto other healthy drives. Once drained the drive is
+// empty + read-only; DELETING it is a separate, manual step. Cancel aborts the drain (already-relocated
+// slices keep their new homes; the drive stays read-only until the operator clears it).
+async function toggleVolumeDrain(): Promise<void> {
   const volume = contextMenuVolume.value;
   if (volume === null) return;
 
   const volumeId = volume.id;
-  const cancelling = volume.isEvicting;
+  const cancelling = volume.isDraining;
   hideContextMenu();
 
-  if (!cancelling && !confirm(`Evict volume ${volumeId}? Its slices will be reconstructed/relocated to other drives so it can be removed. This can take a while and moves data.`)) {
+  if (!cancelling && !confirm(`Drain volume ${volumeId}? It will be marked read-only and its slices reconstructed/relocated to other drives. This can take a while and moves data. Deleting the drive afterward is a separate, manual step.`)) {
     return;
   }
 
   try {
-    const response = await fetch(`${apiBaseUrl}/$/volumes/${volumeId}/evict`, {
+    const response = await fetch(`${apiBaseUrl}/$/volumes/${volumeId}/drain`, {
       method: cancelling ? 'DELETE' : 'POST'
     });
 
     if (!response.ok) {
-      let errorMessage = `Failed to ${cancelling ? 'cancel eviction' : 'evict'} (HTTP ${response.status})`;
+      let errorMessage = `Failed to ${cancelling ? 'cancel drain' : 'drain'} (HTTP ${response.status})`;
       try {
         const text = await response.text();
         if (text) errorMessage += `: ${text}`;
@@ -907,7 +908,7 @@ async function toggleVolumeEvict(): Promise<void> {
 
     await fetchData();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : 'Failed to update eviction';
+    error.value = err instanceof Error ? err.message : 'Failed to update drain';
   }
 }
 
@@ -947,7 +948,7 @@ async function deleteVolume(): Promise<void> {
       let errorMessage = `Failed to delete volume (HTTP ${response.status})`;
       try {
         const text = await response.text();
-        if (text) errorMessage += `: ${text}`; // e.g. "evict it first" when the drive still holds live slices
+        if (text) errorMessage += `: ${text}`; // e.g. "drain it first" when the drive still holds live slices
       } catch {
         // Ignore error reading response body
       }
@@ -1217,7 +1218,7 @@ onUnmounted(() => {
                 <td>
                   <div class="status-cell">
                     <span v-if="entry.volume?.isReadOnly" class="state-badge ro" title="Read-only">RO</span>
-                    <span v-if="entry.volume?.isEvicting" class="state-badge evicting" title="Evicting (draining slices to other drives)">Evicting</span>
+                    <span v-if="entry.volume?.isDraining" class="state-badge draining" title="Draining (draining slices to other drives)">Draining</span>
                     <span v-if="entry.volume && !entry.volume.isEnabled" class="state-badge disabled" title="Disabled">Disabled</span>
                     <span
                       v-else-if="entry.volume && !entry.blockDevice"
@@ -1287,7 +1288,7 @@ onUnmounted(() => {
                 <div v-if="entry.busGroup !== null" class="badge">Bus {{ entry.busGroup }}</div>
                 <div class="badge">{{ formatBytes(entry.bytesTotal) }}</div>
                 <div v-if="entry.volume?.isReadOnly" class="badge ro-badge">READ-ONLY</div>
-                <div v-if="entry.volume?.isEvicting" class="badge evicting-badge">EVICTING</div>
+                <div v-if="entry.volume?.isDraining" class="badge draining-badge">DRAINING</div>
                 <div v-if="entry.volume && !entry.volume.isEnabled" class="badge offline-badge">DISABLED</div>
                 <div v-else-if="entry.volume && !entry.blockDevice" class="badge offline-badge">OFFLINE</div>
                 <div v-if="entry.unassigned" class="badge offline-badge">UNASSIGNED</div>
@@ -1447,9 +1448,9 @@ onUnmounted(() => {
       <div
         v-if="contextMenuVolume"
         class="context-menu-item"
-        @click="toggleVolumeEvict"
+        @click="toggleVolumeDrain"
       >
-        {{ contextMenuVolume.isEvicting ? 'Cancel Eviction' : 'Evict (drain + remove)' }}
+        {{ contextMenuVolume.isDraining ? 'Cancel Drain' : 'Drain (read-only + offload)' }}
       </div>
       <div class="context-menu-item delete" @click="deleteVolume">Delete</div>
     </div>
@@ -2228,7 +2229,7 @@ h2 {
   background-color: #f44336;
 }
 
-.state-badge.evicting {
+.state-badge.draining {
   background-color: #26a69a;
 }
 
@@ -2284,7 +2285,7 @@ h2 {
   background-color: rgba(0, 0, 0, 0.4);
 }
 
-.evicting-badge {
+.draining-badge {
   background-color: rgba(38, 166, 154, 0.85);
 }
 

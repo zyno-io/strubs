@@ -7,7 +7,7 @@ import { deviceProvisioner } from '../../io/device-provisioner';
 import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
-import { evictVolumeJob } from '../../jobs/evict-volume-job';
+import { drainVolumeJob } from '../../jobs/drain-volume-job';
 import { rebalanceJob } from '../../jobs/rebalance-job';
 import { verifyFileJob } from '../../jobs/verify-file-job';
 import { verifyScheduler } from '../../jobs/verify-scheduler';
@@ -49,7 +49,7 @@ export type VolumeStatus = {
     verifyErrors: Volume['verifyErrors'];
     mountError: string | null;
     isDeleted: boolean;
-    isEvicting: boolean;
+    isDraining: boolean;
     stateUpdatedAt: string | null;
     isSmartHealthy: boolean | null;
     smartInfoSummary: VolumeSmartSummary | null;
@@ -404,13 +404,13 @@ export class HttpMgmt {
         if (frozen) {
             verifyScheduler.stop();
             repairWorker.stop();
-            evictVolumeJob.stop();
+            drainVolumeJob.stop();
             rebalanceJob.stop();
             await verifyVolumesJob.stop({ preserveState: true });
         }
         else {
-            // Evictions run before routine maintenance; rebalance (housekeeping) resumes last.
-            await evictVolumeJob.resumePendingJob();
+            // Drains run before routine maintenance; rebalance (housekeeping) resumes last.
+            await drainVolumeJob.resumePendingJob();
             verifyScheduler.start(config.scrubIntervalMs);
             repairWorker.start(config.repairIntervalMs, {
                 batchSize: config.repairBatchSize,
@@ -539,31 +539,33 @@ export class HttpMgmt {
     }
 
     // A volume may only be removed once no LIVE object references its slices. Documented-dead objects
-    // (recoveryComment) are excluded (accepted loss). This forces an evict-first workflow so a drive is
+    // (recoveryComment) are excluded (accepted loss). This forces an drain-first workflow so a drive is
     // never pulled with recoverable data still on it.
     private static async assertVolumeRemovable(id: number): Promise<void> {
         const liveRefs = await database.countObjectsOnVolume(id, { excludeDead: true });
         if (liveRefs > 0)
-            throw new HttpBadRequestError(`volume ${id} still holds ${liveRefs} live object slice(s); evict it first: POST /$/volumes/${id}/evict`);
+            throw new HttpBadRequestError(`volume ${id} still holds ${liveRefs} live object slice(s); drain it first: POST /$/volumes/${id}/drain`);
     }
 
-    private static async handleVolumeEvictRequest(params: RouteParams): Promise<{ evicting: boolean; volumeId: number }> {
+    private static async handleVolumeDrainRequest(params: RouteParams): Promise<{ draining: boolean; volumeId: number }> {
         const id = this.parseVolumeId(params);
-        // Mark evicting (excluded from placement, still readable) + persist, then start the drain.
-        await database.updateVolumeFlags(id, { isEvicting: true });
-        await ioManager.updateVolumeFlags(id, { isEvicting: true });
-        await evictVolumeJob.start(id);
-        return { evicting: true, volumeId: id };
+        // Mark the drive READ-ONLY (no new writes) + draining (excluded from placement, still readable),
+        // persist both, then start the drain. Delete stays a separate, manual step.
+        await database.updateVolumeFlags(id, { isDraining: true, isReadOnly: true });
+        await ioManager.updateVolumeFlags(id, { isDraining: true, isReadOnly: true });
+        await drainVolumeJob.start(id);
+        return { draining: true, volumeId: id };
     }
 
-    // Cancel an in-progress eviction: abort the drain (and clear its persisted state so it never
-    // resumes), then clear the volume's evicting flag. Already-relocated slices keep their new homes.
-    private static async handleVolumeEvictCancelRequest(params: RouteParams): Promise<{ evicting: boolean; volumeId: number }> {
+    // Cancel an in-progress drain: abort the drain (and clear its persisted state so it never resumes),
+    // then clear the draining flag. The drive is LEFT read-only (the operator clears that explicitly via
+    // "Clear Read-Only" when ready to use it again). Already-relocated slices keep their new homes.
+    private static async handleVolumeDrainCancelRequest(params: RouteParams): Promise<{ draining: boolean; volumeId: number }> {
         const id = this.parseVolumeId(params);
-        await evictVolumeJob.cancel(id);
-        await database.updateVolumeFlags(id, { isEvicting: false });
-        await ioManager.updateVolumeFlags(id, { isEvicting: false });
-        return { evicting: false, volumeId: id };
+        await drainVolumeJob.cancel(id);
+        await database.updateVolumeFlags(id, { isDraining: false });
+        await ioManager.updateVolumeFlags(id, { isDraining: false });
+        return { draining: false, volumeId: id };
     }
 
     private static async handleRebalanceStartRequest(req: HttpRequest): Promise<{ rebalancing: boolean }> {
@@ -593,16 +595,16 @@ export class HttpMgmt {
     }
 
     private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
-        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; isEvicting?: unknown; label?: unknown; comment?: unknown }>(req);
+        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; isDraining?: unknown; label?: unknown; comment?: unknown }>(req);
         const id = this.parseVolumeId(params);
 
-        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isEvicting?: boolean; label?: string | null; comment?: string | null } = {};
+        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isDraining?: boolean; label?: string | null; comment?: string | null } = {};
         let shouldSoftDelete = false;
 
-        if (payload.isEvicting !== undefined) {
-            if (typeof payload.isEvicting !== 'boolean')
-                throw new HttpBadRequestError('isEvicting must be a boolean');
-            updates.isEvicting = payload.isEvicting;
+        if (payload.isDraining !== undefined) {
+            if (typeof payload.isDraining !== 'boolean')
+                throw new HttpBadRequestError('isDraining must be a boolean');
+            updates.isDraining = payload.isDraining;
         }
 
         if (payload.isEnabled !== undefined) {
@@ -660,11 +662,11 @@ export class HttpMgmt {
             await ioManager.updateVolumeFlags(id, updates);
         }
 
-        // Start the drain when eviction is turned on; cancel it (abort + clear state) when turned off.
-        if (updates.isEvicting === true)
-            await evictVolumeJob.start(id);
-        else if (updates.isEvicting === false)
-            await evictVolumeJob.cancel(id);
+        // Start the drain when drain is turned on; cancel it (abort + clear state) when turned off.
+        if (updates.isDraining === true)
+            await drainVolumeJob.start(id);
+        else if (updates.isDraining === false)
+            await drainVolumeJob.cancel(id);
 
         return { updated: true };
     }
@@ -701,7 +703,7 @@ export class HttpMgmt {
             bytesFree: volume.bytesFree,
             verifyErrors: volume.verifyErrors,
             isDeleted: volume.isDeleted,
-            isEvicting: volume.isEvicting,
+            isDraining: volume.isDraining,
             stateUpdatedAt: volume.stateUpdatedAt ? volume.stateUpdatedAt.toISOString() : null,
             mountError: volume.mountError,
             isSmartHealthy: supportsSmart ? smartInfoSummary.isHealthy : null,
@@ -834,13 +836,13 @@ export class HttpMgmt {
             },
             {
                 method: 'POST',
-                match: url => this.matchVolumeEvictRoute(url),
-                handler: async (_req, params) => this.handleVolumeEvictRequest(params)
+                match: url => this.matchVolumeDrainRoute(url),
+                handler: async (_req, params) => this.handleVolumeDrainRequest(params)
             },
             {
                 method: 'DELETE',
-                match: url => this.matchVolumeEvictRoute(url),
-                handler: async (_req, params) => this.handleVolumeEvictCancelRequest(params)
+                match: url => this.matchVolumeDrainRoute(url),
+                handler: async (_req, params) => this.handleVolumeDrainCancelRequest(params)
             },
             {
                 method: 'POST',
@@ -1029,8 +1031,8 @@ export class HttpMgmt {
         return { id: match[1] };
     }
 
-    private static matchVolumeEvictRoute(url: string): RouteParams | null {
-        const match = /^\/\$\/volumes\/(\d+)\/evict$/.exec(url);
+    private static matchVolumeDrainRoute(url: string): RouteParams | null {
+        const match = /^\/\$\/volumes\/(\d+)\/drain$/.exec(url);
         if (!match)
             return null;
         return { id: match[1] };

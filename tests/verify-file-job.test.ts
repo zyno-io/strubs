@@ -53,7 +53,7 @@ describe('VerifyFileJob', () => {
             fileObjectService: fileObjectServiceMock as unknown as FileObjectServiceType,
             createSliceVerifier: createSliceVerifierMock as unknown as SliceVerifierFactory,
             createLogger: createNoopLogger,
-            isVolumeEvicting: () => false
+            isVolumeDraining: () => false
         });
     });
 
@@ -95,22 +95,22 @@ describe('VerifyFileJob', () => {
         expect(createSliceVerifierMock).toHaveBeenCalledTimes(3);
     });
 
-    it('skips slices on an evicting volume (the evict job is relocating them)', async () => {
+    it('skips slices on an draining volume (the drain job is relocating them)', async () => {
         const record = createRecord(); // dataVolumes [1,2], parityVolumes [3]
         databaseMock.getObjectById.mockResolvedValue(record);
         fileObjectServiceMock.load.mockResolvedValue({} as FileObject);
         verifySliceMock.mockResolvedValue(undefined);
-        const evictJob = new VerifyFileJob({
+        const drainJob = new VerifyFileJob({
             database: databaseMock as unknown as DatabaseType,
             fileObjectService: fileObjectServiceMock as unknown as FileObjectServiceType,
             createSliceVerifier: createSliceVerifierMock as unknown as SliceVerifierFactory,
             createLogger: createNoopLogger,
-            isVolumeEvicting: (volumeId) => volumeId === 2 // slice index 1 lives on volume 2
+            isVolumeDraining: (volumeId) => volumeId === 2 // slice index 1 lives on volume 2
         });
 
-        const result = await evictJob.verify(record.id);
+        const result = await drainJob.verify(record.id);
 
-        // The evicting-volume slice is not read, but is marked verified-now (so the object doesn't churn
+        // The draining-volume slice is not read, but is marked verified-now (so the object doesn't churn
         // in the scrub queue) — it never goes through the slice verifier.
         expect(result['1']).toEqual({ ok: true, type: 'data', volumeId: 2 });
         expect(result['0']).toBeDefined();
