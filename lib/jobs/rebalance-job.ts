@@ -121,8 +121,12 @@ export class RebalanceJob {
         try {
             const pool = this.deps.getVolumes().filter(v => this.eligible(v));
             if (pool.length < 2) { this.log('rebalance: fewer than 2 eligible volumes, nothing to do'); return; }
-            const target = pool.reduce((sum, v) => sum + this.fill(v), 0) / pool.length;
-            this.log('rebalance: target fill %.1f%% (deadband ±%.1f%%) over %d eligible volumes', target * 100, this.deadband * 100, pool.length);
+            // Balance point = pool-wide used/capacity (capacity-weighted), not the average of per-volume
+            // fills -- heterogeneous drive sizes make the latter wrong.
+            let poolCap = 0, poolUsed = 0;
+            for (const v of pool) { const cap = v.bytesTotal || 0; poolCap += cap; poolUsed += cap - ((v.bytesFree ?? 0) - v.bytesPending); }
+            const target = poolCap > 0 ? poolUsed / poolCap : 0;
+            this.log('rebalance: target fill %s%% (deadband ±%s%%) over %d eligible volumes', (target * 100).toFixed(1), (this.deadband * 100).toFixed(1), pool.length);
 
             // Sources: over target+band (any eligible/writable disk, health-blind). Most-over-full first.
             const sources = pool.filter(v => this.fill(v) > target + this.deadband).sort((a, b) => this.fill(b) - this.fill(a));
