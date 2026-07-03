@@ -274,6 +274,10 @@ export class RepairWorker {
         if (fault.repairStatus !== 'blocked')
             return true;
 
+        // Objects marked unrecoverable never become repairable — do not retry.
+        if (fault.repairBlockedReason === 'unrecoverable')
+            return false;
+
         if (fault.repairBlockedReason === 'target-unwritable') {
             return typeof fault.volumeId === 'number'
                 && this.deps.isVolumeWritable(fault.volumeId);
@@ -336,6 +340,32 @@ export class RepairWorker {
 
             if (this.stopping)
                 return 'cancelled';
+
+            // Guard BEFORE any repair attempt: never reconstruct objects that are documented as
+            // unrecoverable or already below quorum. Beyond being futile, reconstruction from
+            // foreign/corrupt surviving slices yields self-consistent-but-wrong bytes that pass the
+            // per-slice checksum and OVERWRITE good slices (this silently corrupted 33 objects).
+            const guarded = record as { recoveryComment?: unknown; dataVolumes?: unknown; parityVolumes?: unknown; sliceErrors?: Record<string, unknown> } | null;
+            if (guarded && guarded.recoveryComment != null && guarded.recoveryComment !== '') {
+                this.log('skipping repair of %s slice %d: object marked unrecoverable', fault.objectId, fault.sliceIndex);
+                await this.deps.remediationService.markRepairBlocked(fault.key, 'unrecoverable', { message: `object marked unrecoverable: ${String(guarded.recoveryComment)}` });
+                return 'processed';
+            }
+            if (guarded && Array.isArray(guarded.dataVolumes) && Array.isArray(guarded.parityVolumes) && guarded.sliceErrors) {
+                const parityCount = guarded.parityVolumes.length;
+                const totalSlices = guarded.dataVolumes.length + parityCount;
+                const badCount = Object.keys(guarded.sliceErrors).length;
+                if (badCount > parityCount) {
+                    this.log('skipping repair of %s slice %d: below quorum (%d bad slices > %d parity)', fault.objectId, fault.sliceIndex, badCount, parityCount);
+                    await this.deps.remediationService.markRepairBlocked(fault.key, 'insufficient-slices', {
+                        requiredSlices: guarded.dataVolumes.length,
+                        availableSlices: totalSlices - badCount,
+                        totalSlices,
+                        message: `below quorum: ${badCount} bad slices exceed ${parityCount} parity`
+                    });
+                    return 'processed';
+                }
+            }
 
             if (await this.blockIfTargetUnwritable(fault))
                 return 'processed';

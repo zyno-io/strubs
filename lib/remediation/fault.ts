@@ -4,7 +4,10 @@
 
 export type FaultSource = 'read' | 'verify' | 'syslog' | 'smart';
 export type RepairStatus = 'pending' | 'blocked';
-export type RepairBlockedReason = 'insufficient-slices' | 'target-unwritable';
+// 'unrecoverable': the object is documented as beyond repair (a recoveryComment) -- reconstruction is
+// futile and, with foreign/corrupt surviving slices, actively dangerous (it can overwrite good data
+// with self-consistent-but-wrong reconstructed bytes). Never retried.
+export type RepairBlockedReason = 'insufficient-slices' | 'target-unwritable' | 'unrecoverable';
 
 export interface RepairBlockDetails {
     requiredSlices?: number;

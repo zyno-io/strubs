@@ -258,6 +258,71 @@ describe('RepairWorker', () => {
         expect(deps.remediationService.markRepairBlocked).not.toHaveBeenCalled();
     });
 
+    it('skips repair of objects marked unrecoverable (recoveryComment) without reconstructing', async () => {
+        const { worker, deps } = makeWorker({
+            database: { getObjectById: vi.fn().mockResolvedValue({ id: 'obj1', size: 10, recoveryComment: 'drive gone, insufficient slices, 7/1/26 -sf' }) }
+        });
+        await worker.processFaults();
+
+        expect(deps.verifyObject).not.toHaveBeenCalled();
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairAttempted).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairBlocked).toHaveBeenCalledWith(
+            '1:obj1:0',
+            'unrecoverable',
+            expect.objectContaining({ message: expect.stringContaining('object marked unrecoverable') })
+        );
+    });
+
+    it('never retries an unrecoverable blocked fault even after the retry window elapses', async () => {
+        const blocked = fault({ repairStatus: 'blocked', repairBlockedReason: 'unrecoverable', lastRepairAttemptAt: 0 });
+        const { worker, deps } = makeWorker({ blockedRetryMs: 500 });
+        deps.remediationService.listFaults.mockReturnValue([blocked]);
+
+        await worker.processFaults();
+
+        expect(deps.database.getObjectById).not.toHaveBeenCalled();
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairBlocked).not.toHaveBeenCalled();
+    });
+
+    it('skips repair of below-quorum objects (more bad slices than parity) without reconstructing', async () => {
+        const { worker, deps } = makeWorker({
+            database: { getObjectById: vi.fn().mockResolvedValue({
+                id: 'obj1', size: 10,
+                dataVolumes: [1, 2, 3, 4], parityVolumes: [5, 6],
+                sliceErrors: { '1': {}, '2': {}, '4': {} } // 3 bad slices > 2 parity => below quorum
+            }) }
+        });
+        await worker.processFaults();
+
+        expect(deps.verifyObject).not.toHaveBeenCalled();
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.remediationService.markRepairBlocked).toHaveBeenCalledWith(
+            '1:obj1:0',
+            'insufficient-slices',
+            expect.objectContaining({ requiredSlices: 4, availableSlices: 3, totalSlices: 6 })
+        );
+    });
+
+    it('still repairs a within-quorum object with a repairable slice error map', async () => {
+        const verifyObject = vi.fn()
+            .mockResolvedValueOnce({ '0': { ok: false, volumeId: 1 } })
+            .mockResolvedValueOnce({ '0': { ok: true, volumeId: 1 } });
+        const { worker, deps } = makeWorker({
+            verifyObject,
+            database: { getObjectById: vi.fn().mockResolvedValue({
+                id: 'obj1', size: 10,
+                dataVolumes: [1, 2, 3, 4], parityVolumes: [5, 6],
+                sliceErrors: { '0': {} } // 1 bad <= 2 parity => recoverable, must NOT be skipped
+            }) }
+        });
+        await worker.processFaults();
+
+        expect(deps.repairSlice).toHaveBeenCalledWith(expect.anything(), 0);
+        expect(deps.remediationService.clearFault).toHaveBeenCalledWith('1:obj1:0');
+    });
+
     it('leaves the fault on a transient DB error (no ENOENT)', async () => {
         const { worker, deps } = makeWorker({
             database: { getObjectById: vi.fn().mockRejectedValue(new Error('connection reset')) }
