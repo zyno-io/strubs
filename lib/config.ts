@@ -87,6 +87,7 @@ export class Config {
     // Cooperative pacing between chunk reads during verification. This trades
     // scrub throughput for lower foreground-read contention.
     verifyReadDelayMs: number;
+    verifyParity: boolean;
 
     constructor() {
         this.mongoUrl = process.env.STRUBS_MONGO_URL || 'mongodb://strubs:strubs@127.0.0.1:27017/strubs?authSource=admin';
@@ -126,6 +127,8 @@ export class Config {
             process.env.STRUBS_VERIFY_READ_DELAY_MS,
             DEFAULT_VERIFY_READ_DELAY_MS
         );
+        // Full-mode scrub also validates parity (recompute-and-compare); disable with =false.
+        this.verifyParity = process.env.STRUBS_VERIFY_PARITY !== 'false';
     }
 
     async loadIdentity(): Promise<void> {

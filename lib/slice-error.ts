@@ -9,7 +9,8 @@ const CODE_CATEGORY: Record<string, SliceErrorCategory> = {
     EUNAVAIL: 'volume-unavailable',
     ENOENT: 'missing',
     EIO: 'io',
-    ETIMEOUT: 'timeout'
+    ETIMEOUT: 'timeout',
+    EPARITY: 'parity-mismatch'
 };
 
 // Derive a SliceErrorCategory from an error code (preferred) with a message-based

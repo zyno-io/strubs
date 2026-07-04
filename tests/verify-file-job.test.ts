@@ -30,6 +30,17 @@ type SliceVerifierFactory = (object: FileObject) => { verifySlice: (sliceIndex: 
 
 const createSliceVerifierMock = vi.fn();
 const verifySliceMock = vi.fn();
+const verifyObjectParityMock = vi.fn();
+const reportParityFaultMock = vi.fn();
+
+// Full deps for a job that has parity checking ENABLED with a mocked recompute (the real one loads the
+// native RS binding, which vitest can't). Callers override verifyObjectParity per test.
+const parityDeps = () => ({
+    createLogger: createNoopLogger,
+    verifyParity: true,
+    verifyObjectParity: verifyObjectParityMock,
+    reportParityFault: reportParityFaultMock
+});
 
 const createNoopLogger: CreateLogger = (_subject: string) => {
     const logger = ((..._args: unknown[]) => undefined) as Logger;
@@ -48,12 +59,15 @@ describe('VerifyFileJob', () => {
         verifySliceMock.mockReset();
         createSliceVerifierMock.mockReset();
         createSliceVerifierMock.mockImplementation(() => ({ verifySlice: verifySliceMock }));
+        verifyObjectParityMock.mockReset();
+        verifyObjectParityMock.mockResolvedValue([]); // no foreign parity by default
+        reportParityFaultMock.mockReset();
         job = new VerifyFileJob({
             database: databaseMock as unknown as DatabaseType,
             fileObjectService: fileObjectServiceMock as unknown as FileObjectServiceType,
             createSliceVerifier: createSliceVerifierMock as unknown as SliceVerifierFactory,
-            createLogger: createNoopLogger,
-            isVolumeDraining: () => false
+            isVolumeDraining: () => false,
+            ...parityDeps()
         });
     });
 
@@ -93,6 +107,60 @@ describe('VerifyFileJob', () => {
             }
         }));
         expect(createSliceVerifierMock).toHaveBeenCalledTimes(3);
+        expect(verifyObjectParityMock).toHaveBeenCalledTimes(1); // parity verified when data is clean
+    });
+
+    it('flags and faults a foreign parity slice detected by recompute-and-compare', async () => {
+        const record = createRecord(); // data [1,2], parity [3] -> parity slice index 2 on vol 3
+        databaseMock.getObjectById.mockResolvedValue(record);
+        fileObjectServiceMock.load.mockResolvedValue({} as FileObject);
+        verifySliceMock.mockResolvedValue(undefined);       // all slices pass per-chunk checks
+        verifyObjectParityMock.mockResolvedValue([2]);      // ...but parity slice 2 is FOREIGN
+
+        const result = await job.verify(record.id);
+
+        expect(result['2']).toEqual({ ok: false, type: 'parity', volumeId: 3, error: 'parity-mismatch' });
+        expect(reportParityFaultMock).toHaveBeenCalledWith({ objectId: record.id, sliceIndex: 2, volumeId: 3 });
+        expect(databaseMock.updateObjectVerificationState).toHaveBeenCalledWith(record.id, expect.objectContaining({
+            sliceErrors: expect.objectContaining({ '2': expect.objectContaining({ code: 'EPARITY', category: 'parity-mismatch', type: 'parity' }) })
+        }));
+    });
+
+    it('does NOT run parity verification when a data slice already errored', async () => {
+        const record = createRecord();
+        databaseMock.getObjectById.mockResolvedValue(record);
+        fileObjectServiceMock.load.mockResolvedValue({} as FileObject);
+        verifySliceMock.mockRejectedValueOnce(Object.assign(new Error('bad'), { code: 'ECHECKSUM' })).mockResolvedValue(undefined);
+
+        await job.verify(record.id);
+        expect(verifyObjectParityMock).not.toHaveBeenCalled(); // recomputing parity needs good data
+    });
+
+    it('does NOT run parity verification when disabled', async () => {
+        const noParity = new VerifyFileJob({
+            database: databaseMock as unknown as DatabaseType,
+            fileObjectService: fileObjectServiceMock as unknown as FileObjectServiceType,
+            createSliceVerifier: createSliceVerifierMock as unknown as SliceVerifierFactory,
+            isVolumeDraining: () => false,
+            ...parityDeps(),
+            verifyParity: false
+        });
+        databaseMock.getObjectById.mockResolvedValue(createRecord());
+        fileObjectServiceMock.load.mockResolvedValue({} as FileObject);
+        verifySliceMock.mockResolvedValue(undefined);
+
+        await noParity.verify('aaaaaaaaaaaaaaaaaaaaaaaa');
+        expect(verifyObjectParityMock).not.toHaveBeenCalled();
+    });
+
+    it('does NOT run parity verification in light mode', async () => {
+        const record = createRecord();
+        databaseMock.getObjectById.mockResolvedValue(record);
+        fileObjectServiceMock.load.mockResolvedValue({} as FileObject);
+        verifySliceMock.mockResolvedValue(undefined);
+
+        await job.verify(record.id, { mode: 'light' });
+        expect(verifyObjectParityMock).not.toHaveBeenCalled();
     });
 
     it('skips slices on an draining volume (the drain job is relocating them)', async () => {
@@ -104,8 +172,8 @@ describe('VerifyFileJob', () => {
             database: databaseMock as unknown as DatabaseType,
             fileObjectService: fileObjectServiceMock as unknown as FileObjectServiceType,
             createSliceVerifier: createSliceVerifierMock as unknown as SliceVerifierFactory,
-            createLogger: createNoopLogger,
-            isVolumeDraining: (volumeId) => volumeId === 2 // slice index 1 lives on volume 2
+            isVolumeDraining: (volumeId) => volumeId === 2, // slice index 1 lives on volume 2
+            ...parityDeps()
         });
 
         const result = await drainJob.verify(record.id);

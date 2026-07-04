@@ -5,6 +5,7 @@ import { fileObjectService, type FileObjectService } from '../io/file-object/ser
 import type { FileObject, StoredObjectRecord } from '../io/file-object';
 import { FileObjectSliceVerifier, type VerifyMode } from '../io/file-object/slice-verifier';
 import { createError } from '../helpers';
+import { config } from '../config';
 import { buildObjectVerificationStateUpdate } from '../verification-state';
 import { isMaintenanceFrozen } from '../maintenance';
 
@@ -16,6 +17,12 @@ type VerifyFileJobDeps = {
     // Slices on a draining volume are being relocated by the drain job — the scrub skips them so it
     // doesn't fight the drain or fault a slice that's about to move.
     isVolumeDraining: (volumeId: number | null) => boolean;
+    // Full-mode scrub validates parity: recompute the correct parity from the data and compare to the
+    // stored parity. Returns the parity slice indices whose stored value is FOREIGN (self-consistent but
+    // wrong) -- the incident failure mode that per-chunk checksums can't catch.
+    verifyParity: boolean;
+    verifyObjectParity: (object: FileObject) => Promise<number[]>;
+    reportParityFault: (input: { objectId: string; sliceIndex: number; volumeId: number | null }) => void;
 };
 
 type SliceVerifier = ReturnType<VerifyFileJobDeps['createSliceVerifier']>;
@@ -41,6 +48,26 @@ const defaultDeps: VerifyFileJobDeps = {
         // Lazy require so this module doesn't pull the io manager graph at import for consumers/tests.
         const { ioManager } = require('../io/manager') as typeof import('../io/manager');
         return ioManager.getVolume(volumeId)?.isDraining === true;
+    },
+    verifyParity: config.verifyParity,
+    verifyObjectParity: async (object: FileObject) => {
+        const { FileObjectReader } = require('../io/file-object/reader') as typeof import('../io/file-object/reader');
+        const reader = new FileObjectReader(object);
+        const mismatched = new Set<number>();
+        try {
+            await reader.prepare();
+            for (let result; (result = await reader.verifyChunkSetParity()) !== null; )
+                result.mismatched.forEach(index => mismatched.add(index));
+        }
+        finally { await reader.close().catch(() => undefined); }
+        return [...mismatched];
+    },
+    reportParityFault: (input) => {
+        const { remediationService } = require('../remediation/service') as typeof import('../remediation/service');
+        remediationService.reportSliceFault({
+            objectId: input.objectId, sliceIndex: input.sliceIndex, volumeId: input.volumeId,
+            source: 'verify', code: 'EPARITY', message: 'stored parity does not match recomputed parity (foreign/stale)', isChecksum: false
+        });
     }
 };
 
@@ -72,6 +99,7 @@ export class VerifyFileJob {
         const sliceResults: VerifyFileJobResult = {};
         const sliceErrors: Record<string, SliceErrorInfo> = {};
         const verifiedAt = new Date();
+        let drainingSkipped = false;
 
         const tasks: Promise<void>[] = [];
         for (let sliceIndex = 0; sliceIndex < totalSlices; sliceIndex++) {
@@ -84,6 +112,7 @@ export class VerifyFileJob {
                 // object doesn't churn to the front of the scrub queue for the whole drain; the slice
                 // is re-verified on its new volume after the drain relocates it.
                 sliceResults[String(sliceIndex)] = { ok: true, type: sliceIndex < record.dataVolumes.length ? 'data' : 'parity', volumeId: sliceVolumeId };
+                drainingSkipped = true;
                 continue;
             }
             tasks.push(
@@ -97,6 +126,25 @@ export class VerifyFileJob {
             );
         }
         await Promise.all(tasks);
+
+        // Parity verification: recompute the correct parity from the data and compare to what's stored.
+        // Only when the data verified clean and nothing was drain-skipped -- recomputing needs
+        // authoritative data. A foreign parity slice passes the per-chunk checks above but fails here, so
+        // flag it and fault it -> the repair worker re-verifies (this same check) and recomputes the
+        // correct parity in place.
+        if (this.deps.verifyParity && mode === 'full' && !drainingSkipped && Object.keys(sliceErrors).length === 0) {
+            let mismatched: number[] = [];
+            try { mismatched = await this.deps.verifyObjectParity(object); }
+            catch (err) { this.log('parity verify errored for %s: %s', record.id, err instanceof Error ? err.message : String(err)); }
+            for (const sliceIndex of mismatched) {
+                const key = String(sliceIndex);
+                const volumeId = record.parityVolumes[sliceIndex - record.dataVolumes.length] ?? null;
+                this.log('object %s parity slice %d is FOREIGN (recomputed != stored)', record.id, sliceIndex);
+                sliceResults[key] = { ok: false, type: 'parity', volumeId, error: 'parity-mismatch' };
+                sliceErrors[key] = { code: 'EPARITY', category: 'parity-mismatch', err: 'stored parity does not match recomputed value', type: 'parity' };
+                this.deps.reportParityFault({ objectId: record.id, sliceIndex, volumeId });
+            }
+        }
 
         await this.deps.database.updateObjectVerificationState(
             record.id,

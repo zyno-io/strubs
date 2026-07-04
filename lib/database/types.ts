@@ -35,6 +35,7 @@ export type SliceErrorCategory =
     | 'missing'             // ENOENT — slice file absent on a mounted volume
     | 'io'                  // EIO and other native read errors
     | 'timeout'             // ETIMEOUT — slice I/O timed out
+    | 'parity-mismatch'     // EPARITY — parity self-consistent but != recomputed (foreign/stale)
     | 'unknown';            // EOPEN/unclassified
 
 export type SliceErrorInfo = {
