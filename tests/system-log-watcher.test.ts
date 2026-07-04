@@ -64,11 +64,19 @@ describe('SystemLogWatcher poll', () => {
             ioManager: { getVolumeEntries: vi.fn(() => volumes) },
             verifyVolumesJob: { start: vi.fn().mockResolvedValue({ startedAt: 'x' }) },
             notificationService: { notify: vi.fn().mockResolvedValue({ delivered: [], failed: [], suppressed: false }) },
+            runtimeConfig: { get: vi.fn().mockResolvedValue(undefined), set: vi.fn().mockResolvedValue(undefined) },
             createLogger: loggerFactory(),
             now: () => 1000,
             ...overrides
         };
     };
+
+    // A runtimeConfig mock that actually stores, to simulate persistence across restarts.
+    const statefulConfig = () => {
+        const store = new Map<string, unknown>();
+        return { get: vi.fn(async (k: string) => store.get(k)), set: vi.fn(async (k: string, v: unknown) => { store.set(k, v); }) };
+    };
+    const smartd = (device: string, count: number) => `Device: /dev/${device} [SAT], ${count} Currently unreadable (pending) sectors`;
 
     it('triggers targeted verify only for devices mapped to managed volumes', async () => {
         const deps = makeDeps();
@@ -136,5 +144,35 @@ describe('SystemLogWatcher poll', () => {
         await watcher.poll();
 
         expect(start).toHaveBeenCalledTimes(4);
+    });
+
+    it('does not re-verify a standing (unchanged) pending sector (cooldown disabled)', async () => {
+        const run = vi.fn(async (_c: string, args: string[]) => ({ code: 0, stdout: args.includes('smartd') ? smartd('sdaf', 1) : '' }));
+        const deps = makeDeps({ run });
+        const watcher = new SystemLogWatcher({ triggerCooldownMs: 0 }, deps);
+        await watcher.poll();
+        await watcher.poll();
+        expect(deps.verifyVolumesJob.start).toHaveBeenCalledTimes(1); // only the first appearance
+    });
+
+    it('re-verifies when the pending-sector count grows', async () => {
+        let count = 1;
+        const run = vi.fn(async (_c: string, args: string[]) => ({ code: 0, stdout: args.includes('smartd') ? smartd('sdaf', count) : '' }));
+        const deps = makeDeps({ run });
+        const watcher = new SystemLogWatcher({ triggerCooldownMs: 0 }, deps);
+        await watcher.poll();          // 1 -> trigger
+        count = 2; await watcher.poll(); // 2 > 1 -> trigger
+        await watcher.poll();          // stable 2 -> ignored
+        expect(deps.verifyVolumesJob.start).toHaveBeenCalledTimes(2);
+    });
+
+    it('persists the pending high-water across restarts', async () => {
+        const runtimeConfig = statefulConfig();
+        const run = vi.fn(async (_c: string, args: string[]) => ({ code: 0, stdout: args.includes('smartd') ? smartd('sdaf', 1) : '' }));
+        await new SystemLogWatcher({ triggerCooldownMs: 0 }, makeDeps({ run, runtimeConfig })).poll(); // triggers + persists {sdaf:1}
+        const startAfter = vi.fn().mockResolvedValue({ startedAt: 'x' });
+        // fresh watcher sharing the persisted store -- simulates a restart
+        await new SystemLogWatcher({ triggerCooldownMs: 0 }, makeDeps({ run, runtimeConfig, verifyVolumesJob: { start: startAfter } })).poll();
+        expect(startAfter).not.toHaveBeenCalled();
     });
 });
