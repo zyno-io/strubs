@@ -62,4 +62,21 @@ describe('VerifyScheduler', () => {
         scheduler.stop();
         expect(scheduler.isScheduled()).toBe(false);
     });
+
+    it('handles intervals beyond the 32-bit timer max without firing early', async () => {
+        vi.useFakeTimers();
+        const deps = makeDeps(false);
+        const scheduler = new VerifyScheduler(deps);
+        const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000; // 2,592,000,000 > 2^31-1 -> Node would clamp to 1ms
+        scheduler.start(THIRTY_DAYS);
+
+        // Advancing well past the overflow point must NOT trigger a scrub (the bug fired every 1ms).
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(deps.verifyVolumesJob.start).not.toHaveBeenCalled();
+
+        // It fires only once the full interval has actually elapsed.
+        await vi.advanceTimersByTimeAsync(THIRTY_DAYS);
+        expect(deps.verifyVolumesJob.start).toHaveBeenCalledTimes(1);
+        scheduler.stop();
+    });
 });
