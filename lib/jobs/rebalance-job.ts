@@ -29,6 +29,7 @@ type RebalanceJobDeps = {
     tryCopyRelocate: (object: LoadedObject, sliceIndex: number, fileName: string, sourceVol: Volume, targetVol: Volume) => Promise<boolean>;
     repairSlice: (object: LoadedObject, sliceIndex: number) => Promise<void>;   // recompute/reconstruct, md5-gated
     deleteSourceSlice: (sourceVol: Volume, fileName: string) => Promise<boolean>;
+    recordRelocated: (fromVolumeId: number, toVolumeId: number, size: number, sliceSize: number, isParity: boolean) => void;
     runtimeConfig: typeof runtimeConfig;
     isFrozen: () => Promise<boolean>;
     createLogger: typeof createLogger;
@@ -47,6 +48,10 @@ const defaultDeps: RebalanceJobDeps = {
     },
     repairSlice: async (object, sliceIndex) => { const { sliceRepairer } = require('../io/file-object/slice-repairer') as typeof import('../io/file-object/slice-repairer'); await sliceRepairer.repair(object as never, sliceIndex); },
     deleteSourceSlice: async (sourceVol, fileName) => { try { await sourceVol.deleteCommittedFile(fileName); return true; } catch { return false; } },
+    recordRelocated: (fromVolumeId, toVolumeId, size, sliceSize, isParity) => {
+        const { storageStatsTracker } = require('../storage/stats-tracker') as typeof import('../storage/stats-tracker');
+        storageStatsTracker.recordRelocated(fromVolumeId, toVolumeId, size, sliceSize, isParity);
+    },
     runtimeConfig,
     isFrozen: isMaintenanceFrozen,
     createLogger,
@@ -205,6 +210,8 @@ export class RebalanceJob {
             return;
         }
         s.moves++;
+        // Reflect the move in per-volume storage stats immediately (source -1, target +1).
+        this.deps.recordRelocated(source.id, dest.id, (doc as { size?: number }).size ?? 0, sliceBytes, isParity);
         // Free the space (the point of rebalance). A crash before this leaves a harmless duplicate.
         if (!await this.deps.deleteSourceSlice(source, fileName)) s.sourceDeleteFailed++;
         else this.accountMove(source, dest, sliceBytes);

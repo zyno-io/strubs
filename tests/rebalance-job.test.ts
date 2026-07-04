@@ -29,6 +29,7 @@ const makeJob = (vols: any[], doc: any, overrides?: any) => {
         tryCopyRelocate: vi.fn().mockResolvedValue(true),
         repairSlice: vi.fn().mockResolvedValue(undefined),
         deleteSourceSlice: vi.fn().mockResolvedValue(true),
+        recordRelocated: vi.fn(),
         runtimeConfig: { get: vi.fn(), set: vi.fn(), delete: vi.fn() },
         isFrozen: vi.fn().mockResolvedValue(false),
         createLogger: loggerFactory(),
@@ -55,6 +56,7 @@ describe('RebalanceJob', () => {
         // flip: source 1 -> target 2, with the distinct-volume (toVolumeId) guard
         expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 1, 2);
         expect(deps.deleteSourceSlice).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }), 'obj1.0');
+        expect(deps.recordRelocated).toHaveBeenCalledWith(1, 2, 160, 40, false); // stats: source 1 -> dest 2
     });
 
     it('recomputes (reconstructs) parity slices instead of copying them', async () => {

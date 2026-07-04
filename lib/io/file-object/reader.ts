@@ -311,6 +311,42 @@ export class FileObjectReader extends Base {
         return { buffer: snapshot, chunkDataSize };
     }
 
+    // Parity verification for the current chunk set: read the STORED parity chunks, recompute the CORRECT
+    // parity from the data, and compare. A foreign/bad parity slice (self-consistent but encoding the
+    // wrong data -- the incident failure mode) shows up here as a mismatch; nothing else validates it.
+    // Skips (dataIncomplete=true) when a data slice had to be reconstructed, since then the recomputed
+    // parity is derived from possibly-wrong data. Advances to the next chunk set. Returns null at EOF.
+    async verifyChunkSetParity(): Promise<{ mismatched: number[]; missing: number[]; dataIncomplete: boolean } | null> {
+        if (this.hasReachedEOF)
+            return null;
+        const chunkIndex = this._currentChunkSetIndex;
+        // Read the parity as stored on disk (independent of the recompute buffer).
+        const stored: (Buffer | null)[] = [];
+        for (const parityIndex of this.parityIndices()) {
+            try {
+                await this.ensureSliceOpen(parityIndex); // a healthy read only opens data slices
+                stored.push(Buffer.from(await this._readSliceChunk(parityIndex, chunkIndex)));
+            }
+            catch { stored.push(null); }
+        }
+        // Recompute the correct full chunk set (reconstructs any missing DATA from parity, then recomputes
+        // every parity chunk from that data region).
+        const recomputed = await this.reconstructFullChunkSet();
+        if (!recomputed)
+            return null;
+        const dataIncomplete = this.dataIndices().some(index => this._failedSlices.has(index));
+        const mismatched: number[] = [];
+        const missing: number[] = [];
+        this.parityIndices().forEach((parityIndex, position) => {
+            const start = (this.dataSliceCount + position) * recomputed.chunkDataSize;
+            const correct = recomputed.buffer.subarray(start, start + recomputed.chunkDataSize);
+            const onDisk = stored[position];
+            if (!onDisk) { missing.push(parityIndex); return; }
+            if (!dataIncomplete && !onDisk.equals(correct)) mismatched.push(parityIndex);
+        });
+        return { mismatched, missing, dataIncomplete };
+    }
+
     private dataIndices(): number[] {
         return Array.from({ length: this.dataSliceCount }, (_unused, index) => index);
     }

@@ -32,6 +32,8 @@ type DrainVolumeJobDeps = {
     // Clear the draining flag once the drain job finishes (the drive stays read-only -- the operator
     // deletes or un-read-onlys it as a separate manual step).
     markDrainComplete: (volumeId: number) => Promise<void>;
+    // Notify storage stats of a slice moving fromVolumeId -> toVolumeId (near-immediate per-volume update).
+    recordRelocated: (fromVolumeId: number, toVolumeId: number, size: number, sliceSize: number, isParity: boolean) => void;
     runtimeConfig: typeof runtimeConfig;
     isFrozen: () => Promise<boolean>;
     createLogger: typeof createLogger;
@@ -62,6 +64,10 @@ const defaultDeps: DrainVolumeJobDeps = {
     markDrainComplete: async (volumeId: number) => {
         await database.updateVolumeFlags(volumeId, { isDraining: false });
         await ioManager.updateVolumeFlags(volumeId, { isDraining: false });
+    },
+    recordRelocated: (fromVolumeId, toVolumeId, size, sliceSize, isParity) => {
+        const { storageStatsTracker } = require('../storage/stats-tracker') as typeof import('../storage/stats-tracker');
+        storageStatsTracker.recordRelocated(fromVolumeId, toVolumeId, size, sliceSize, isParity);
     },
     runtimeConfig,
     isFrozen: isMaintenanceFrozen,
@@ -280,6 +286,9 @@ export class DrainVolumeJob {
             return;
         }
         s.relocated++;
+        // Reflect the move in per-volume storage stats immediately (source -1, target +1) so the UI
+        // tracks the drain instead of waiting for the next full reconcile.
+        this.deps.recordRelocated(volumeId, target.id, (doc as { size?: number }).size ?? 0, sliceBytes, isParity);
         // Account the write so pickTarget spreads within the run (loadFromRecord objects don't
         // self-account on commit). Drain keeps the source, so only the target changes.
         if (typeof target.bytesFree === 'number') target.bytesFree -= sliceBytes;

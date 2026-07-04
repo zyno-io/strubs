@@ -115,6 +115,31 @@ export function buildStorageStatsDeltaForObject(record: StatsObjectRecord, direc
     return delta;
 }
 
+// A single slice of an EXISTING object moving from one volume to another (drain/rebalance). The object
+// still exists and its total slices/bytes are unchanged, so SYSTEM counters don't move -- only the two
+// volumes' per-volume counters shift (source -1, target +1). Distinct-volume placement guarantees the
+// object had exactly one slice on the source and none on the target, so objectCount is ∓1 on each.
+export function buildStorageStatsDeltaForRelocation(fromVolumeId: number, toVolumeId: number, size: number, sliceSize: number, isParity: boolean): StorageStatsDelta {
+    const delta = createEmptyStorageStatsDelta();
+    const apply = (volumeId: number, dir: 1 | -1): void => {
+        const entry = getOrCreateVolumeDelta(delta, volumeId);
+        entry.objectCount += dir;
+        entry.logicalBytes += dir * size;
+        entry.physicalBytes += dir * sliceSize;
+        if (isParity) {
+            entry.paritySliceCount += dir;
+            entry.parityBytes += dir * sliceSize;
+        }
+        else {
+            entry.dataSliceCount += dir;
+            entry.dataBytes += dir * sliceSize;
+        }
+    };
+    apply(fromVolumeId, -1);
+    apply(toVolumeId, 1);
+    return delta;
+}
+
 export function mergeStorageStatsDelta(target: StorageStatsDelta, source: StorageStatsDelta): void {
     mergeSystemCounters(target.system, source.system);
     for (const [volumeId, counters] of Object.entries(source.volumes))

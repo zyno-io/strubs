@@ -4,6 +4,7 @@ import type { StoredObjectRecord } from '../io/file-object';
 import { createLogger } from '../log';
 import {
     buildStorageStatsDeltaForObject,
+    buildStorageStatsDeltaForRelocation,
     createEmptyStorageStatsDelta,
     mergeStorageStatsDelta,
     storageStatsDeltaIsEmpty
@@ -84,6 +85,17 @@ export class StorageStatsTracker {
 
     recordDeleted(record: StoredObjectRecord): void {
         this.recordDelta(record, -1);
+    }
+
+    // A drain/rebalance moved one slice from fromVolumeId to toVolumeId. Applies the per-volume delta
+    // immediately (flushed within the flush interval) so per-volume counts track the relocation instead
+    // of waiting for the next full reconcile.
+    recordRelocated(fromVolumeId: number, toVolumeId: number, size: number, sliceSize: number, isParity: boolean): void {
+        if (!this.started)
+            return;
+        this.mutationSerial += 1;
+        mergeStorageStatsDelta(this.pending, buildStorageStatsDeltaForRelocation(fromVolumeId, toVolumeId, size, sliceSize, isParity));
+        this.scheduleFlush();
     }
 
     async getSnapshot(): Promise<StorageStatsSnapshot | null> {

@@ -75,6 +75,36 @@ describe('StorageStatsTracker', () => {
         await tracker.stop();
     });
 
+    it('records a slice relocation as a per-volume-only delta (system unchanged)', async () => {
+        const database = {
+            applyStorageStatsDelta: vi.fn().mockResolvedValue(undefined),
+            getStorageStats: vi.fn(),
+            backfillContentSliceSizes: vi.fn().mockResolvedValue(0),
+            computeStorageStats: vi.fn(),
+            replaceStorageStats: vi.fn(),
+            refreshStorageStatsUnavailable: vi.fn()
+        };
+        const tracker = new StorageStatsTracker({
+            database: database as any,
+            ioManager: { getVolumeEntries: vi.fn(() => [[1, { isReadable: true }], [2, { isReadable: true }]]) },
+            createLogger: createLogger()
+        });
+        tracker.start({ reconcileIntervalMs: 0, flushIntervalMs: 1000 });
+
+        // a 40-byte DATA slice of a 160-byte object moves from vol 1 -> vol 2
+        tracker.recordRelocated(1, 2, 160, 40, false);
+        await tracker.flush();
+
+        const delta = database.applyStorageStatsDelta.mock.calls[0][0];
+        // object still exists -> system totals unchanged
+        expect(delta.system).toMatchObject({ objectCount: 0, logicalBytes: 0, dataSliceCount: 0, paritySliceCount: 0, physicalBytes: 0 });
+        // source loses the slice, target gains it
+        expect(delta.volumes['1']).toMatchObject({ objectCount: -1, logicalBytes: -160, dataSliceCount: -1, dataBytes: -40, physicalBytes: -40 });
+        expect(delta.volumes['2']).toMatchObject({ objectCount: 1, logicalBytes: 160, dataSliceCount: 1, dataBytes: 40, physicalBytes: 40 });
+
+        await tracker.stop();
+    });
+
     it('tracks unavailable object deltas against readable volume ids', async () => {
         const database = {
             applyStorageStatsDelta: vi.fn().mockResolvedValue(undefined),

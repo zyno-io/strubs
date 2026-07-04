@@ -34,6 +34,7 @@ const makeJob = (overrides?: any) => {
         repairSlice: vi.fn().mockResolvedValue(undefined),
         deleteSlice: vi.fn().mockResolvedValue(undefined),
         markDrainComplete: vi.fn().mockResolvedValue(undefined),
+        recordRelocated: vi.fn(),
         runtimeConfig: { get: vi.fn(), set: vi.fn(), delete: vi.fn() },
         isFrozen: vi.fn().mockResolvedValue(false),
         createLogger: loggerFactory(),
@@ -57,6 +58,8 @@ describe('DrainVolumeJob', () => {
         expect(sliceIndex).toBe(0);
         expect(relocatedObject.dataSliceVolumeIds[0]).toBe(21); // repointed off volume 5 before rebuild
         expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, 21);
+        // storage stats notified of the move: source 5 -> target 21, data slice, size 4000, sliceSize 1000
+        expect(deps.recordRelocated).toHaveBeenCalledWith(5, 21, 4000, 1000, false);
     });
 
     it('uses copy-first when the source is online and the copy validates (no reconstruction)', async () => {
