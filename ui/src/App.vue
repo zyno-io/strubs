@@ -94,6 +94,12 @@ let verifyPollTimer: ReturnType<typeof setInterval> | null = null;
 const maintenanceFrozen = ref<boolean | null>(null);
 const freezePending = ref<boolean>(false);
 
+// The maintenance panel (verify + freeze) collapses when everything is nominal — nothing verifying and
+// maintenance enabled (not frozen) — and auto-expands when a verify is running or maintenance is frozen.
+const maintenanceCollapsed = ref<boolean>(true);
+const maintenanceNominal = computed(() => !verifyStatus.value?.running && maintenanceFrozen.value === false);
+watch(maintenanceNominal, nominal => { maintenanceCollapsed.value = nominal; }, { immediate: true });
+
 interface StorageCounters {
   objectCount: number;
   logicalBytes: number;
@@ -1028,23 +1034,7 @@ onUnmounted(() => {
   <div class="container">
     <header>
       <h1>STRUBS</h1>
-      <span
-        v-if="maintenanceFrozen !== null"
-        class="freeze-pill"
-        :class="maintenanceFrozen ? 'frozen' : 'active'"
-        :title="maintenanceFrozen ? 'Verify, repair, drain and rebalance are paused' : 'Maintenance is running'"
-      >
-        {{ maintenanceFrozen ? '❄ Frozen' : '● Maintenance active' }}
-      </span>
     </header>
-
-    <!-- Maintenance freeze banner (only while frozen, so it stays visible/actionable) -->
-    <div v-if="maintenanceFrozen === true" class="freeze-banner">
-      <span>Maintenance is <strong>frozen</strong> — verify, repair, drain, and rebalance are paused.</span>
-      <button @click="toggleFreeze" :disabled="freezePending" class="unfreeze-btn">
-        {{ freezePending ? 'Unfreezing…' : 'Unfreeze' }}
-      </button>
-    </div>
 
     <div class="controls">
       <button @click="refreshDevices" :disabled="loading" class="refresh-btn">
@@ -1053,28 +1043,49 @@ onUnmounted(() => {
       <button @click="openModal" :disabled="loading || availableDevices.length === 0" class="add-btn">
         + Add Volume
       </button>
-      <button
-        v-if="maintenanceFrozen === false"
-        @click="toggleFreeze"
-        :disabled="freezePending"
-        class="freeze-btn"
-      >
-        {{ freezePending ? 'Freezing…' : 'Freeze Maintenance' }}
-      </button>
     </div>
 
-    <!-- Verify Job Panel -->
+    <!-- Maintenance panel: verify status + freeze control. Collapsible; collapsed when all is nominal. -->
     <section class="section verify-panel">
-      <div class="verify-header">
+      <div class="verify-header maintenance-summary" @click="maintenanceCollapsed = !maintenanceCollapsed">
         <div class="verify-title">
-          <h2>Verify</h2>
+          <span class="collapse-chevron">{{ maintenanceCollapsed ? '▸' : '▾' }}</span>
+          <h2>Maintenance</h2>
           <span
             class="verify-state"
             :class="verifyStatus?.running ? 'running' : 'idle'"
           >
-            {{ verifyStatus?.running ? 'Running' : 'Idle' }}
+            {{ verifyStatus?.running ? 'Verifying' : 'Idle' }}
+          </span>
+          <span
+            v-if="maintenanceFrozen !== null"
+            class="freeze-pill"
+            :class="maintenanceFrozen ? 'frozen' : 'active'"
+            :title="maintenanceFrozen ? 'Verify, repair, drain and rebalance are paused' : 'Maintenance is running'"
+          >
+            {{ maintenanceFrozen ? '❄ Frozen' : '● Active' }}
           </span>
         </div>
+        <div class="verify-actions" @click.stop>
+          <button
+            v-if="maintenanceFrozen !== null"
+            @click="toggleFreeze"
+            :disabled="freezePending"
+            :class="maintenanceFrozen ? 'unfreeze-btn' : 'freeze-btn'"
+          >
+            {{ maintenanceFrozen
+              ? (freezePending ? 'Unfreezing…' : 'Unfreeze')
+              : (freezePending ? 'Freezing…' : 'Freeze') }}
+          </button>
+        </div>
+      </div>
+
+      <template v-if="!maintenanceCollapsed">
+      <div v-if="maintenanceFrozen === true" class="freeze-banner">
+        Maintenance is <strong>frozen</strong> — verify, repair, drain, and rebalance are paused.
+      </div>
+      <div class="verify-subheader">
+        <h3>Verify</h3>
         <div class="verify-actions">
           <button
             @click="startVerify"
@@ -1136,6 +1147,7 @@ onUnmounted(() => {
           vol {{ entry.volumeId }}: {{ entry.count.toLocaleString() }}
         </span>
       </div>
+      </template>
     </section>
 
     <section
@@ -1878,6 +1890,35 @@ h2 {
   flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 16px;
+}
+
+.maintenance-summary {
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 0;
+}
+
+.collapse-chevron {
+  font-size: 12px;
+  color: #888;
+  width: 10px;
+  display: inline-block;
+}
+
+.verify-subheader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0 6px;
+  padding-top: 12px;
+  border-top: 1px solid #eee;
+}
+
+.verify-subheader h3 {
+  margin: 0;
+  font-size: 15px;
+  color: #555;
 }
 
 .verify-title {
