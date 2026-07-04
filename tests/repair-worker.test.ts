@@ -62,6 +62,19 @@ describe('RepairWorker', () => {
         expect(deps.remediationService.markRepairAttempted).toHaveBeenCalledWith('1:obj1:0');
     });
 
+    it('clears a stale fault when the object no longer references the fault volume (relocated by a drain)', async () => {
+        const { worker, deps } = makeWorker({
+            // object moved off volume 1 (its slices are now on 2-7); the fault volume is even unwritable
+            database: { getObjectById: vi.fn().mockResolvedValue({ id: 'obj1', size: 10, dataVolumes: [2, 3, 4, 5], parityVolumes: [6, 7] }) },
+            isVolumeWritable: vi.fn().mockReturnValue(false)
+        });
+        await worker.processFaults();
+
+        expect(deps.remediationService.clearFault).toHaveBeenCalledWith('1:obj1:0');
+        expect(deps.remediationService.markRepairBlocked).not.toHaveBeenCalled(); // NOT deferred as target-unwritable
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+    });
+
     it('rebuilds a confirmed-bad slice and clears the fault after it re-verifies', async () => {
         const verifyObject = vi.fn()
             .mockResolvedValueOnce({ '0': { ok: false, volumeId: 1 } }) // classify: still bad

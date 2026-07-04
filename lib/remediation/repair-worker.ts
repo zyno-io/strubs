@@ -342,6 +342,18 @@ export class RepairWorker {
             if (this.stopping)
                 return 'cancelled';
 
+            // Stale fault: the object no longer references the volume the fault was recorded on -- its
+            // slice was relocated (e.g. by a drain), so there is nothing to repair here. Clear it rather
+            // than deferring forever as target-unwritable when that old volume is offline/read-only.
+            const relocated = record as { dataVolumes?: unknown; parityVolumes?: unknown } | null;
+            if (relocated && Array.isArray(relocated.dataVolumes) && Array.isArray(relocated.parityVolumes)
+                && typeof fault.volumeId === 'number'
+                && !(relocated.dataVolumes as number[]).includes(fault.volumeId)
+                && !(relocated.parityVolumes as number[]).includes(fault.volumeId)) {
+                await this.clear(fault, 'slice relocated off volume — fault stale');
+                return 'processed';
+            }
+
             // Guard BEFORE any repair attempt: never reconstruct objects that are documented as
             // unrecoverable or already below quorum. Beyond being futile, reconstruction from
             // foreign/corrupt surviving slices yields self-consistent-but-wrong bytes that pass the

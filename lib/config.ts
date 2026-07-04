@@ -9,7 +9,10 @@ dotenv.config();
 const log = createLogger('config');
 
 const VALID_SEVERITIES: Severity[] = ['info', 'warning', 'critical'];
-const DEFAULT_SCRUB_INTERVAL_MS = 24 * 60 * 60 * 1000;
+// A full whole-object rolling scrub takes many days on a large array, so poke it roughly monthly
+// rather than daily (the scheduler no-ops while a scrub is still in flight). Override with
+// STRUBS_SCRUB_INTERVAL_MS.
+const DEFAULT_SCRUB_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_SYSLOG_WATCH_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_REPAIR_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_REPAIR_BATCH_SIZE = 25;
