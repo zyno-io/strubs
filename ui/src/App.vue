@@ -90,6 +90,10 @@ const verifyActionPending = ref<boolean>(false);
 const stopRequested = ref<boolean>(false);
 let verifyPollTimer: ReturnType<typeof setInterval> | null = null;
 
+// Maintenance freeze: when frozen, verify/repair/drain/rebalance are all paused.
+const maintenanceFrozen = ref<boolean | null>(null);
+const freezePending = ref<boolean>(false);
+
 interface StorageCounters {
   objectCount: number;
   logicalBytes: number;
@@ -119,6 +123,46 @@ async function fetchStorageStats(): Promise<void> {
     storageStats.value = await res.json();
   } catch {
     // Ignore transient stats polling errors
+  }
+}
+
+// Poll the maintenance-freeze state; tolerant of transient errors so polling continues.
+async function fetchFreezeStatus(): Promise<void> {
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/maintenance-freeze`);
+    if (!res.ok) return;
+    maintenanceFrozen.value = (await res.json()).frozen;
+  } catch {
+    // Ignore transient errors
+  }
+}
+
+// Toggle the maintenance freeze. Unfreezing resumes drains, then verify + repair + rebalance;
+// freezing pauses them. Confirm either way since it changes what the system is actively doing.
+async function toggleFreeze(): Promise<void> {
+  if (freezePending.value || maintenanceFrozen.value === null) return;
+  const next = !maintenanceFrozen.value;
+  const msg = next
+    ? 'Freeze maintenance? This pauses verify, repair, drain, and rebalance.'
+    : 'Unfreeze maintenance? This resumes drains, then verify, repair, and rebalance.';
+  if (!confirm(msg)) return;
+  freezePending.value = true;
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/maintenance-freeze`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ frozen: next })
+    });
+    if (!res.ok) {
+      error.value = `Failed to ${next ? 'freeze' : 'unfreeze'} (HTTP ${res.status})`;
+      return;
+    }
+    maintenanceFrozen.value = (await res.json()).frozen;
+    void fetchVerifyStatus();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to update maintenance freeze';
+  } finally {
+    freezePending.value = false;
   }
 }
 
@@ -965,8 +1009,9 @@ onMounted(() => {
   fetchData();
   fetchVerifyStatus();
   fetchStorageStats();
-  // Keep the verify panel live without a manual refresh
-  verifyPollTimer = setInterval(fetchVerifyStatus, 3000);
+  fetchFreezeStatus();
+  // Keep the verify panel + freeze state live without a manual refresh
+  verifyPollTimer = setInterval(() => { fetchVerifyStatus(); fetchFreezeStatus(); }, 3000);
   storageStatsPollTimer = setInterval(fetchStorageStats, 10000);
   // Close context menu on click anywhere
   document.addEventListener('click', hideContextMenu);
@@ -983,13 +1028,38 @@ onUnmounted(() => {
   <div class="container">
     <header>
       <h1>STRUBS</h1>
+      <span
+        v-if="maintenanceFrozen !== null"
+        class="freeze-pill"
+        :class="maintenanceFrozen ? 'frozen' : 'active'"
+        :title="maintenanceFrozen ? 'Verify, repair, drain and rebalance are paused' : 'Maintenance is running'"
+      >
+        {{ maintenanceFrozen ? '❄ Frozen' : '● Maintenance active' }}
+      </span>
     </header>
+
+    <!-- Maintenance freeze banner (only while frozen, so it stays visible/actionable) -->
+    <div v-if="maintenanceFrozen === true" class="freeze-banner">
+      <span>Maintenance is <strong>frozen</strong> — verify, repair, drain, and rebalance are paused.</span>
+      <button @click="toggleFreeze" :disabled="freezePending" class="unfreeze-btn">
+        {{ freezePending ? 'Unfreezing…' : 'Unfreeze' }}
+      </button>
+    </div>
+
     <div class="controls">
       <button @click="refreshDevices" :disabled="loading" class="refresh-btn">
         {{ loading ? 'Loading...' : 'Refresh' }}
       </button>
       <button @click="openModal" :disabled="loading || availableDevices.length === 0" class="add-btn">
         + Add Volume
+      </button>
+      <button
+        v-if="maintenanceFrozen === false"
+        @click="toggleFreeze"
+        :disabled="freezePending"
+        class="freeze-btn"
+      >
+        {{ freezePending ? 'Freezing…' : 'Freeze Maintenance' }}
       </button>
     </div>
 
@@ -1519,7 +1589,10 @@ onUnmounted(() => {
 
 header {
   margin-bottom: 15px;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
 }
 
 h1 {
@@ -1543,7 +1616,7 @@ h2 {
   justify-content: center;
 }
 
-.refresh-btn, .add-btn {
+.refresh-btn, .add-btn, .freeze-btn, .unfreeze-btn {
   padding: 6px 14px;
   color: white;
   border: none;
@@ -1561,7 +1634,7 @@ h2 {
   background-color: #1976D2;
 }
 
-.refresh-btn:disabled, .add-btn:disabled {
+.refresh-btn:disabled, .add-btn:disabled, .freeze-btn:disabled, .unfreeze-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
@@ -1572,6 +1645,50 @@ h2 {
 
 .add-btn:hover:not(:disabled) {
   background-color: #45a049;
+}
+
+/* --- maintenance freeze --- */
+.freeze-pill {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.freeze-pill.frozen {
+  background-color: #e1f5fe;
+  color: #0277bd;
+  border: 1px solid #4fc3f7;
+}
+.freeze-pill.active {
+  background-color: #e8f5e9;
+  color: #2e7d32;
+  border: 1px solid #81c784;
+}
+.freeze-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-bottom: 15px;
+  padding: 10px 16px;
+  background-color: #e1f5fe;
+  border: 1px solid #4fc3f7;
+  border-radius: 6px;
+  color: #01579b;
+  font-size: 13px;
+}
+.freeze-btn {
+  background-color: #ff9800;
+}
+.freeze-btn:hover:not(:disabled) {
+  background-color: #f57c00;
+}
+.unfreeze-btn {
+  background-color: #0288d1;
+}
+.unfreeze-btn:hover:not(:disabled) {
+  background-color: #0277bd;
 }
 
 .section {
