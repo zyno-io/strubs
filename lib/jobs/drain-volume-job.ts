@@ -167,7 +167,7 @@ export class DrainVolumeJob {
                 await this.processBatch(batch, volumeId, s);
                 if (this.aborted)
                     return;
-                cursor = String(batch[batch.length - 1]._id);
+                cursor = (batch[batch.length - 1] as { id: string }).id;
                 await this.deps.runtimeConfig.set(DRAIN_CURSOR_ID_KEY, cursor);
                 if (s.objects % 1000 === 0)
                     this.log('  ...%d objects, %d relocated, %d unrecoverable, %d dead-skipped', s.objects, s.relocated, s.unrecoverable, s.skippedDead);
@@ -197,7 +197,7 @@ export class DrainVolumeJob {
                 break;
             s.objects++;
             const p = this.drainObject(doc, volumeId, s).catch(err => {
-                this.log.error('drain of object %s failed: %s', String((doc as { _id?: unknown })._id), err instanceof Error ? err.message : String(err));
+                this.log.error('drain of object %s failed: %s', (doc as { id?: string }).id, err instanceof Error ? err.message : String(err));
             }).finally(() => inflight.delete(p));
             inflight.add(p);
             if (inflight.size >= this.deps.concurrency)
@@ -225,7 +225,7 @@ export class DrainVolumeJob {
         const declared = (doc as { sliceSize?: number }).sliceSize;
         const sliceBytes = typeof declared === 'number' ? declared : Math.ceil(((doc as { size?: number }).size ?? 0) / Math.max(1, dataVols.length));
         const target = this.pickTarget(objectVols, sliceBytes);
-        if (!target) { s.noDest++; this.log('no relocation target for object %s (all healthy volumes in use or full)', String((doc as { _id?: unknown })._id)); return; }
+        if (!target) { s.noDest++; this.log('no relocation target for object %s (all healthy volumes in use or full)', (doc as { id?: string }).id); return; }
 
         const object = await this.deps.loadObject(doc);
         const isParity = idx >= object.dataSliceCount;
@@ -236,7 +236,7 @@ export class DrainVolumeJob {
 
         // Copy-first for DATA (fast); PARITY is always RECOMPUTED (a byte-copy would preserve known-bad
         // /foreign parity). Reconstruct is whole-object md5-gated and works even when the source is offline.
-        const fileName = `${String(doc._id)}.${idx}`;
+        const fileName = `${(doc as { id: string }).id}.${idx}`;
         const sourceVol = this.deps.getVolume(volumeId);
         let placed = false;
         if (sourceVol && !isParity)
@@ -255,7 +255,7 @@ export class DrainVolumeJob {
         if (!placed) return;
         // Positional flip: rewrites only this slice's ref (source->target), so a concurrent relocation
         // of another slice of the same object can't be clobbered.
-        const flipped = await this.deps.database.replaceObjectVolumeRef(doc._id, volumeId, target.id);
+        const flipped = await this.deps.database.replaceObjectVolumeRef((doc as { id: string }).id, volumeId, target.id);
         if (!flipped) {
             await this.deps.deleteSlice(target, fileName).catch(() => undefined); // drop the orphan copy; drain keeps the source
             return;

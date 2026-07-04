@@ -6,7 +6,7 @@ const loggerFactory = () => vi.fn(() => Object.assign(vi.fn(), { error: vi.fn() 
 
 // object with a slice on the draining volume (index 0 = volume 5)
 const objectDoc = (overrides?: Record<string, unknown>) => ({
-    _id: 'obj1',
+    id: 'obj1',
     dataVolumes: [5, 10, 11, 12],
     parityVolumes: [13, 14],
     size: 4000,

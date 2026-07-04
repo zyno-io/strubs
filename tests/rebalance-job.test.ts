@@ -12,8 +12,8 @@ const vol = (id: number, bytesFree: number, extra?: Record<string, unknown>) => 
 
 // object with its slice on the source volume; `slot` decides data (0) vs parity index
 const objectDoc = (sourceId: number, slot: 'data' | 'parity') => slot === 'data'
-    ? { _id: 'obj1', dataVolumes: [sourceId, 10, 11, 12], parityVolumes: [13, 14], size: 160, sliceSize: 40 }
-    : { _id: 'obj1', dataVolumes: [10, 11, 12, 15], parityVolumes: [sourceId, 14], size: 160, sliceSize: 40 };
+    ? { id: 'obj1', dataVolumes: [sourceId, 10, 11, 12], parityVolumes: [13, 14], size: 160, sliceSize: 40 }
+    : { id: 'obj1', dataVolumes: [10, 11, 12, 15], parityVolumes: [sourceId, 14], size: 160, sliceSize: 40 };
 
 const loadedFor = (doc: any) => ({ dataSliceVolumeIds: [...doc.dataVolumes], paritySliceVolumeIds: [...doc.parityVolumes], dataSliceCount: 4, sliceSize: 40 });
 
@@ -85,7 +85,7 @@ describe('RebalanceJob', () => {
 
     it('does not move when the object already uses every under-target volume (no dest)', async () => {
         // object already on vol 2 (the only under-target) -> distinct-volume blocks it
-        const doc = { _id: 'obj1', dataVolumes: [1, 2, 11, 12], parityVolumes: [13, 14], size: 160, sliceSize: 40 };
+        const doc = { id: 'obj1', dataVolumes: [1, 2, 11, 12], parityVolumes: [13, 14], size: 160, sliceSize: 40 };
         const { job, deps } = makeJob(pool(), doc);
         await run(job);
         expect(deps.database.replaceObjectVolumeRef).not.toHaveBeenCalled();

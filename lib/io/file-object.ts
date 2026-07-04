@@ -60,6 +60,19 @@ const defaultDeps: FileObjectDependencies = {
     createLogger
 };
 
+// Mongo returns md5 as a BSON Binary (has a .buffer Buffer); the writer produces a real Buffer. Normalize
+// either to a Buffer so Buffer.equals() in the md5 gate works.
+function toBuffer(value: unknown): Buffer | null {
+    if (value == null)
+        return null;
+    if (Buffer.isBuffer(value))
+        return value;
+    const inner = (value as { buffer?: unknown }).buffer;
+    if (Buffer.isBuffer(inner))
+        return inner;
+    return Buffer.from(value as Uint8Array);
+}
+
 export class FileObject extends Duplex {
     id: string | null = null;
     idBuf: Buffer | null = null;
@@ -188,7 +201,10 @@ export class FileObject extends Duplex {
         this.size = record.size;
         this.containerId = record.containerId || null;
         this.name = record.name;
-        this.md5 = record.md5;
+        // Mongo hands md5 back as a BSON Binary, not a Buffer; unwrap it so the whole-object md5 gate
+        // (which calls Buffer.equals) works. Normal reads never compare it, so this was latent until
+        // reconstruction (drain/repair) ran on real records.
+        this.md5 = toBuffer(record.md5);
         this.mime = record.mime || null;
         this.chunkSize = record.chunkSize;
         this.dataSliceVolumeIds = record.dataVolumes;
