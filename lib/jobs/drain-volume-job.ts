@@ -20,6 +20,8 @@ type DrainVolumeJobDeps = {
     database: Pick<typeof database, 'findObjectsOnVolume' | 'replaceObjectVolumeRef' | 'getObjectById'>;
     getWritableVolumes: () => Volume[];
     getVolume: (id: number) => Volume | undefined;
+    // Ids of volumes still flagged for draining (for auto-continuing to the next queued volume).
+    getDrainingVolumeIds: () => number[];
     loadObject: (record: unknown) => Promise<LoadedObject>;
     // Copy-first fast path: if the source drive is online, copy the slice file to the target and
     // validate it (chunk checksums) -- far cheaper than RS for a HEALTHY drain. Returns false (falls
@@ -41,6 +43,7 @@ const defaultDeps: DrainVolumeJobDeps = {
     database,
     getWritableVolumes: () => ioManager.getWritableVolumes(),
     getVolume: (id: number) => ioManager.getVolume(id),
+    getDrainingVolumeIds: () => ioManager.getVolumeEntries().filter(([, v]) => v.isDraining && !v.isDeleted).map(([id]) => id),
     tryCopyRelocate: async (object: LoadedObject, sliceIndex: number, fileName: string, sourceVol: Volume, targetVol: Volume) => {
         const { relocateByCopy } = require('../io/slice-relocator') as typeof import('../io/slice-relocator');
         return relocateByCopy(object as never, sliceIndex, fileName, sourceVol, targetVol);
@@ -153,6 +156,7 @@ export class DrainVolumeJob {
         this.activeVolumeId = volumeId;
         const s: DrainSummary = { objects: 0, relocated: 0, unrecoverable: 0, skippedDead: 0, noDest: 0 };
         this.log('draining volume %d — reconstructing and relocating its slices', volumeId);
+        let completed = false;
         try {
             let cursor = afterId;
             for (;;) {
@@ -174,8 +178,10 @@ export class DrainVolumeJob {
                 if (this.deps.delayMs > 0)
                     await new Promise(r => setTimeout(r, this.deps.delayMs));
             }
-            if (!this.cancelled && !this.aborted)
+            if (!this.cancelled && !this.aborted) {
                 await this.finalize(volumeId, s);
+                completed = true;
+            }
         }
         catch (err) {
             this.log.error('drain of volume %d failed: %s', volumeId, err instanceof Error ? err.message : String(err));
@@ -187,6 +193,19 @@ export class DrainVolumeJob {
             // cancelled drain never resumes.
             if (this.aborted)
                 await this.clearState().catch(() => undefined);
+        }
+
+        // Auto-continue: if this drain finished cleanly and other volumes are still flagged for draining
+        // (e.g. the operator queued several), pick up the next one so they don't have to babysit it.
+        // The just-completed volume has had isDraining cleared, so it won't be re-selected.
+        if (completed && !this.cancelled && !this.aborted && !(await this.deps.isFrozen())) {
+            const next = this.deps.getDrainingVolumeIds().find(id => id !== volumeId);
+            if (typeof next === 'number') {
+                this.log('drain of volume %d complete; auto-continuing to next flagged volume %d', volumeId, next);
+                await this.deps.runtimeConfig.set(DRAIN_VOLUME_ID_KEY, next);
+                await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
+                await this.run(next, undefined);
+            }
         }
     }
 

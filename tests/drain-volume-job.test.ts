@@ -28,6 +28,7 @@ const makeJob = (overrides?: any) => {
             { id: 21, bytesFree: 9e9, bytesPending: 0 }
         ]),
         getVolume: vi.fn(() => ({ id: 5, isReadable: true })),
+        getDrainingVolumeIds: vi.fn(() => []),
         tryCopyRelocate: vi.fn().mockResolvedValue(false), // default: copy declines -> reconstruct path
         loadObject: vi.fn().mockResolvedValue(loadedObject()),
         repairSlice: vi.fn().mockResolvedValue(undefined),
@@ -96,6 +97,24 @@ describe('DrainVolumeJob', () => {
         });
         await runDrain(job, 5);
         expect(deps.deleteSlice).toHaveBeenCalledWith(expect.objectContaining({ id: 21 }), 'obj1.0'); // clean up target orphan
+    });
+
+    it('auto-continues to the next flagged volume when a drain completes', async () => {
+        const draining = new Set([5, 8]); // operator queued vol 5 and vol 8
+        const { job, deps } = makeJob({
+            getDrainingVolumeIds: vi.fn(() => [...draining]),
+            markDrainComplete: vi.fn(async (id: number) => { draining.delete(id); }) // clearing isDraining, as the real one does
+        });
+        await runDrain(job, 5);
+        expect(deps.markDrainComplete).toHaveBeenCalledWith(5);
+        expect(deps.markDrainComplete).toHaveBeenCalledWith(8); // picked up vol 8 without operator action
+    });
+
+    it('does not auto-continue when no other volume is flagged', async () => {
+        const { job, deps } = makeJob({ getDrainingVolumeIds: vi.fn(() => [5]) }); // only the one being drained
+        await runDrain(job, 5);
+        expect(deps.markDrainComplete).toHaveBeenCalledTimes(1);
+        expect(deps.markDrainComplete).toHaveBeenCalledWith(5);
     });
 
     it('cancel() clears persisted drain state so it does not resume', async () => {
