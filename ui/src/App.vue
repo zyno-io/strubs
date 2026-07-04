@@ -1899,9 +1899,10 @@ h2 {
 }
 
 .collapse-chevron {
-  font-size: 12px;
-  color: #888;
-  width: 10px;
+  font-size: 20px;
+  line-height: 1;
+  color: #666;
+  width: 18px;
   display: inline-block;
 }
 

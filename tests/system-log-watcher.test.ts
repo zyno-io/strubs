@@ -55,27 +55,28 @@ describe('SystemLogWatcher poll', () => {
                 return { code: 0, stdout: KERNEL_OUTPUT };
             return { code: 0, stdout: '' };
         });
-        const volumes: [number, any][] = [
-            [1, { deviceName: 'sdaf', isDeleted: false }],
-            [2, { deviceName: 'sdn', isDeleted: false }]
+        const volumes: [number, any][] = overrides?.volumes ?? [
+            [1, mkVol(1, 'sdaf')],
+            [2, mkVol(2, 'sdn')]
         ];
         return {
             run,
             ioManager: { getVolumeEntries: vi.fn(() => volumes) },
             verifyVolumesJob: { start: vi.fn().mockResolvedValue({ startedAt: 'x' }) },
             notificationService: { notify: vi.fn().mockResolvedValue({ delivered: [], failed: [], suppressed: false }) },
-            runtimeConfig: { get: vi.fn().mockResolvedValue(undefined), set: vi.fn().mockResolvedValue(undefined) },
+            persistPendingHighWater: vi.fn().mockResolvedValue(undefined),
             createLogger: loggerFactory(),
             now: () => 1000,
             ...overrides
         };
     };
 
-    // A runtimeConfig mock that actually stores, to simulate persistence across restarts.
-    const statefulConfig = () => {
-        const store = new Map<string, unknown>();
-        return { get: vi.fn(async (k: string) => store.get(k)), set: vi.fn(async (k: string, v: unknown) => { store.set(k, v); }) };
-    };
+    // A mock Volume whose in-memory high-water is mutated by setPendingSectorHighWater, mirroring the
+    // real Volume (which loads pending_sector_high_water from its DB doc on startup).
+    const mkVol = (id: number, device: string, highWater = 0) => ({
+        id, deviceName: device, isDeleted: false, pendingSectorHighWater: highWater,
+        setPendingSectorHighWater(n: number) { this.pendingSectorHighWater = n; }
+    });
     const smartd = (device: string, count: number) => `Device: /dev/${device} [SAT], ${count} Currently unreadable (pending) sectors`;
 
     it('triggers targeted verify only for devices mapped to managed volumes', async () => {
@@ -166,13 +167,18 @@ describe('SystemLogWatcher poll', () => {
         expect(deps.verifyVolumesJob.start).toHaveBeenCalledTimes(2);
     });
 
-    it('persists the pending high-water across restarts', async () => {
-        const runtimeConfig = statefulConfig();
+    it('persists the high-water onto the volume when it triggers', async () => {
+        const run = vi.fn(async (_c: string, args: string[]) => ({ code: 0, stdout: args.includes('smartd') ? smartd('sdaf', 2) : '' }));
+        const deps = makeDeps({ run });
+        await new SystemLogWatcher({ triggerCooldownMs: 0 }, deps).poll();
+        expect(deps.persistPendingHighWater).toHaveBeenCalledWith(1, 2); // sdaf -> vol 1, count 2
+    });
+
+    it('does not re-verify a pending sector already recorded on the volume (survives restart)', async () => {
+        // vol 1 (sdaf) loaded from its DB doc already at high-water 1 -- as it would be after a restart
         const run = vi.fn(async (_c: string, args: string[]) => ({ code: 0, stdout: args.includes('smartd') ? smartd('sdaf', 1) : '' }));
-        await new SystemLogWatcher({ triggerCooldownMs: 0 }, makeDeps({ run, runtimeConfig })).poll(); // triggers + persists {sdaf:1}
-        const startAfter = vi.fn().mockResolvedValue({ startedAt: 'x' });
-        // fresh watcher sharing the persisted store -- simulates a restart
-        await new SystemLogWatcher({ triggerCooldownMs: 0 }, makeDeps({ run, runtimeConfig, verifyVolumesJob: { start: startAfter } })).poll();
-        expect(startAfter).not.toHaveBeenCalled();
+        const deps = makeDeps({ run, volumes: [[1, mkVol(1, 'sdaf', 1)]] });
+        await new SystemLogWatcher({ triggerCooldownMs: 0 }, deps).poll();
+        expect(deps.verifyVolumesJob.start).not.toHaveBeenCalled();
     });
 });

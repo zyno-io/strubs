@@ -99,6 +99,10 @@ export class Database {
         await this.volumeRepository.softDeleteVolume(id);
     }
 
+    async setVolumePendingSectorHighWater(id: number, count: number): Promise<void> {
+        await this.volumeRepository.setPendingSectorHighWater(id, count);
+    }
+
     async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isDraining?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
         await this.volumeRepository.updateVolumeFlags(id, changes);
     }

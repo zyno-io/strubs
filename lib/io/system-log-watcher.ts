@@ -3,7 +3,7 @@ import { createLogger } from '../log';
 import { ioManager } from './manager';
 import { verifyVolumesJob } from '../jobs/verify-volumes-job';
 import { notificationService, NotificationService } from '../notify/service';
-import { runtimeConfig } from '../runtime-config';
+import { database } from '../database';
 import type { Volume } from './volume';
 
 type RunFn = (command: string, args: string[]) => Promise<{ code: number | null; stdout: string }>;
@@ -13,7 +13,8 @@ type SystemLogWatcherDeps = {
     ioManager: Pick<typeof ioManager, 'getVolumeEntries'>;
     verifyVolumesJob: Pick<typeof verifyVolumesJob, 'start'>;
     notificationService: NotificationService;
-    runtimeConfig: Pick<typeof runtimeConfig, 'get' | 'set'>;
+    // Persist a volume's pending-sector high-water (the in-memory Volume is updated separately).
+    persistPendingHighWater: (volumeId: number, count: number) => Promise<void>;
     createLogger: typeof createLogger;
     now: () => number;
 };
@@ -23,12 +24,10 @@ const defaultDeps: SystemLogWatcherDeps = {
     ioManager,
     verifyVolumesJob,
     notificationService,
-    runtimeConfig,
+    persistPendingHighWater: (volumeId, count) => database.setVolumePendingSectorHighWater(volumeId, count),
     createLogger,
     now: () => Date.now()
 };
-
-const PENDING_HIGH_WATER_KEY = 'syslogPendingHighWater';
 
 export type DeviceSignal = {
     device: string;            // bare device name, e.g. "sdn"
@@ -53,31 +52,11 @@ export class SystemLogWatcher {
     private lastPollAt: Date | null = null;
     private polling = false;
     private readonly lastTriggered = new Map<string, number>();
-    // Highest pending-sector count per device we've already verified. A standing (unchanged) pending
-    // sector must NOT keep re-triggering a full drive verify; only a count that GROWS beyond this does.
-    // Persisted so a restart doesn't reset it (and re-fire on every managed drive with a pending sector).
-    private readonly pendingHighWater = new Map<string, number>();
-    private highWaterLoaded = false;
 
     constructor(options?: { triggerCooldownMs?: number }, deps?: Partial<SystemLogWatcherDeps>) {
         this.deps = { ...defaultDeps, ...deps };
         this.log = this.deps.createLogger('syslog-watcher');
         this.cooldownMs = options?.triggerCooldownMs ?? DEFAULT_TRIGGER_COOLDOWN_MS;
-    }
-
-    private async ensureHighWaterLoaded(): Promise<void> {
-        if (this.highWaterLoaded)
-            return;
-        this.highWaterLoaded = true;
-        const stored = await this.deps.runtimeConfig.get(PENDING_HIGH_WATER_KEY);
-        if (stored && typeof stored === 'object')
-            for (const [device, count] of Object.entries(stored as Record<string, unknown>))
-                if (typeof count === 'number')
-                    this.pendingHighWater.set(device, count);
-    }
-
-    private async persistHighWater(): Promise<void> {
-        await this.deps.runtimeConfig.set(PENDING_HIGH_WATER_KEY, Object.fromEntries(this.pendingHighWater));
     }
 
     start(intervalMs: number): void {
@@ -111,7 +90,6 @@ export class SystemLogWatcher {
         const since = this.lastPollAt ?? new Date(this.deps.now() - DEFAULT_LOOKBACK_MS);
         const pollStart = new Date(this.deps.now());
         try {
-            await this.ensureHighWaterLoaded();
             const signals = await this.collectSignals(since);
             const byDevice = this.dedupeByDevice(signals);
             for (const signal of byDevice)
@@ -157,24 +135,25 @@ export class SystemLogWatcher {
     }
 
     private async handleSignal(signal: DeviceSignal): Promise<void> {
+        const volume = this.resolveVolume(signal.device);
+        if (!volume) {
+            // Not a managed volume (yet) — don't arm anything, so we still react if it becomes one later.
+            this.log('ignoring %s on %s (not a managed volume)', signal.kind, signal.device);
+            return;
+        }
+        const volumeId = volume.id;
+
         // Pending sectors are a STANDING condition smartd re-reports every check. Only act when the count
-        // has grown beyond what we've already verified for this device -- a stable known-pending sector
-        // must not perpetually re-verify a whole drive.
-        if (signal.kind === 'pending' && (signal.count ?? 0) <= (this.pendingHighWater.get(signal.device) ?? 0))
+        // has grown beyond what we've already verified for THIS volume -- a stable known-pending sector
+        // must not perpetually re-verify a whole drive. The high-water lives on the volume, so it
+        // survives restarts and is discarded with the volume.
+        if (signal.kind === 'pending' && (signal.count ?? 0) <= volume.pendingSectorHighWater)
             return;
 
         const last = this.lastTriggered.get(signal.device);
         const now = this.deps.now();
         if (last !== undefined && now - last < this.cooldownMs)
             return; // already acted on this device recently
-
-        const volumeId = this.resolveVolumeId(signal.device);
-        if (volumeId === null) {
-            // Not a managed volume (yet) — don't arm the cooldown or high-water, so we still react if it
-            // becomes one later.
-            this.log('ignoring %s on %s (not a managed volume)', signal.kind, signal.device);
-            return;
-        }
 
         this.log('device %s (volume %d) reported %s; triggering targeted verify', signal.device, volumeId, signal.kind);
 
@@ -197,11 +176,11 @@ export class SystemLogWatcher {
             // Arm the cooldown only once the verify run was accepted, so a
             // transient failure doesn't suppress this device for hours.
             this.lastTriggered.set(signal.device, now);
-            // Record the pending high-water (persisted) so this standing count won't re-trigger; only a
-            // further increase will.
+            // Record the pending high-water on the volume (in-memory + persisted) so this standing count
+            // won't re-trigger; only a further increase will.
             if (signal.kind === 'pending') {
-                this.pendingHighWater.set(signal.device, signal.count ?? 0);
-                await this.persistHighWater();
+                volume.setPendingSectorHighWater(signal.count ?? 0);
+                await this.deps.persistPendingHighWater(volumeId, signal.count ?? 0);
             }
         }
         catch (err) {
@@ -209,13 +188,13 @@ export class SystemLogWatcher {
         }
     }
 
-    private resolveVolumeId(device: string): number | null {
-        for (const [id, volume] of this.deps.ioManager.getVolumeEntries()) {
+    private resolveVolume(device: string): Volume | null {
+        for (const [, volume] of this.deps.ioManager.getVolumeEntries()) {
             const vol = volume as Volume;
             if (vol.isDeleted)
                 continue;
             if (vol.deviceName === device)
-                return id;
+                return vol;
         }
         return null;
     }

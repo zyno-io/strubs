@@ -118,4 +118,11 @@ describe('VolumeRepository.updateVolumeFlags', () => {
         await repo.softDeleteVolume(9);
         expect(collection.updateOne).toHaveBeenCalledWith({ id: 9 }, { $set: { enabled: false, is_deleted: true, state_updated_at: expect.any(Date) } });
     });
+
+    it('persists the pending-sector high-water on the volume', async () => {
+        const collection = { updateOne: vi.fn().mockResolvedValue(undefined) };
+        const repo = new VolumeRepository(collection as any);
+        await repo.setPendingSectorHighWater(47, 2);
+        expect(collection.updateOne).toHaveBeenCalledWith({ id: 47 }, { $set: { pending_sector_high_water: 2 } });
+    });
 });

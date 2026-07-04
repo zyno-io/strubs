@@ -69,6 +69,10 @@ export class VolumeRepository {
         await this.collection.updateOne({ id }, update);
     }
 
+    async setPendingSectorHighWater(id: number, count: number): Promise<void> {
+        await this.collection.updateOne({ id }, { $set: { pending_sector_high_water: count } });
+    }
+
     async setVerifyErrors(id: number, errors: VolumeVerifyErrors | null): Promise<void> {
         if (errors) {
             await this.collection.updateOne({ id }, { $set: { verifyErrors: errors } });

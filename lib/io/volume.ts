@@ -33,6 +33,7 @@ export interface VolumeConfig {
     is_deleted?: boolean;
     is_draining?: boolean;
     state_updated_at?: Date | string | null;
+    pending_sector_high_water?: number;
 }
 
 export type PersistedVolumeConfig = VolumeConfig & { is_deleted?: boolean };
@@ -53,6 +54,9 @@ export class Volume extends EventEmitter {
     public isDeleted: boolean;
     // Timestamp of the last operational STATE change (enabled/read-only/deleted/draining/healthy).
     public stateUpdatedAt: Date | null;
+    // Highest SMART pending-sector count we've already reacted to for this drive (the syslog-watcher
+    // only re-verifies when it GROWS beyond this, so a stable known-pending sector doesn't churn).
+    public pendingSectorHighWater: number;
     // Draining: the operator has asked to remove this drive. Its slices are being reconstructed and
     // relocated onto healthy volumes. It stays READABLE (reads still serve during the drain) but is
     // NOT writable (no new placement, no in-place repair) so the drain is the only thing moving it.
@@ -82,6 +86,7 @@ export class Volume extends EventEmitter {
 
         this.isDeleted = inConfig.is_deleted === true;
         this.stateUpdatedAt = inConfig.state_updated_at ? new Date(inConfig.state_updated_at) : null;
+        this.pendingSectorHighWater = inConfig.pending_sector_high_water ?? 0;
         this.isDraining = inConfig.is_draining === true;
         this.isEnabled = inConfig.enabled && !this.isDeleted;
         this.isHealthy = inConfig.healthy;
@@ -133,6 +138,10 @@ export class Volume extends EventEmitter {
 
     setStateUpdatedAt(when: Date): void {
         this.stateUpdatedAt = when;
+    }
+
+    setPendingSectorHighWater(count: number): void {
+        this.pendingSectorHighWater = count;
     }
 
     setVerifyErrors(errors: VolumeVerifyErrors | null): void {
