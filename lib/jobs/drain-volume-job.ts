@@ -17,7 +17,7 @@ type LoadedObject = { dataSliceVolumeIds: number[]; paritySliceVolumeIds: number
 type DrainSummary = { objects: number; relocated: number; unrecoverable: number; skippedDead: number; noDest: number };
 
 type DrainVolumeJobDeps = {
-    database: Pick<typeof database, 'findObjectsOnVolume' | 'replaceObjectVolumeRef' | 'getObjectById'>;
+    database: Pick<typeof database, 'findObjectsOnVolume' | 'replaceObjectVolumeRef' | 'getObjectById' | 'countObjectsOnVolume'>;
     getWritableVolumes: () => Volume[];
     getVolume: (id: number) => Volume | undefined;
     // Ids of volumes still flagged for draining (for auto-continuing to the next queued volume).
@@ -91,6 +91,9 @@ export class DrainVolumeJob {
     private cancelled = false; // paused (freeze) — persisted state kept so it resumes
     private aborted = false;   // operator cancel — persisted state cleared so it does NOT resume
     private activeVolumeId: number | null = null;
+    // Volumes drain-attempted this process run — so auto-continue never ping-pongs back into a volume
+    // it just finished (or one left stuck with unrelocatable slices, which keeps isDraining=true).
+    private readonly attemptedVolumeIds = new Set<number>();
 
     constructor(deps?: Partial<DrainVolumeJobDeps>) {
         this.deps = { ...defaultDeps, ...deps };
@@ -160,34 +163,55 @@ export class DrainVolumeJob {
         this.cancelled = false;
         this.aborted = false;
         this.activeVolumeId = volumeId;
+        this.attemptedVolumeIds.add(volumeId);
         const s: DrainSummary = { objects: 0, relocated: 0, unrecoverable: 0, skippedDead: 0, noDest: 0 };
         this.log('draining volume %d — reconstructing and relocating its slices', volumeId);
-        let completed = false;
+        let completed = false;    // the drain loop ran to its natural end (not paused/aborted/frozen)
+        let fullyDrained = false; // zero live (non-dead) slices remain — safe to signal the drive removable
         try {
             let cursor = afterId;
-            for (;;) {
-                if (this.aborted) { this.log('drain of volume %d cancelled', volumeId); return; }
-                if (this.cancelled) { this.log('drain of volume %d paused', volumeId); return; }
-                if (await this.deps.isFrozen()) { this.log('maintenance freeze active: pausing drain of volume %d', volumeId); return; }
+            let prevRemaining = Number.POSITIVE_INFINITY;
+            // Pass loop: a forward scan ADVANCES ITS CURSOR PAST objects that fail to relocate (a transient
+            // error, e.g. a momentary source-read failure), so a single pass can leave slices behind and
+            // still reach the end. Re-scan from the start until the count of live (non-dead) refs stops
+            // dropping: transient failures clear on retry; genuinely-unrelocatable slices (below quorum /
+            // no target) make no progress and stop the loop with the drive still flagged draining.
+            passLoop: for (;;) {
+                for (;;) {
+                    if (this.aborted) { this.log('drain of volume %d cancelled', volumeId); return; }
+                    if (this.cancelled) { this.log('drain of volume %d paused', volumeId); return; }
+                    if (await this.deps.isFrozen()) { this.log('maintenance freeze active: pausing drain of volume %d', volumeId); return; }
 
-                const batch = await this.deps.database.findObjectsOnVolume([volumeId], BATCH_SIZE, cursor);
-                if (!batch.length)
-                    break;
+                    const batch = await this.deps.database.findObjectsOnVolume([volumeId], BATCH_SIZE, cursor);
+                    if (!batch.length)
+                        break;
 
-                await this.processBatch(batch, volumeId, s);
-                if (this.aborted)
-                    return;
-                cursor = (batch[batch.length - 1] as { id: string }).id;
-                await this.deps.runtimeConfig.set(DRAIN_CURSOR_ID_KEY, cursor);
-                if (s.objects % 1000 === 0)
-                    this.log('  ...%d objects, %d relocated, %d unrecoverable, %d dead-skipped', s.objects, s.relocated, s.unrecoverable, s.skippedDead);
-                if (this.deps.delayMs > 0)
-                    await new Promise(r => setTimeout(r, this.deps.delayMs));
+                    await this.processBatch(batch, volumeId, s);
+                    if (this.aborted)
+                        return;
+                    cursor = (batch[batch.length - 1] as { id: string }).id;
+                    await this.deps.runtimeConfig.set(DRAIN_CURSOR_ID_KEY, cursor);
+                    if (s.objects % 1000 === 0)
+                        this.log('  ...%d objects, %d relocated, %d unrecoverable, %d dead-skipped', s.objects, s.relocated, s.unrecoverable, s.skippedDead);
+                    if (this.deps.delayMs > 0)
+                        await new Promise(r => setTimeout(r, this.deps.delayMs));
+                }
+
+                // Forward scan exhausted. Any live (non-dead) refs still on the volume are objects that
+                // FAILED to relocate this pass — retry them, unless the count didn't drop (stuck).
+                const remaining = await this.deps.database.countObjectsOnVolume(volumeId, { excludeDead: true });
+                if (remaining === 0) { fullyDrained = true; break passLoop; }
+                if (remaining >= prevRemaining) {
+                    this.log.error('drain of volume %d stuck: %d live slice(s) could not be relocated (below quorum / no target) — removal blocked', volumeId, remaining);
+                    break passLoop;
+                }
+                this.log('drain of volume %d: %d live ref(s) remain after pass (transient failures) — re-scanning', volumeId, remaining);
+                prevRemaining = remaining;
+                cursor = undefined;
+                await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
             }
-            if (!this.cancelled && !this.aborted) {
-                await this.finalize(volumeId, s);
-                completed = true;
-            }
+            completed = true;
+            await this.finalize(volumeId, s, fullyDrained);
         }
         catch (err) {
             this.log.error('drain of volume %d failed: %s', volumeId, err instanceof Error ? err.message : String(err));
@@ -205,7 +229,9 @@ export class DrainVolumeJob {
         // (e.g. the operator queued several), pick up the next one so they don't have to babysit it.
         // The just-completed volume has had isDraining cleared, so it won't be re-selected.
         if (completed && !this.cancelled && !this.aborted && !(await this.deps.isFrozen())) {
-            const next = this.deps.getDrainingVolumeIds().find(id => id !== volumeId);
+            // Skip any volume already attempted this run: a stuck volume keeps isDraining=true (so it
+            // still blocks its own removal) and would otherwise be re-selected here forever.
+            const next = this.deps.getDrainingVolumeIds().find(id => id !== volumeId && !this.attemptedVolumeIds.has(id));
             if (typeof next === 'number') {
                 this.log('drain of volume %d complete; auto-continuing to next flagged volume %d', volumeId, next);
                 await this.deps.runtimeConfig.set(DRAIN_VOLUME_ID_KEY, next);
@@ -310,15 +336,24 @@ export class DrainVolumeJob {
         return best;
     }
 
-    private async finalize(volumeId: number, s: DrainSummary): Promise<void> {
-        this.log('drain of volume %d complete: %d objects, %d relocated, %d unrecoverable, %d dead-skipped, %d no-dest',
+    private async finalize(volumeId: number, s: DrainSummary, fullyDrained: boolean): Promise<void> {
+        this.log('drain of volume %d finished: %d objects, %d relocated, %d unrecoverable, %d dead-skipped, %d no-dest',
             volumeId, s.objects, s.relocated, s.unrecoverable, s.skippedDead, s.noDest);
-        if (s.unrecoverable || s.noDest)
-            this.log.error('volume %d still has %d slices that could not be relocated (unrecoverable/no-dest) — removal blocked until resolved', volumeId, s.unrecoverable + s.noDest);
+        // Clear the persisted progress cursor either way: a stuck drain must not tight-loop-resume on
+        // every restart, and a done drain has nothing to resume.
         await this.deps.runtimeConfig.delete(DRAIN_VOLUME_ID_KEY);
         await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
-        // Drain job finished: clear the draining flag (the drive stays read-only + empty, awaiting a
-        // manual delete). Only reached on natural completion -- a freeze-pause returns before here.
+        if (!fullyDrained) {
+            // Live slices remain that couldn't be relocated (below quorum / no target). Do NOT clear the
+            // draining flag — leaving it set keeps the drive read-only and blocks removal until the
+            // operator resolves the loss (recoveryComment) or frees capacity.
+            const remaining = await this.deps.database.countObjectsOnVolume(volumeId, { excludeDead: true }).catch(() => -1);
+            this.log.error('volume %d NOT fully drained (%d live slice(s) remain) — draining flag left set; removal blocked until resolved', volumeId, remaining);
+            return;
+        }
+        // Fully drained: clear the draining flag (the drive stays read-only + empty, awaiting a manual
+        // delete). Only reached when zero live slices remain -- so a partial drain can never signal "safe
+        // to pull". Freeze-pause / abort return before here.
         await this.deps.markDrainComplete(volumeId);
     }
 }

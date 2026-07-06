@@ -21,7 +21,8 @@ const makeJob = (overrides?: any) => {
         database: {
             findObjectsOnVolume: vi.fn().mockResolvedValueOnce([objectDoc()]).mockResolvedValue([]),
             replaceObjectVolumeRef: vi.fn().mockResolvedValue(true),
-            getObjectById: vi.fn()
+            getObjectById: vi.fn(),
+            countObjectsOnVolume: vi.fn().mockResolvedValue(0) // volume fully drained after the pass
         },
         getWritableVolumes: vi.fn(() => [
             { id: 20, bytesFree: 5e9, bytesPending: 0 },
@@ -83,7 +84,7 @@ describe('DrainVolumeJob', () => {
     it('recomputes (reconstructs) a parity slice instead of copying it', async () => {
         const parityDoc = objectDoc({ dataVolumes: [10, 11, 12, 15], parityVolumes: [5, 14] });
         const { job, deps } = makeJob({
-            database: { findObjectsOnVolume: vi.fn().mockResolvedValueOnce([parityDoc]).mockResolvedValue([]), replaceObjectVolumeRef: vi.fn().mockResolvedValue(true), getObjectById: vi.fn() },
+            database: { findObjectsOnVolume: vi.fn().mockResolvedValueOnce([parityDoc]).mockResolvedValue([]), replaceObjectVolumeRef: vi.fn().mockResolvedValue(true), getObjectById: vi.fn(), countObjectsOnVolume: vi.fn().mockResolvedValue(0) },
             loadObject: vi.fn().mockResolvedValue({ dataSliceVolumeIds: [10, 11, 12, 15], paritySliceVolumeIds: [5, 14], dataSliceCount: 4, sliceSize: 1000 }),
             tryCopyRelocate: vi.fn().mockResolvedValue(true)
         });
@@ -96,7 +97,7 @@ describe('DrainVolumeJob', () => {
     it('drops the orphaned target copy when the flip loses a race', async () => {
         const { job, deps } = makeJob({
             tryCopyRelocate: vi.fn().mockResolvedValue(true),
-            database: { findObjectsOnVolume: vi.fn().mockResolvedValueOnce([objectDoc()]).mockResolvedValue([]), replaceObjectVolumeRef: vi.fn().mockResolvedValue(false), getObjectById: vi.fn() }
+            database: { findObjectsOnVolume: vi.fn().mockResolvedValueOnce([objectDoc()]).mockResolvedValue([]), replaceObjectVolumeRef: vi.fn().mockResolvedValue(false), getObjectById: vi.fn(), countObjectsOnVolume: vi.fn().mockResolvedValue(0) }
         });
         await runDrain(job, 5);
         expect(deps.deleteSlice).toHaveBeenCalledWith(expect.objectContaining({ id: 21 }), 'obj1.0'); // clean up target orphan
@@ -138,7 +139,8 @@ describe('DrainVolumeJob', () => {
             database: {
                 findObjectsOnVolume: vi.fn().mockResolvedValueOnce([objectDoc({ recoveryComment: 'drive gone' })]).mockResolvedValue([]),
                 replaceObjectVolumeRef: vi.fn().mockResolvedValue(true),
-                getObjectById: vi.fn()
+                getObjectById: vi.fn(),
+                countObjectsOnVolume: vi.fn().mockResolvedValue(0)
             }
         });
         await runDrain(job, 5);
@@ -197,5 +199,43 @@ describe('DrainVolumeJob', () => {
         const { job, deps } = makeJob();
         await runDrain(job, 5);
         expect(deps.markDrainComplete).toHaveBeenCalledWith(5);
+    });
+
+    it('re-scans and completes when refs a transient failure left behind clear on retry', async () => {
+        // A forward scan advances its cursor past objects that fail to relocate, so one pass can leave
+        // slices behind (the md5-Binary bug did exactly this). Completion must gate on a real ref count,
+        // not on reaching the end of the scan — so it re-scans and only completes once none remain.
+        const { job, deps } = makeJob({
+            database: {
+                findObjectsOnVolume: vi.fn()
+                    .mockResolvedValueOnce([objectDoc()]).mockResolvedValueOnce([])   // pass 1
+                    .mockResolvedValueOnce([objectDoc()]).mockResolvedValueOnce([]),  // pass 2 (retry)
+                replaceObjectVolumeRef: vi.fn().mockResolvedValue(true),
+                getObjectById: vi.fn(),
+                countObjectsOnVolume: vi.fn().mockResolvedValueOnce(1).mockResolvedValue(0) // 1 left, then 0
+            }
+        });
+        await runDrain(job, 5);
+        expect(deps.database.findObjectsOnVolume).toHaveBeenCalledTimes(4); // scanned twice
+        expect(deps.repairSlice).toHaveBeenCalledTimes(2);                  // retried the leftover slice
+        expect(deps.markDrainComplete).toHaveBeenCalledWith(5);            // completed only after 0 remain
+    });
+
+    it('does NOT mark complete or clear the draining flag when live slices cannot be relocated', async () => {
+        // Count never drops between passes -> stuck (below quorum / no target). The flag must stay set so
+        // the drive keeps blocking its own removal; a partial drain must never signal "safe to pull".
+        const { job, deps } = makeJob({
+            database: {
+                findObjectsOnVolume: vi.fn()
+                    .mockResolvedValueOnce([objectDoc()]).mockResolvedValueOnce([])
+                    .mockResolvedValueOnce([objectDoc()]).mockResolvedValueOnce([]),
+                replaceObjectVolumeRef: vi.fn().mockResolvedValue(true),
+                getObjectById: vi.fn(),
+                countObjectsOnVolume: vi.fn().mockResolvedValue(3) // no progress
+            }
+        });
+        await runDrain(job, 5);
+        expect(deps.markDrainComplete).not.toHaveBeenCalled();                       // removal blocked
+        expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('drainVolumeId');     // but progress state cleared
     });
 });
