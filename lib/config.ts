@@ -24,6 +24,7 @@ const DEFAULT_VOLUME_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_STORAGE_STATS_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_STORAGE_STATS_FLUSH_INTERVAL_MS = 5 * 1000;
 const DEFAULT_VERIFY_READ_DELAY_MS = 2;
+const DEFAULT_DRAIN_CONCURRENCY = 4;
 
 function parseSeverity(value: string | undefined, fallback: Severity): Severity {
     if (value && (VALID_SEVERITIES as string[]).includes(value))
@@ -89,6 +90,11 @@ export class Config {
     verifyReadDelayMs: number;
     verifyParity: boolean;
 
+    // How many objects a drain/rebalance relocates concurrently. Higher = faster on drives that can
+    // absorb the parallel I/O, but the aging USB-DAS enclosures are seek-bound, so raise it in small
+    // steps and measure. Override with STRUBS_DRAIN_CONCURRENCY.
+    drainConcurrency: number;
+
     constructor() {
         this.mongoUrl = process.env.STRUBS_MONGO_URL || 'mongodb://strubs:strubs@127.0.0.1:27017/strubs?authSource=admin';
         this.dataSliceCount = process.env.STRUBS_DATA_SLICES ? parseInt(process.env.STRUBS_DATA_SLICES, 10) : 4;
@@ -129,6 +135,7 @@ export class Config {
         );
         // Full-mode scrub also validates parity (recompute-and-compare); disable with =false.
         this.verifyParity = process.env.STRUBS_VERIFY_PARITY !== 'false';
+        this.drainConcurrency = parsePositiveInt(process.env.STRUBS_DRAIN_CONCURRENCY, DEFAULT_DRAIN_CONCURRENCY);
     }
 
     async loadIdentity(): Promise<void> {

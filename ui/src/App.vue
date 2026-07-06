@@ -1061,9 +1061,9 @@ onUnmounted(() => {
             v-if="maintenanceFrozen !== null"
             class="freeze-pill"
             :class="maintenanceFrozen ? 'frozen' : 'active'"
-            :title="maintenanceFrozen ? 'Verify, repair, drain and rebalance are paused' : 'Maintenance is running'"
+            :title="maintenanceFrozen ? 'Verify, repair, drain and rebalance are paused' : 'Verify, repair, drain and rebalance run automatically'"
           >
-            {{ maintenanceFrozen ? '❄ Frozen' : '● Active' }}
+            {{ maintenanceFrozen ? '❄ Frozen' : '● Enabled' }}
           </span>
         </div>
         <div class="verify-actions" @click.stop>
@@ -1899,7 +1899,7 @@ h2 {
 }
 
 .collapse-chevron {
-  font-size: 20px;
+  font-size: 32px;
   line-height: 1;
   color: #666;
   width: 18px;
@@ -1929,7 +1929,7 @@ h2 {
 }
 
 .verify-title h2 {
-  margin-bottom: 0;
+  margin: 0;
 }
 
 .verify-state {

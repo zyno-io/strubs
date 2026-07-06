@@ -11,7 +11,6 @@ import type { ContentDocument } from '../database/types';
 const DRAIN_VOLUME_ID_KEY = 'drainVolumeId';
 const DRAIN_CURSOR_ID_KEY = 'drainCursorId';
 const BATCH_SIZE = 100;
-const DEFAULT_CONCURRENCY = 4;
 
 type LoadedObject = { dataSliceVolumeIds: number[]; paritySliceVolumeIds: number[]; dataSliceCount: number; sliceSize: number };
 type DrainSummary = { objects: number; relocated: number; unrecoverable: number; skippedDead: number; noDest: number };
@@ -72,7 +71,7 @@ const defaultDeps: DrainVolumeJobDeps = {
     runtimeConfig,
     isFrozen: isMaintenanceFrozen,
     createLogger,
-    concurrency: DEFAULT_CONCURRENCY,
+    concurrency: config.drainConcurrency,
     delayMs: config.verifyReadDelayMs
 };
 
