@@ -56,6 +56,11 @@ watch([sortBy, storageTab, volumesView], () => {
 
 // Context menu state
 const contextMenu = ref<{ x: number; y: number; volumeId: number | null }>({ x: 0, y: 0, volumeId: null });
+
+// Identify-drive state: while the modal is open we re-POST /identify ~every second (heartbeat); the
+// server stops the flashing ~3s after the last ping, so closing the tab or a lost "stop" self-heals.
+const identifyDrive = ref<{ volumeId: number; device: string | null } | null>(null);
+let identifyHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 const showEditLabelModal = ref<boolean>(false);
 const editingVolumeId = ref<number | null>(null);
 const editLabelValue = ref<string>('');
@@ -962,6 +967,45 @@ async function toggleVolumeDrain(): Promise<void> {
   }
 }
 
+// Identify a drive: flash its activity LED so the operator can find the physical bay. Opens a modal and
+// heartbeats POST /identify every second; the server auto-stops ~3s after the last beat (self-heals a
+// closed tab / lost cancel). Stop() closes the modal and sends an immediate DELETE.
+async function openIdentify(): Promise<void> {
+  const volume = contextMenuVolume.value;
+  if (volume === null) return;
+  const device = deviceNameFromBlockPath(volume.blockPath ?? null);
+  hideContextMenu();
+  identifyDrive.value = { volumeId: volume.id, device };
+  await sendIdentifyBeat();
+  if (identifyHeartbeatTimer !== null) clearInterval(identifyHeartbeatTimer);
+  identifyHeartbeatTimer = setInterval(sendIdentifyBeat, 1000);
+}
+
+async function sendIdentifyBeat(): Promise<void> {
+  const target = identifyDrive.value;
+  if (target === null) return;
+  try {
+    const response = await fetch(`${apiBaseUrl}/$/volumes/${target.volumeId}/identify`, { method: 'POST' });
+    if (!response.ok) {
+      let message = `Failed to identify drive (HTTP ${response.status})`;
+      try { const text = await response.text(); if (text) message += `: ${text}`; } catch { /* ignore */ }
+      throw new Error(message);
+    }
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to identify drive';
+    stopIdentify(); // don't keep beating a failing endpoint
+  }
+}
+
+function stopIdentify(): void {
+  const target = identifyDrive.value;
+  if (identifyHeartbeatTimer !== null) { clearInterval(identifyHeartbeatTimer); identifyHeartbeatTimer = null; }
+  identifyDrive.value = null;
+  // Best-effort immediate stop; even if it doesn't land, the server's TTL stops the reads within ~3s.
+  if (target !== null)
+    void fetch(`${apiBaseUrl}/$/volumes/${target.volumeId}/identify`, { method: 'DELETE' }).catch(() => undefined);
+}
+
 // Set the shared sort field (used by the clickable table headers)
 function setSort(field: 'volumeLabel' | 'volumeId' | 'name' | 'path'): void {
   sortBy.value = field;
@@ -1026,6 +1070,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (verifyPollTimer !== null) clearInterval(verifyPollTimer);
   if (storageStatsPollTimer !== null) clearInterval(storageStatsPollTimer);
+  if (identifyDrive.value !== null) stopIdentify(); // stop flashing if the view is torn down mid-identify
   document.removeEventListener('click', hideContextMenu);
 });
 </script>
@@ -1534,7 +1579,38 @@ onUnmounted(() => {
       >
         {{ contextMenuVolume.isDraining ? 'Cancel Drain' : 'Drain (read-only + offload)' }}
       </div>
+      <div
+        v-if="contextMenuVolume"
+        class="context-menu-item"
+        @click="openIdentify"
+      >
+        Identify (flash LED)
+      </div>
       <div class="context-menu-item delete" @click="deleteVolume">Delete</div>
+    </div>
+
+    <!-- Identify Drive Modal: flashing LED indicator + stop -->
+    <div v-if="identifyDrive !== null" class="modal-overlay" @click="stopIdentify">
+      <div class="modal identify-modal" @click.stop style="max-width: 420px;">
+        <div class="modal-header">
+          <h2>Identify Drive</h2>
+          <button @click="stopIdentify" class="close-btn">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="identify-status">
+            <span class="identify-blink" aria-hidden="true"></span>
+            <div>
+              <div class="identify-line">
+                Flashing volume <strong>{{ identifyDrive.volumeId }}</strong><span v-if="identifyDrive.device"> (<code>{{ identifyDrive.device }}</code>)</span>
+              </div>
+              <div class="identify-hint">Watch the drive bays for the flashing activity LED. Reads are read-only and stop automatically a few seconds after you close this.</div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button @click="stopIdentify" class="create-btn">Stop</button>
+        </div>
+      </div>
     </div>
 
     <!-- Edit Label Modal -->
@@ -2612,6 +2688,37 @@ h2 {
   gap: 10px;
   padding: 20px;
   border-top: 1px solid #e0e0e0;
+}
+
+.identify-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.identify-blink {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  border-radius: 50%;
+  background: #f44336;
+  box-shadow: 0 0 8px 2px rgba(244, 67, 54, 0.7);
+  animation: identify-blink 1s steps(1, end) infinite;
+}
+
+@keyframes identify-blink {
+  50% { opacity: 0.15; box-shadow: none; }
+}
+
+.identify-line { font-size: 15px; }
+.identify-line code { font-family: monospace; }
+
+.identify-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #888;
+  line-height: 1.4;
 }
 
 .cancel-btn, .create-btn {

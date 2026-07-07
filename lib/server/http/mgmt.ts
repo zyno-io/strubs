@@ -8,6 +8,7 @@ import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
 import { drainVolumeJob } from '../../jobs/drain-volume-job';
+import { driveIdentifier } from '../../io/drive-identifier';
 import { rebalanceJob } from '../../jobs/rebalance-job';
 import { verifyFileJob } from '../../jobs/verify-file-job';
 import { verifyScheduler } from '../../jobs/verify-scheduler';
@@ -560,6 +561,34 @@ export class HttpMgmt {
     // Cancel an in-progress drain: abort the drain (and clear its persisted state so it never resumes),
     // then clear the draining flag. The drive is LEFT read-only (the operator clears that explicitly via
     // "Clear Read-Only" when ready to use it again). Already-relocated slices keep their new homes.
+    // Identify a drive by flashing its activity LED (continuous read-only I/O to the raw device), so the
+    // operator can find the right bay before pulling it. Heartbeat-driven: the UI re-POSTs ~every second
+    // and the reads self-stop ~3s after the last ping, so a closed tab or lost "stop" can't leave a drive
+    // churning. DELETE stops immediately.
+    private static resolveIdentifyDevicePath(id: number): string {
+        const volume = ioManager.getVolume(id);
+        if (!volume)
+            throw new HttpNotFoundError();
+        if (!volume.deviceName)
+            throw new HttpBadRequestError(`volume ${id} has no online device to identify (drive offline?)`);
+        return `/dev/${volume.deviceName}`;
+    }
+
+    private static async handleVolumeIdentifyRequest(params: RouteParams): Promise<{ identifying: boolean; volumeId: number; device: string }> {
+        const id = this.parseVolumeId(params);
+        const devicePath = this.resolveIdentifyDevicePath(id);
+        driveIdentifier.identify(devicePath);
+        return { identifying: true, volumeId: id, device: devicePath };
+    }
+
+    private static async handleVolumeIdentifyStopRequest(params: RouteParams): Promise<{ identifying: boolean; volumeId: number }> {
+        const id = this.parseVolumeId(params);
+        const volume = ioManager.getVolume(id);
+        if (volume?.deviceName)
+            driveIdentifier.stop(`/dev/${volume.deviceName}`);
+        return { identifying: false, volumeId: id };
+    }
+
     private static async handleVolumeDrainCancelRequest(params: RouteParams): Promise<{ draining: boolean; volumeId: number }> {
         const id = this.parseVolumeId(params);
         await drainVolumeJob.cancel(id);
@@ -846,6 +875,16 @@ export class HttpMgmt {
             },
             {
                 method: 'POST',
+                match: url => this.matchVolumeIdentifyRoute(url),
+                handler: async (_req, params) => this.handleVolumeIdentifyRequest(params)
+            },
+            {
+                method: 'DELETE',
+                match: url => this.matchVolumeIdentifyRoute(url),
+                handler: async (_req, params) => this.handleVolumeIdentifyStopRequest(params)
+            },
+            {
+                method: 'POST',
                 match: url => url === '/$/rebalance' ? {} : null,
                 handler: async req => this.handleRebalanceStartRequest(req)
             },
@@ -1033,6 +1072,13 @@ export class HttpMgmt {
 
     private static matchVolumeDrainRoute(url: string): RouteParams | null {
         const match = /^\/\$\/volumes\/(\d+)\/drain$/.exec(url);
+        if (!match)
+            return null;
+        return { id: match[1] };
+    }
+
+    private static matchVolumeIdentifyRoute(url: string): RouteParams | null {
+        const match = /^\/\$\/volumes\/(\d+)\/identify$/.exec(url);
         if (!match)
             return null;
         return { id: match[1] };
