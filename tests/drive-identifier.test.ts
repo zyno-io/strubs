@@ -67,6 +67,32 @@ describe('DriveIdentifier', () => {
         expect(stats().reads).toBe(17); // 16 tolerated, the 17th trips the abort
     });
 
+    it('a heartbeat that raced an explicit stop cannot revive the flashing (stop wins)', async () => {
+        // On read #2, stop() then an immediately-following identify() (a heartbeat POST that was already
+        // in flight when Stop was clicked). Without suppression that identify would restart the session.
+        const h = makeIdentifier({ stepMs: 500, onRead: (n, id) => {
+            if (n === 2) { id.stop('/dev/sdx'); id.identify('/dev/sdx'); }
+        } });
+        h.identifier.identify('/dev/sdx');
+        await vi.waitFor(() => expect(h.stats().closed).toBe(true));
+        expect(h.stats().reads).toBe(2); // stayed stopped despite the racing heartbeat
+    });
+
+    it('re-identifies normally once the stop-suppression window has elapsed', async () => {
+        let clock = 0;
+        let reads = 0;
+        let closed = false;
+        const reader = { read: async () => { reads++; clock += 1000; }, close: async () => { closed = true; } };
+        const id = new DriveIdentifier({ now: () => clock, openDevice: async () => reader, createLogger: noopLogger });
+        id.stop('/dev/sdx');                 // suppress until clock 1500
+        id.identify('/dev/sdx');             // clock 0 < 1500 -> ignored
+        expect(id.isIdentifying('/dev/sdx')).toBe(false);
+        clock = 2000;                        // past the suppression window
+        id.identify('/dev/sdx');             // now honored
+        await vi.waitFor(() => expect(closed).toBe(true));
+        expect(reads).toBeGreaterThan(0);    // flashed again
+    });
+
     it('isIdentifying reflects the live state', async () => {
         const h = makeIdentifier({ stepMs: 1000 });
         expect(h.identifier.isIdentifying('/dev/sdx')).toBe(false);

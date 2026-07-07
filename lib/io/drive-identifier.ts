@@ -10,6 +10,10 @@ const READ_CHUNK_BYTES = 1024 * 1024;                     // 1 MiB reads
 // seeks -> the LED flashes). Wrap within the first 256 GiB, comfortably inside every drive in the fleet.
 const READ_SPAN_BYTES = 256 * 1024 * 1024 * 1024;
 const MAX_CONSECUTIVE_ERRORS = 16;                        // give up if the device keeps erroring (unplugged)
+// After an explicit stop, briefly ignore identify() calls so a heartbeat POST that was already in flight
+// when the operator hit Stop can't land afterward and revive the flashing. Must exceed the UI heartbeat
+// interval (~1s) plus round-trip jitter.
+const STOP_SUPPRESS_MS = 1500;
 
 type DeviceReader = {
     read(buffer: Buffer, offset: number, length: number, position: number): Promise<unknown>;
@@ -38,6 +42,9 @@ export class DriveIdentifier {
     private readonly deps: DriveIdentifierDeps;
     private readonly log: ReturnType<typeof createLogger>;
     private readonly sessions = new Map<string, IdentifySession>();
+    // devicePath -> timestamp until which identify() is ignored (set by stop(), so a racing in-flight
+    // heartbeat can't restart a session the operator just stopped).
+    private readonly suppressUntil = new Map<string, number>();
 
     constructor(deps?: Partial<DriveIdentifierDeps>) {
         this.deps = { ...defaultDeps, ...deps };
@@ -47,8 +54,12 @@ export class DriveIdentifier {
     // Start or extend flashing. Idempotent -- call every ~1s as a heartbeat; each call pushes the stop
     // deadline TTL into the future.
     identify(devicePath: string): void {
+        const now = this.deps.now();
+        // A heartbeat that raced a just-issued stop must not revive it (see STOP_SUPPRESS_MS).
+        if (now < (this.suppressUntil.get(devicePath) ?? 0))
+            return;
         const existing = this.sessions.get(devicePath);
-        const expiry = this.deps.now() + IDENTIFY_TTL_MS;
+        const expiry = now + IDENTIFY_TTL_MS;
         if (existing && existing.running) {
             existing.expiry = expiry;
             return;
@@ -59,8 +70,10 @@ export class DriveIdentifier {
         void this.runLoop(session);
     }
 
-    // Stop flashing immediately (the explicit "stop" button). No-op if not running.
+    // Stop flashing (the explicit "stop" button / DELETE). Ends the read loop at its next check and
+    // suppresses any in-flight heartbeat that would otherwise restart it. No-op if not running.
     stop(devicePath: string): void {
+        this.suppressUntil.set(devicePath, this.deps.now() + STOP_SUPPRESS_MS);
         const session = this.sessions.get(devicePath);
         if (session)
             session.expiry = 0; // the loop exits at its next deadline check and closes the device
