@@ -44,14 +44,19 @@ A write goes to `.tmp/<name>` and is `rename()`d into the sharded path — so a 
    MD5 of that chunk's data bytes only
 ```
 
-**Chunk 0 is shorter than the rest**, and this trips people up. The 48-byte file header shares the first `chunkSize` slot with chunk 0, so:
+**Chunk 0 is shorter than the rest**, and this trips people up. The 48-byte file header shares the first `chunkSize` slot with chunk 0, so chunk 0's data region gives up 48 bytes to make room for it.
+
+Writing `ceil8(x)` for "round up to a multiple of 8":
 
 ```
-S0   = chunkSize − 16 − 48   = 16320   (at the default 16384)
-Sstd = chunkSize − 16        = 16368
+Sstd = chunkSize − 16                                         = 16368   at chunkSize 16384
+S0   = ceil8( clamp( floor(size / dataN), 1, Sstd − 48 ) )    = 16320   for a large enough object
+Send = ceil8( ceil(endChunkSetBytes / dataN) )                          the final chunk, zero-padded
 ```
 
-`48 + 16 + 16320 = 16384`. Every subsequent chunk is a clean `16 + 16368 = 16384`.
+For any object big enough to fill it, `S0 = chunkSize − 16 − 48 = 16320`, and `48 + 16 + 16320 = 16384` exactly. Every later chunk is a clean `16 + 16368 = 16384`.
+
+> **But `S0` is not a constant.** It is capped at `floor(size / dataN)`, so a *small* object has a **shorter chunk 0** — and if `size / dataN` is below `Sstd − 48`, the slice has exactly **one** chunk, zero-padded. Assuming `S0 = 16320` for every object is the single easiest way to mis-read a small file, and it will hand you checksum failures that aren't real. Derive it; don't assume it.
 
 Offsets:
 
@@ -64,7 +69,7 @@ dataLen(k)    = S0    for k = 0
                 Send  for the final chunk (zero-padded; truncate using the object size)
 ```
 
-> **Use the object's own `chunkSize` from Mongo, and the real file size on disk.** Hardcoding 16384, or trusting `content.sliceSize`, will over-read small objects and produce checksum failures that aren't real. `sliceSize` is a *planning estimate* used for space reservation and stats — it is **not** the exact on-disk length.
+> **Use the object's own `chunkSize` and `size` from Mongo, and the real file length on disk.** Hardcoding 16384 — or trusting `content.sliceSize`, which is a *planning estimate* for space reservation and stats and **not** the exact on-disk length — will over-read small objects and produce failures that aren't there.
 
 ### File header — 48 bytes
 
@@ -182,12 +187,48 @@ A single `_id: 'current'` document with cached system-wide and per-volume counte
 
 ## Reading an object without STRUBS
 
-The recipe, given the Mongo record:
+If the service is gone but the disks and Mongo survive, this is all you need. The steps below have been run against real objects from 34 KB to 1.4 GB and reproduce `content.md5` exactly.
 
-1. Read `dataVolumes`, `chunkSize`, `size`, `md5` from `content`.
-2. Map each volume id → uuid via the `volumes` collection → `/run/strubs/mounts/<uuid>/strubs/`.
-3. Open slice files `<id>.0` … `<id>.{dataN-1}` at their sharded paths.
-4. For each chunk index *k*, pull `dataLen(k)` bytes from `dataStart(k)` of each data slice, in slice order, and concatenate.
-5. Truncate to `size`, and check the MD5 against `content.md5`.
+**1. Get the record.** From `content`: `dataVolumes`, `chunkSize`, `size`, `md5`. Let `dataN = dataVolumes.length`.
 
-If a data slice is missing, you'll need a Reed–Solomon decode with the parity slices — `@ronomon/reed-solomon`, `create(dataN, parityN)`, same library STRUBS uses. Any 4 of the 6 slices are enough.
+**2. Find the slice files.** Map each volume id to its `uuid` via the `volumes` collection. Data slice *i* is at:
+
+```
+/run/strubs/mounts/<uuid of dataVolumes[i]>/strubs/<id[0:2]>/<id[2:4]>/<id[4:6]>/<id>.<i>
+```
+
+**3. Derive the geometry.** All of it comes from `size`, `chunkSize` and `dataN` — nothing else. (`ceil8` = round up to a multiple of 8.)
+
+```
+Sstd      = chunkSize − 16
+S0        = ceil8( clamp( floor(size / dataN), 1, Sstd − 48 ) )
+stdOffset = S0 × dataN                                  # plaintext consumed by chunk 0
+nStd      = floor( ceil( max(0, size − stdOffset) / dataN ) / Sstd )    # full-size chunks after chunk 0
+endBytes  = size − (stdOffset + nStd × Sstd × dataN)     # plaintext left for the final chunk
+Send      = ceil8( ceil( endBytes / dataN ) )
+nChunks   = 1 + nStd + (endBytes > 0 ? 1 : 0)
+
+chunkStart(k) = k == 0 ? 48 : 48 + (16 + S0) + (k − 1) × (16 + Sstd)
+dataStart(k)  = chunkStart(k) + 16
+dataLen(k)    = k == 0 ? S0 : (k <= nStd ? Sstd : Send)
+```
+
+**4. Reassemble.** The data slices hold your plaintext verbatim; the concatenation *is* the file.
+
+```
+out = []
+for k in 0 .. nChunks-1:
+    for i in 0 .. dataN-1:
+        out += dataLen(k) bytes at dataStart(k) of slice i
+truncate out to `size`          # the final chunk is zero-padded — truncate ONCE, at the end
+```
+
+> Truncate the **assembled stream**, not each slice's contribution. The final chunk set is zero-padded across every slice, so trimming per-slice will silently mis-assemble the tail.
+
+**5. Verify.** MD5 the result and compare with `content.md5`. If it matches, you have the file.
+
+### If a data slice is missing
+
+You need a Reed–Solomon decode. Use the same library STRUBS does — `@ronomon/reed-solomon`, `create(dataN, parityN)` — and feed it the surviving slices' chunks for each chunk set, marking the missing indices as targets. **Any `dataN` of the `dataN + parityN` slices are enough** (any 4 of 6 by default), so parity slices substitute for missing data slices one-for-one.
+
+A caution worth repeating from [Data integrity](data-integrity.md): a slice can pass every per-chunk MD5 and still be *the wrong data*. Always check the reassembled result against `content.md5` before you trust it — that whole-object hash is the only thing that can tell you.
