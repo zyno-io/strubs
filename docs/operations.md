@@ -1,0 +1,288 @@
+# Operations
+
+The runbook. Most of this is doable from the web UI at `/$/ui`; the `curl` equivalents are given because they're what you'll want in a script or over SSH.
+
+Throughout, `$` is escaped in URLs (`localhost/\$/volumes`) so your shell doesn't eat it.
+
+## Deployment
+
+STRUBS runs as root — it mounts filesystems and reads raw block devices.
+
+```ini
+# /etc/systemd/system/strubs.service
+[Unit]
+Description=strubs
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/node service.js
+WorkingDirectory=/opt/strubs/dist
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Tuning goes in a drop-in, so it survives upgrades:
+
+```ini
+# /etc/systemd/system/strubs.service.d/tuning.conf
+[Service]
+Environment=STRUBS_DRAIN_CONCURRENCY=8
+```
+
+Deploying a change:
+
+```bash
+cd /opt/strubs
+npx tsc                          # -> dist/
+cd ui && npx vite build          # -> ui/dist/  (only if the UI changed)
+systemctl restart strubs
+```
+
+> **Restarting is safe, but not free.** STRUBS unmounts its volumes on shutdown, so a restart will fail to unmount cleanly if anything else holds a file open on them (an `rsync`, a script). In-flight relocations are aborted (`IOABORT`) — safe, because a slice is only removed from its source *after* the copy is verified and the reference flipped — but they'll need to be redone. Long-running jobs (scrub, drain, rebalance) checkpoint their progress and resume automatically on boot.
+
+## Watching it
+
+```bash
+curl -s localhost/\$/status          | jq     # capacity, volumes by state
+curl -s localhost/\$/volumes         | jq     # every drive: flags, SMART, fill
+curl -s localhost/\$/faults          | jq     # outstanding slice faults
+curl -s localhost/\$/verify-volumes  | jq     # scrub progress
+curl -s localhost/\$/rebalance       | jq     # rebalance progress
+journalctl -u strubs -f
+```
+
+Notifications go to the log always, and to Slack if `STRUBS_SLACK_WEBHOOK_URL` is set (see [Configuration](configuration.md#notifications)). `POST /$/notify/test` sends a real one, which is the only way to know your webhook works.
+
+---
+
+## Adding a drive
+
+> **Provisioning wipes the disk.** Partitions and formats it. Get the path right.
+
+Find the device, sanity-check its SMART, then provision it:
+
+```bash
+curl -s localhost/\$/blockDevices?sort=sysfsPath | jq '.[] | {name, size, model, serial, volumeId}'
+smartctl -d sat -H -A /dev/sdx
+```
+
+```bash
+curl -X POST localhost/\$/volumes -H 'Content-Type: application/json' \
+  -d "{\"blockPath\":\"/dev/sdx\",\"wipe\":$(date +%s%3N)}"
+```
+
+`wipe` is a **timestamp**, and it must be within 10 seconds of now — that freshness window is the only thing standing between a replayed request and a formatted disk.
+
+The new volume is mounted, started, and writable immediately, and new writes start landing on it (it has the most free space). Existing data doesn't move by itself — **[rebalance](#rebalancing) if you want it levelled.**
+
+## Replacing or removing a drive
+
+The sequence is: **drain → confirm empty → identify → pull.**
+
+### 1. Drain it
+
+```bash
+curl -X POST localhost/\$/volumes/13/drain
+```
+
+This marks the volume read-only + draining and relocates **every** slice it holds onto healthy volumes, rewriting object references as it goes. It's move-then-flip: a slice is written and verified on its new home, the reference is flipped, and only then is the source copy deleted. Cancelling or crashing mid-drain loses nothing.
+
+It works on a **dead disk too** — with the drive offline it reconstructs each slice from parity instead of copying it. That's the whole point: you don't need the failing drive to be readable to get its data off it.
+
+Watch it:
+
+```bash
+curl -s localhost/\$/volumes | jq '.[] | select(.id==13) | {isDraining, bytesFree, bytesTotal}'
+journalctl -u strubs -f | grep -i drain
+```
+
+Slices that genuinely can't be rebuilt (below quorum) are **left in place and reported**, and they block removal until you accept the loss. That's deliberate.
+
+### 2. Confirm it's actually empty
+
+Do not skip this. Drain reports "complete" when its scan finishes, and a scan that skipped objects (because of an error mid-run) can still report complete.
+
+```bash
+curl -s localhost/\$/volumes/13 | jq '{isDraining, bytesFree, bytesTotal}'
+```
+
+The authoritative check is that nothing references it any more:
+
+```js
+db.content.countDocuments({ $or: [{ dataVolumes: 13 }, { parityVolumes: 13 }] })   // must be 0
+```
+
+`DELETE /$/volumes/13` will refuse while live slices remain, and tell you how many — so a refusal here is the system doing its job, not an obstacle to route around.
+
+### 3. Find the physical drive
+
+In a 30-bay chassis, the difference between `sdf` and `sdg` is somebody's afternoon. Flash its LED:
+
+```bash
+curl -X POST localhost/\$/volumes/13/identify     # re-POST every ~1s to keep it going
+curl -X DELETE localhost/\$/volumes/13/identify   # stop
+```
+
+The UI does the heartbeat for you — open the volume menu and pick **Identify**. Reads stop by themselves ~3 seconds after the last ping, so a closed tab can't leave a drive spinning.
+
+### 4. Remove it
+
+```bash
+curl -X DELETE localhost/\$/volumes/13    # soft-delete; refused if slices remain
+```
+
+Then physically pull it. Keep the drive on a shelf until a full verify confirms the relocated copies are good — it costs nothing and it's the difference between an inconvenience and an incident.
+
+---
+
+## Rebalancing
+
+After adding or removing drives, fill is uneven. Rebalance levels it.
+
+```bash
+curl -X POST localhost/\$/rebalance -H 'Content-Type: application/json' -d '{}'
+curl -s localhost/\$/rebalance | jq
+curl -X DELETE localhost/\$/rebalance      # cancel any time; safe
+```
+
+It computes a capacity-weighted target fill across the pool, sheds from volumes above it, and lands on volumes below it. Some things worth knowing:
+
+- **It shows up in the UI**, with live progress, rate, and ETA. `bytesToMove` is recomputed from actual volume fills, so it's honest across restarts.
+- **It works biggest-objects-first.** Byte mass concentrates in a small minority of large objects while every move costs the same fixed latency, so this reaches the target in far fewer moves.
+- **It never copies parity.** Parity is always recomputed from the data — a byte-copy would faithfully preserve parity that's silently wrong. This is why it's slower than a plain file copy, and it isn't negotiable. See [Data integrity](data-integrity.md#parity-verification).
+- **It parks the scrub** while it runs, and releases it afterwards. A scrub of a volume whose slices are being relocated is verifying a moving target.
+
+### Tuning it
+
+Concurrency is a **live setting** — it applies to a running job at the next batch, no restart:
+
+```bash
+curl -X PUT localhost/\$/rebalance -H 'Content-Type: application/json' -d '{"concurrency":8}'
+```
+
+Relocation is latency-bound (open, read, write, commit, ref flip, delete), not bandwidth-bound, so concurrency is the lever that matters. Raise it in steps and watch `bytesPerSec` in the status. Back off if the drives start thrashing or kernel I/O errors appear — seek-bound disks in external enclosures have a real ceiling.
+
+---
+
+## Verification
+
+```bash
+# Full scrub of everything (reads every byte; takes a long time)
+curl -X POST localhost/\$/verify-volumes -H 'Content-Type: application/json' -d '{"mode":"full"}'
+
+# Light pass — existence + headers only. Hours, not weeks. Low stress.
+curl -X POST localhost/\$/verify-volumes -H 'Content-Type: application/json' -d '{"mode":"light"}'
+
+# Just one drive
+curl -X POST localhost/\$/verify-volumes -H 'Content-Type: application/json' \
+     -d '{"volumeIds":[13],"mode":"full"}'
+
+# One object
+curl -X POST localhost/\$/verify-file/6a4e9b8f3b1e7a0049000001 \
+     -H 'Content-Type: application/json' -d '{"mode":"full"}'
+
+curl -s localhost/\$/verify-volumes | jq
+curl -X DELETE localhost/\$/verify-volumes
+```
+
+A scrub runs automatically every 90 days by default. **Use `full`.** A light verify will happily tell you every slice is present and correctly labelled while your parity is worthless — only a full pass recomputes parity and compares it. See [Data integrity](data-integrity.md).
+
+If a rebalance is running, a verify request is **queued**, not rejected: the response carries `deferred: true` and it starts when the rebalance finishes. The UI shows it as *Waiting for rebalance*.
+
+---
+
+## When something is wrong
+
+### First: consider freezing
+
+```bash
+curl -X PUT localhost/\$/maintenance-freeze -H 'Content-Type: application/json' -d '{"frozen":true}'
+```
+
+The freeze stops **all** background maintenance — scrub, repair, drain, rebalance — while reads and writes carry on normally. It's persisted and survives restarts.
+
+Reach for it when you don't yet understand what's happening. Automatic repair is usually what you want, but repair *reconstructs slices*, and reconstructing from sources you haven't validated is exactly how a recoverable problem becomes a permanent one. **Freeze, diagnose, then unfreeze.** Unfreezing resumes work in order: drains, then scrub and repair, then rebalance.
+
+### A drive is throwing errors
+
+```bash
+journalctl -k | grep -iE 'i/o error|medium error|offline'
+smartctl -d sat -H -A /dev/sdx
+curl -s localhost/\$/volumes/13 | jq .smartInfo
+```
+
+Distinguish two very different things:
+
+- **Media errors** — reallocated or pending sectors, uncorrectable reads. The platter is going. Drain it.
+- **Link errors** — the device dropping off the bus and re-enumerating (`device offline error`, USB CRC counts, `Buffer I/O error` followed by a re-attach). SMART will be spotless because the *disk* is fine — it's the cable, the bridge, or the enclosure. Reseat before you replace.
+
+STRUBS itself treats a kernel error as a **hint**: the log watcher triggers a targeted verify of that drive rather than concluding anything. If the fault count crosses the threshold, the health monitor degrades the volume to read-only + unhealthy — reads keep working, writes stop. It **never** evicts a drive on its own.
+
+### Objects are flagged
+
+```bash
+curl -s localhost/\$/faults | jq '.faults[] | {objectId, sliceIndex, volumeId, code, repairStatus, repairBlockedReason}'
+```
+
+```js
+db.content.countDocuments({ isFile: true, sliceErrors: { $exists: true } })
+db.content.find({ isFile: true, sliceErrors: { $exists: true } }).limit(5)
+```
+
+Blocked reasons, and what they mean:
+
+| Reason | Meaning |
+|---|---|
+| `insufficient-slices` | Below quorum. Repair is refused — with too few good sources it would produce plausible-looking wrong bytes and overwrite what's left. |
+| `unrecoverable` | Marked `recoveryComment` by an operator: accepted loss. |
+| `target-unwritable` | Nowhere healthy to put the rebuilt slice. Add capacity or clear a volume's flags. |
+| `reconstruction-mismatch` | **Serious.** The rebuild didn't reproduce the object's MD5, so it was refused rather than committed. The surviving slices are foreign or corrupt. Nothing was overwritten — this is the safety gate doing exactly its job. Investigate before touching it. |
+
+If a fault looks stale — the object is fine and the slices are all present — re-verify that single object (`POST /$/verify-file/{id}`). A clean result clears it.
+
+### A drive vanished
+
+The device reconciler handles disks appearing, disappearing, and coming back under a different kernel name. If a volume is showing `isMissing`, the disk STRUBS expects is genuinely not there.
+
+Identity lives **on the disk**, not in the bay, so you can move drives between ports and enclosures freely. To identify an unmounted disk out-of-band:
+
+```bash
+debugfs -R 'dump /strubs/.identity /tmp/id' /dev/sdX 2>/dev/null && xxd /tmp/id
+# byte 37 (0x25) = volume id
+```
+
+> On USB and SAS enclosures, `lsblk` and `smartctl` often report the *enclosure bridge's* serial rather than the drive's — two bays can look like the same device. Don't identify drives by serial on those setups. The `.identity` file is the ground truth.
+
+---
+
+## The `tools/` directory
+
+Standalone scripts, run with `node tools/<name>.js`. They talk to Mongo and the disks directly, and several require a compiled `dist/`. Most default to a dry run; read the script before running it.
+
+They exist because a diagnosis you can run out-of-process, against a frozen system, is worth a lot more than one you have to redeploy the service to get.
+
+| | |
+|---|---|
+| `full-verify.js`, `light-verify.js` | Out-of-process verification passes, gated on whole-object MD5. |
+| `parity-verify.js` | Read-only parity audit — recompute and compare. |
+| `classify-slice-errors.js` | Bucket flagged objects: readable-now / recoverable / lost. |
+| `recover-residual.js` | Reconstruct and relocate slices from dead volumes, MD5-gated. |
+| `restamp-headers.js` | Repair mis-stamped slice headers in place, data verified first. |
+| `verify-dead.js`, `archive-dead.js` | Prove unrecoverability, then archive records and reclaim the slices. |
+| `resync-stats.js` | Rebuild the cached storage statistics. |
+
+The `parity-*.js` scripts are forensic tools from a specific incident. They're kept because the analysis they encode is hard to reproduce, not because you'll need them routinely.
+
+## Backups
+
+Say it once more: **back up MongoDB.**
+
+The slices are useless without the `content` records that say which volumes hold them. Every disk can be perfectly healthy and the array still lost. `mongodump` on a schedule, off the box.
+
+And STRUBS survives disks, not buildings. It is not an off-site backup.
