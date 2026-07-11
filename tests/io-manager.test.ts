@@ -57,6 +57,11 @@ type VolumeMockInstance = {
     mountPoint: string | null;
     deviceModel: string | null;
     deviceVendor: string | null;
+    deviceSerial: string | null;
+    partitionUuid: string | null;
+    isDeleted: boolean;
+    isPresent: boolean;
+    bindDevice: ReturnType<typeof vi.fn>;
 };
 
 const createdVolumes: VolumeMockInstance[] = [];
@@ -66,6 +71,8 @@ vi.mock('../lib/io/volume', () => ({
         Object.assign(this, {
             id: config.id,
             isEnabled: config.enabled !== false,
+            isDeleted: config.is_deleted === true,
+            partitionUuid: config.partition_uuid,
             bytesTotal: config.partition_size,
             bytesUsedData: config.data_size ?? 0,
             bytesUsedParity: config.parity_size ?? 0,
@@ -73,11 +80,23 @@ vi.mock('../lib/io/volume', () => ({
             bytesPending: 0,
             isWritable: true,
             isStarted: false,
+            isPresent: false,
             deviceGroup: null,
             blockPath: null,
             mountPoint: null,
             deviceModel: null,
             deviceVendor: null,
+            deviceSerial: null,
+            // Mirror the real Volume.bindDevice so initVolume's binding is exercised faithfully.
+            bindDevice: vi.fn(function (this: VolumeMockInstance, device: any, partition: any) {
+                this.deviceSerial = device.serial ?? null;
+                this.deviceModel = device.model ?? null;
+                this.deviceVendor = device.vendor ?? null;
+                this.deviceGroup = device.busGroup ?? null;
+                this.blockPath = partition.path ?? `/dev/${partition.name}`;
+                this.mountPoint = partition.mountPoint || null;
+                this.isPresent = true;
+            }),
             start: vi.fn().mockImplementation(async () => {
                 this.isStarted = true;
             }),

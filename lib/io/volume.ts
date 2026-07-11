@@ -10,6 +10,7 @@ import { config } from '../config';
 import { formatBytes, mount as mountVolume, unmount as unmountVolume } from './helpers';
 import { buildVolumeIdentityBuffer } from './volume-identity';
 import { ensureExtFilesystemHealthy } from './filesystem-check';
+import type { CachedDevice, CachedPartition } from './device-discovery';
 
 export type VolumeVerifyErrors = {
     checksum: number;
@@ -48,6 +49,10 @@ export class Volume extends EventEmitter {
     public isMounted = false;
     public isVerified = false;
     public isStarted = false;
+    // Whether a matching device+partition was found in the latest discovery and bound to this volume.
+    // Distinct from operator flags (enabled/deleted): a disk pulled or still enumerating leaves the
+    // volume unbound. `isMissing` derives the operator-visible "the disk STRUBS expects is gone" state.
+    public isPresent = false;
     public isEnabled: boolean;
     public isHealthy: boolean;
     public isReadOnly: boolean;
@@ -403,6 +408,54 @@ export class Volume extends EventEmitter {
 
     get isWritable() {
         return this.isStarted && this.isEnabled && this.isHealthy && !this.isReadOnly && !this.isDraining;
+    }
+
+    // The disk STRUBS expects for this volume isn't present in the latest discovery. Only meaningful
+    // for volumes the operator wants online — a disabled/deleted volume isn't "missing", it's off.
+    get isMissing() {
+        return this.isEnabled && !this.isDeleted && !this.isPresent;
+    }
+
+    // Bind this volume to a freshly-discovered device+partition. The single place device identity is
+    // copied onto the volume — used by initial init, the Enable path, and the device reconciler, so a
+    // disk that appears (or reappears under a new kernel name) is picked up the same way everywhere.
+    bindDevice(device: CachedDevice, partition: CachedPartition): void {
+        this.deviceSerial = device.serial ?? null;
+        this.deviceModel = device.model ?? null;
+        this.deviceVendor = device.vendor ?? null;
+        this.deviceName = device.name;
+        this.deviceGroup = device.busGroup ?? null;
+        this.fsType = partition.fsType ?? null;
+        this.blockPath = partition.path ?? `/dev/${partition.name}`;
+        this.mountPoint = partition.mountPoint || null;
+        this.isMounted = !!partition.mountPoint;
+        this.isPresent = true;
+    }
+
+    // The backing disk is gone (pulled, or dropped off the bus). Tear down any (now-stale) mount with a
+    // lazy unmount — the device node may be EIO, which a normal unmount can't complete — and clear the
+    // device binding so nothing (health watcher, reads) resolves to a dead kernel name. Config is kept.
+    async markMissing(): Promise<void> {
+        this.log('marking missing: backing device is no longer present');
+        if (this.isMounted && this.mountPoint) {
+            try {
+                await unmountVolume(this.mountPoint, { lazy: true });
+            }
+            catch (err) {
+                this.log.error('lazy unmount during markMissing failed', err);
+            }
+        }
+        this.isStarted = false;
+        this.isVerified = false;
+        this.isMounted = false;
+        this.bytesFree = null;
+        this.blockPath = null;
+        this.fsType = null;
+        this.deviceName = null;
+        this.deviceGroup = null;
+        this.mountPoint = null;
+        this.isPresent = false;
+        this.emit('missing');
     }
 
     async createTemporaryFh(fileName: string): Promise<FileHandle> {

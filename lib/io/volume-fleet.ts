@@ -2,9 +2,18 @@ import _ from 'lodash';
 
 import { database } from '../database';
 import { createLogger } from '../log';
-import { formatBytes } from './helpers';
+import { formatBytes, readProcMounts } from './helpers';
 import { Volume, type VolumeConfig, type PersistedVolumeConfig } from './volume';
 import type { CachedDevice, CachedPartition } from './device-discovery';
+
+// An edge change detected by a reconcile pass. `missing`: backing disk disappeared. `restored`: an
+// absent/unbound volume's disk is back and the volume was brought online. `healed`: a stale mount
+// (disk dropped + re-added under a new kernel name) was torn down and remounted on the live node.
+export type VolumeTransition = {
+    volumeId: number;
+    kind: 'missing' | 'restored' | 'healed';
+    deviceName: string | null;
+};
 
 type VolumeFleetDeps = {
     database: typeof database;
@@ -20,6 +29,7 @@ export class VolumeFleet {
     private readonly deps: VolumeFleetDeps;
     private _volumeConfig: PersistedVolumeConfig[] = [];
     private _volumes: Record<number, Volume> = {};
+    private _lock: Promise<void> = Promise.resolve();
 
     constructor(deps?: Partial<VolumeFleetDeps>) {
         this.deps = { ...defaultDeps, ...deps };
@@ -51,49 +61,69 @@ export class VolumeFleet {
             return undefined;
         }
 
-        const partitionMatch = this.findPartitionByUuid(devices, config.partition_uuid);
+        if (!this.bindVolumeDevice(volume, devices))
+            return undefined;
+
+        return volume;
+    }
+
+    // Find the volume's disk in the latest discovery and bind it (device identity + partition). Returns
+    // false (leaving the volume unbound: blockPath null, isPresent false) when the disk is absent or its
+    // partition is the wrong size. Separated from initVolume so the reconciler and Enable path can
+    // (re)bind an EXISTING volume object in place, preserving its counters/reservations.
+    bindVolumeDevice(volume: Volume, devices: CachedDevice[]): boolean {
+        const partitionMatch = this.findPartitionByUuid(devices, volume.partitionUuid ?? undefined);
         if (!partitionMatch) {
             this.deps.log.error?.(
                 'volume%d: partition with uuid %s was not found on any discovered device',
-                config.id,
-                config.partition_uuid
+                volume.id,
+                volume.partitionUuid
             );
-            return undefined;
+            return false;
         }
 
         const { device: onlineDevice, partition } = partitionMatch;
-        if (!partition) {
-            this.deps.log.error?.(
-                'volume%d: partition with uuid %s could not be found on the discovered device',
-                config.id,
-                config.partition_uuid
-            );
-            return undefined;
-        }
-
-        if (partition.size !== config.partition_size) {
+        if (partition.size !== volume.bytesTotal) {
             this.deps.log.error?.(
                 'volume%d: partition with uuid %s on device %s has size %d, expected %d',
-                config.id,
-                config.partition_uuid,
+                volume.id,
+                volume.partitionUuid,
                 onlineDevice.name,
                 partition.size,
-                config.partition_size
+                volume.bytesTotal
             );
-            return undefined;
+            return false;
         }
 
-        volume.deviceSerial = onlineDevice.serial ?? null;
-        volume.deviceModel = onlineDevice.model ?? null;
-        volume.deviceVendor = onlineDevice.vendor ?? null;
-        volume.deviceName = onlineDevice.name;
-        volume.deviceGroup = onlineDevice.busGroup ?? null;
-        volume.fsType = partition.fsType ?? null;
-        volume.blockPath = partition.path ?? `/dev/${partition.name}`;
-        volume.mountPoint = partition.mountPoint || null;
-        volume.isMounted = !!partition.mountPoint;
+        volume.bindDevice(onlineDevice, partition);
+        return true;
+    }
 
-        return volume;
+    getVolumeByPartitionUuid(partitionUuid: string): Volume | undefined {
+        if (!partitionUuid)
+            return undefined;
+        return Object.values(this._volumes).find(volume => !volume.isDeleted && volume.partitionUuid === partitionUuid);
+    }
+
+    getVolumeByDeviceName(deviceName: string): Volume | undefined {
+        if (!deviceName)
+            return undefined;
+        return Object.values(this._volumes).find(volume => !volume.isDeleted && volume.deviceName === deviceName);
+    }
+
+    // Serializes device (re)binding/start/stop across the reconciler, Enable, register and drain so two
+    // paths never mount/unmount the same fleet concurrently. Mirrors the verify job's volume-lock style.
+    async withLock<T>(fn: () => Promise<T>): Promise<T> {
+        const previous = this._lock;
+        let release!: () => void;
+        this._lock = new Promise<void>(resolve => { release = resolve; });
+        await previous;
+        try {
+            return await fn();
+        }
+        finally {
+            release();
+        }
     }
 
     async startVolumes(): Promise<void> {
@@ -206,17 +236,26 @@ export class VolumeFleet {
     }
 
     async registerVolume(config: PersistedVolumeConfig, devices: CachedDevice[]): Promise<Volume> {
-        this._volumeConfig.push(config);
-        const volume = this.initVolume(config, devices);
-        if (!volume)
-            throw new Error('failed to initialize volume from configuration');
+        return this.withLock(async () => {
+            this._volumeConfig.push(config);
+            const volume = this.initVolume(config, devices);
+            if (!volume)
+                throw new Error('failed to initialize volume from configuration');
 
-        await volume.start();
-        this.deps.log('volume%d: registered and started new volume', volume.id);
-        return volume;
+            await volume.start();
+            this.deps.log('volume%d: registered and started new volume', volume.id);
+            return volume;
+        });
     }
 
+    // Serialized against the reconciler so an operator enable/disable never races an automatic
+    // remount/markMissing on the same volume. softDeleteVolume (called internally on the isDeleted path)
+    // deliberately does NOT take the lock, so this can't self-deadlock.
     async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isDraining?: boolean; label?: string | null; comment?: string | null }, devices: CachedDevice[]): Promise<void> {
+        return this.withLock(() => this._updateVolumeFlagsLocked(id, changes, devices));
+    }
+
+    private async _updateVolumeFlagsLocked(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isDraining?: boolean; label?: string | null; comment?: string | null }, devices: CachedDevice[]): Promise<void> {
         const config = this._volumeConfig.find(cfg => cfg.id === id);
         if (!config)
             throw new Error('volume configuration not found');
@@ -271,6 +310,14 @@ export class VolumeFleet {
                         throw new Error('failed to initialize volume from configuration');
                     this._volumes[id] = volume;
                 }
+                else if (!volume.blockPath) {
+                    // Existing but unbound: a disk that was absent or still enumerating at boot (e.g. a
+                    // slow DAS enclosure) leaves an unbound Volume object. Enabling refreshes the device
+                    // list, so re-bind in place rather than starting with a null blockPath (which throws
+                    // "mount path not configured"). Rebinding in place preserves the object's counters.
+                    if (!this.bindVolumeDevice(volume, devices))
+                        throw new Error(`volume ${id}: backing disk is not present; cannot enable`);
+                }
                 if (!volume.isStarted) {
                     await volume.start();
                 }
@@ -307,6 +354,83 @@ export class VolumeFleet {
             (config as PersistedVolumeConfig).state_updated_at = now;
         }
         this.deps.log('volume%d: marked as deleted', id);
+    }
+
+    // One reconciliation pass against a fresh device snapshot. Detects disks that appeared, disappeared,
+    // or are backing a now-stale mount (dropped + re-added under a new kernel name), and repairs each in
+    // place. Returns the edge transitions so the caller can notify / wake repair. Runs under the fleet
+    // lock so it never races Enable/register/drain. Operator intent is respected: disabled, deleted and
+    // draining volumes are left untouched.
+    async reconcile(devices: CachedDevice[], options?: { autoRecover?: boolean }): Promise<VolumeTransition[]> {
+        // autoRecover=false (maintenance freeze) still detects and marks pulled disks missing, but holds
+        // the remount/restart of returned disks so it doesn't fight an operator swapping drives.
+        const autoRecover = options?.autoRecover !== false;
+        return this.withLock(async () => {
+            const transitions: VolumeTransition[] = [];
+            const presentUuids = new Set<string>();
+            for (const device of devices)
+                for (const partition of device.partitions)
+                    if (partition.uuid)
+                        presentUuids.add(partition.uuid);
+
+            const mounts = await readProcMounts();
+
+            for (const volume of Object.values(this._volumes)) {
+                if (volume.isDeleted || !volume.isEnabled || volume.isDraining)
+                    continue;
+
+                const present = volume.partitionUuid ? presentUuids.has(volume.partitionUuid) : false;
+
+                if (!present) {
+                    // Transition to absent: only act on the edge so we don't re-notify every pass.
+                    if (volume.isPresent || volume.isStarted) {
+                        const deviceName = volume.deviceName;
+                        await volume.markMissing();
+                        transitions.push({ volumeId: volume.id, kind: 'missing', deviceName });
+                    }
+                    continue;
+                }
+
+                const stale = this.isMountStale(volume, devices, mounts);
+                if (volume.isStarted && volume.isPresent && volume.blockPath && !stale)
+                    continue; // healthy and bound — nothing to do
+
+                if (!autoRecover)
+                    continue; // frozen: hold remount/restart of returned/stale disks
+
+                try {
+                    // Stale mount (backing device vanished/renamed): tear the dead mount down first so
+                    // the rebind mounts the live node rather than stacking over the EIO'd one.
+                    if (stale)
+                        await volume.markMissing();
+                    if (!volume.blockPath || !volume.isPresent) {
+                        if (!this.bindVolumeDevice(volume, devices))
+                            continue; // wrong size / not matchable — leave unbound, try again next pass
+                    }
+                    if (!volume.isStarted)
+                        await volume.start();
+                    transitions.push({ volumeId: volume.id, kind: stale ? 'healed' : 'restored', deviceName: volume.deviceName });
+                }
+                catch (err) {
+                    this.deps.log.error?.('volume%d: reconcile failed to bring volume online: %s', volume.id, err instanceof Error ? err.message : String(err));
+                }
+            }
+
+            return transitions;
+        });
+    }
+
+    // A volume we believe is mounted whose /run/strubs mount is missing from the kernel table, or is
+    // backed by a device that no longer holds this volume's partition (the vol-57 drop-and-rename case).
+    private isMountStale(volume: Volume, devices: CachedDevice[], mounts: Map<string, string>): boolean {
+        if (!volume.isMounted || !volume.mountPoint)
+            return false;
+        const source = mounts.get(volume.mountPoint);
+        if (!source)
+            return true;
+        const match = this.findPartitionByUuid(devices, volume.partitionUuid ?? undefined);
+        const livePath = match ? (match.partition.path ?? `/dev/${match.partition.name}`) : null;
+        return source !== livePath;
     }
 
     private findPartitionByUuid(devices: CachedDevice[], partitionUuid?: string): { device: CachedDevice; partition: CachedPartition } | undefined {

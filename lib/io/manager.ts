@@ -55,6 +55,14 @@ export class IOManager {
         return this.deps.volumeFleet.getVolume(id);
     }
 
+    getVolumeByPartitionUuid(partitionUuid: string): Volume | undefined {
+        return this.deps.volumeFleet.getVolumeByPartitionUuid(partitionUuid);
+    }
+
+    getVolumeByDeviceName(deviceName: string): Volume | undefined {
+        return this.deps.volumeFleet.getVolumeByDeviceName(deviceName);
+    }
+
     getVolumeEntries(): Array<[number, Volume]> {
         return this.deps.volumeFleet.getVolumeEntries();
     }

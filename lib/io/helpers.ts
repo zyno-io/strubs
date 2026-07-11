@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import os from 'os';
+import { promises as fsp } from 'fs';
 
 import { spawnHelper } from '../helpers/spawn';
 
@@ -87,11 +88,31 @@ export async function mount(blockPath: string, mountPath: string, fsType: string
         throw new Error('mount exited with code ' + code + (stdout ? ': ' + stdout : ''));
 }
 
-export async function unmount(mountPath: string): Promise<void> {
-    const { code, stdout } = await spawnHelper('umount', [ mountPath ]);
+export async function unmount(mountPath: string, options?: { lazy?: boolean }): Promise<void> {
+    // Lazy (umount -l) detaches the mount now and cleans up when it's no longer busy: needed when the
+    // backing device has vanished (EIO), where a plain umount can block indefinitely.
+    const params = options?.lazy ? [ '-l', mountPath ] : [ mountPath ];
+    const { code, stdout } = await spawnHelper('umount', params);
 
     if (code !== 0)
         throw new Error('umount exited with code ' + code + (stdout ? ': ' + stdout : ''));
+}
+
+// Parse /proc/mounts into a map of mountpoint -> source device. Used to reconcile a volume's believed
+// mount against the kernel's reality (is it still mounted, and by the device we expect?). /proc/mounts
+// octal-escapes spaces/tabs in fields; mountpoints are decoded so lookups by path work.
+export async function readProcMounts(): Promise<Map<string, string>> {
+    const text = await fsp.readFile('/proc/mounts', 'utf8');
+    const map = new Map<string, string>();
+    const unescape = (field: string) => field.replace(/\\([0-7]{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
+    for (const line of text.split('\n')) {
+        if (!line)
+            continue;
+        const [source, mountpoint] = line.split(' ');
+        if (source && mountpoint)
+            map.set(unescape(mountpoint), unescape(source));
+    }
+    return map;
 }
 
 export function formatBytes(bytes: number): string {
