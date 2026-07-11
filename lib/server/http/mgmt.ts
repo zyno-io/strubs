@@ -9,7 +9,7 @@ import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
 import { drainVolumeJob } from '../../jobs/drain-volume-job';
 import { driveIdentifier } from '../../io/drive-identifier';
-import { rebalanceJob } from '../../jobs/rebalance-job';
+import { rebalanceJob, type RebalanceStatus } from '../../jobs/rebalance-job';
 import { verifyFileJob } from '../../jobs/verify-file-job';
 import { verifyScheduler } from '../../jobs/verify-scheduler';
 import { repairWorker } from '../../remediation/repair-worker';
@@ -38,6 +38,11 @@ export type VolumeStatus = {
     isEnabled: boolean;
     isHealthy: boolean;
     isReadOnly: boolean;
+    // Whether the volume's disk is currently discovered/bound, and the derived operator-facing "the disk
+    // STRUBS expects is gone" state (enabled + not deleted + not present). Lets the UI show "missing"
+    // distinctly from disabled or unhealthy.
+    isPresent: boolean;
+    isMissing: boolean;
     deviceSerial: string | null;
     deviceModel: string | null;
     deviceVendor: string | null;
@@ -175,13 +180,7 @@ export class HttpMgmt {
     }
 
     private static serializeBlockDevices(devices: CachedDevice[], sortParam: 'name' | 'sysfsPath' | 'size' | 'volumeId' | 'volumeLabel'): BlockDevice[] {
-        const volumes = new Map<number, Volume>();
-        for (const [id, volume] of ioManager.getVolumeEntries()) {
-            if ((volume as Volume).isDeleted)
-                continue;
-            volumes.set(id, volume);
-        }
-        const enriched = devices.map(device => this.serializeCachedDevice(device, volumes));
+        const enriched = devices.map(device => this.serializeCachedDevice(device));
         this.applyDerivedGroupLabels(enriched);
         enriched.sort((a, b) => {
             if (sortParam === 'sysfsPath')
@@ -197,7 +196,7 @@ export class HttpMgmt {
         return enriched;
     }
 
-    private static serializeCachedDevice(device: CachedDevice, volumes: Map<number, Volume>): BlockDevice {
+    private static serializeCachedDevice(device: CachedDevice): BlockDevice {
         const sysfsResolved = path.resolve(`/sys/block/${device.name}`, device.sysfsPath);
         const children: BlockDevicePartition[] = device.partitions.map(partition => ({
             type: 'part' as const,
@@ -224,12 +223,10 @@ export class HttpMgmt {
         };
         const primaryPartition = device.partitions.find(part => part.uuid);
         if (primaryPartition?.uuid) {
-            for (const [volumeId, volume] of volumes.entries()) {
-                if (volume.partitionUuid === primaryPartition.uuid) {
-                    serialized.volumeId = volumeId;
-                    serialized.volumeLabel = volume.label ?? null;
-                    break;
-                }
+            const volume = ioManager.getVolumeByPartitionUuid(primaryPartition.uuid);
+            if (volume) {
+                serialized.volumeId = volume.id;
+                serialized.volumeLabel = volume.label ?? null;
             }
         }
         return serialized;
@@ -598,7 +595,7 @@ export class HttpMgmt {
     }
 
     private static async handleRebalanceStartRequest(req: HttpRequest): Promise<{ rebalancing: boolean }> {
-        const payload = await this.parseJsonBody<{ deadband?: unknown; maxMoves?: unknown }>(req);
+        const payload = await this.parseJsonBody<{ deadband?: unknown; maxMoves?: unknown; concurrency?: unknown }>(req);
         const options: { deadband?: number; maxMoves?: number } = {};
         if (payload.deadband !== undefined) {
             if (typeof payload.deadband !== 'number' || payload.deadband < 0 || payload.deadband > 0.5)
@@ -610,12 +607,25 @@ export class HttpMgmt {
                 throw new HttpBadRequestError('maxMoves must be a positive number');
             options.maxMoves = payload.maxMoves;
         }
+        if (payload.concurrency !== undefined)
+            await rebalanceJob.setConcurrency(payload.concurrency);
         await rebalanceJob.start(options);
         return { rebalancing: true };
     }
 
-    private static async handleRebalanceStatusRequest(): Promise<{ running: boolean }> {
-        return { running: rebalanceJob.isRunning() };
+    private static async handleRebalanceStatusRequest(): Promise<RebalanceStatus> {
+        return rebalanceJob.getStatus();
+    }
+
+    // Retune concurrency without stopping: a running rebalance picks it up at the next batch.
+    private static async handleRebalanceConfigRequest(req: HttpRequest): Promise<{ concurrency: number }> {
+        const payload = await this.parseJsonBody<{ concurrency?: unknown }>(req);
+        if (payload.concurrency === undefined)
+            throw new HttpBadRequestError('concurrency is required');
+        const n = typeof payload.concurrency === 'number' ? payload.concurrency : NaN;
+        if (!Number.isInteger(n) || n < 1 || n > 64)
+            throw new HttpBadRequestError('concurrency must be an integer in [1, 64]');
+        return { concurrency: await rebalanceJob.setConcurrency(n) };
     }
 
     private static async handleRebalanceCancelRequest(): Promise<{ rebalancing: boolean }> {
@@ -721,6 +731,8 @@ export class HttpMgmt {
             isEnabled: volume.isEnabled,
             isHealthy: volume.isHealthy,
             isReadOnly: volume.isReadOnly,
+            isPresent: volume.isPresent,
+            isMissing: volume.isMissing,
             deviceSerial: volume.deviceSerial,
             deviceModel: volume.deviceModel ?? null,
             deviceVendor: volume.deviceVendor ?? null,
@@ -892,6 +904,11 @@ export class HttpMgmt {
                 method: 'GET',
                 match: url => url === '/$/rebalance' ? {} : null,
                 handler: async () => this.handleRebalanceStatusRequest()
+            },
+            {
+                method: 'PUT',
+                match: url => url === '/$/rebalance' ? {} : null,
+                handler: async req => this.handleRebalanceConfigRequest(req)
             },
             {
                 method: 'DELETE',

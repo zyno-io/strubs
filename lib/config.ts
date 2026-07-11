@@ -9,7 +9,7 @@ dotenv.config();
 const log = createLogger('config');
 
 const VALID_SEVERITIES: Severity[] = ['info', 'warning', 'critical'];
-// A full whole-object rolling scrub takes ~2 weeks on this array, so run it QUARTERLY -- frequent
+// A full whole-object rolling scrub can take weeks on a large array, so run it QUARTERLY -- frequent
 // enough to catch and repair slice degradation on aging drives within the 4+2 redundancy window, gentle
 // enough not to needlessly wear them (reads already checksum hot data continuously). The scheduler
 // no-ops while a scrub is still in flight, and chunks this >24.8-day delay so it doesn't overflow the
@@ -25,6 +25,9 @@ const DEFAULT_STORAGE_STATS_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_STORAGE_STATS_FLUSH_INTERVAL_MS = 5 * 1000;
 const DEFAULT_VERIFY_READ_DELAY_MS = 2;
 const DEFAULT_DRAIN_CONCURRENCY = 4;
+// Backstop cadence only — udev drives low-latency reaction, so this just catches missed events. Kept
+// at 5min (matching the other monitors) to avoid spawning smartctl across every disk too aggressively.
+const DEFAULT_DEVICE_RECONCILE_INTERVAL_MS = 5 * 60 * 1000;
 
 function parseSeverity(value: string | undefined, fallback: Severity): Severity {
     if (value && (VALID_SEVERITIES as string[]).includes(value))
@@ -90,10 +93,19 @@ export class Config {
     verifyReadDelayMs: number;
     verifyParity: boolean;
 
-    // How many objects a drain/rebalance relocates concurrently. Higher = faster on drives that can
-    // absorb the parallel I/O, but the aging USB-DAS enclosures are seek-bound, so raise it in small
-    // steps and measure. Override with STRUBS_DRAIN_CONCURRENCY.
+    // How many objects a drain relocates concurrently. Higher = faster on drives that can absorb the
+    // parallel I/O, but the aging USB-DAS enclosures are seek-bound, so raise it in small steps and
+    // measure. Override with STRUBS_DRAIN_CONCURRENCY.
     drainConcurrency: number;
+
+    // NOTE: rebalance concurrency is deliberately NOT here. It lives in runtimeConfig so it can be
+    // read and retuned from the API/UI while a rebalance is running (see rebalance-job).
+
+    // Device reconciler: detects hotplugged disks (insert/remove) and remounts/marks volumes to match.
+    // The interval is the periodic backstop pass (set 0 to disable); udev provides low-latency reaction
+    // and can be turned off with STRUBS_DISABLE_UDEV=true (falls back to periodic-only).
+    deviceReconcileIntervalMs: number;
+    deviceReconcileUdev: boolean;
 
     constructor() {
         this.mongoUrl = process.env.STRUBS_MONGO_URL || 'mongodb://strubs:strubs@127.0.0.1:27017/strubs?authSource=admin';
@@ -136,6 +148,11 @@ export class Config {
         // Full-mode scrub also validates parity (recompute-and-compare); disable with =false.
         this.verifyParity = process.env.STRUBS_VERIFY_PARITY !== 'false';
         this.drainConcurrency = parsePositiveInt(process.env.STRUBS_DRAIN_CONCURRENCY, DEFAULT_DRAIN_CONCURRENCY);
+        this.deviceReconcileIntervalMs = parseNonNegativeInt(
+            process.env.STRUBS_DEVICE_RECONCILE_INTERVAL_MS,
+            DEFAULT_DEVICE_RECONCILE_INTERVAL_MS
+        );
+        this.deviceReconcileUdev = process.env.STRUBS_DISABLE_UDEV !== 'true';
     }
 
     async loadIdentity(): Promise<void> {

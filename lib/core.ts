@@ -12,6 +12,7 @@ import { createLogger } from './log';
 import { volumeSmartMonitor } from './io/volume-smart-monitor';
 import { systemLogWatcher } from './io/system-log-watcher';
 import { volumeHealthMonitor } from './io/volume-health-monitor';
+import { deviceReconciler } from './io/device-reconciler';
 import { configureNotifications } from './notify/bootstrap';
 import { remediationService } from './remediation/service';
 import { repairWorker } from './remediation/repair-worker';
@@ -65,6 +66,11 @@ export class Core {
             await remediationService.hydrate();
             await ioManager.init();
             await volumeSmartMonitor.start();
+            // A rebalance owns the disks while it runs. If one is pending, park the scrub BEFORE we
+            // consider resuming it — otherwise it would start here and get killed seconds later when
+            // the rebalance resumes below. It stays queued and the rebalance releases it when done.
+            if (await rebalanceJob.hasPendingRun())
+                await verifyVolumesJob.pauseForRebalance();
             // Resume any pending verify run before exposing HTTP, so an inbound
             // verify/scrub request can't race the resume for job state.
             await verifyVolumesJob.resumePendingJob();
@@ -92,6 +98,7 @@ export class Core {
                 await rebalanceJob.resumePendingJob();
             }
             volumeHealthMonitor.start(config.volumeHealthIntervalMs, config.volumeFaultThreshold);
+            deviceReconciler.start(config.deviceReconcileIntervalMs, { udev: config.deviceReconcileUdev });
             storageStatsTracker.start({
                 reconcileIntervalMs: config.storageStatsIntervalMs,
                 flushIntervalMs: config.storageStatsFlushIntervalMs
@@ -122,6 +129,7 @@ export class Core {
             systemLogWatcher.stop();
             repairWorker.stop();
             volumeHealthMonitor.stop();
+            deviceReconciler.stop();
 
             try {
                 await this.deps.serverManager.stop();

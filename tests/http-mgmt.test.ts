@@ -7,6 +7,14 @@ import type { HttpRequest, HttpResponse } from '../lib/server/http/server';
 const ioManagerMock = {
     getVolumeEntries: vi.fn(),
     getVolume: vi.fn(),
+    // Mirrors the real delegator: find a non-deleted volume by partition UUID from the current entries.
+    getVolumeByPartitionUuid: vi.fn((uuid: string) => {
+        const entries = (ioManagerMock.getVolumeEntries() as Array<[number, any]> | undefined) ?? [];
+        for (const [, volume] of entries)
+            if (volume && !volume.isDeleted && volume.partitionUuid === uuid)
+                return volume;
+        return undefined;
+    }),
     registerVolume: vi.fn(),
     softDeleteVolume: vi.fn(),
     updateVolumeFlags: vi.fn(),
@@ -402,7 +410,7 @@ describe('HttpMgmt.handle', () => {
         ];
         ioManagerMock.getCachedDevices.mockReturnValue(cachedDevices);
         ioManagerMock.getVolumeEntries.mockReturnValue([
-            [5, { partitionUuid: 'part-b', label: 'Data' }]
+            [5, { id: 5, partitionUuid: 'part-b', label: 'Data' }]
         ]);
 
         const response = await HttpMgmt.handle(3, createRequest('GET', '/$/blockDevices'), nullResponse);
@@ -599,8 +607,8 @@ describe('HttpMgmt.handle', () => {
         ];
         ioManagerMock.getCachedDevices.mockReturnValue(cachedDevices);
         ioManagerMock.getVolumeEntries.mockReturnValue([
-            [5, { partitionUuid: 'part-b', label: 'Backup' }],
-            [3, { partitionUuid: 'part-a', label: 'Archive' }]
+            [5, { id: 5, partitionUuid: 'part-b', label: 'Backup' }],
+            [3, { id: 3, partitionUuid: 'part-a', label: 'Archive' }]
         ]);
 
         const reqId = createRequest('GET', '/$/blockDevices');

@@ -81,7 +81,12 @@ const getApiBaseUrl = (): string => {
 const apiBaseUrl = getApiBaseUrl();
 
 // Verify job state
-interface VerifyStatus {
+// Verify defers to a running rebalance: the request is persisted and queued, not dropped.
+interface VerifyStatusWaiting {
+  waiting: boolean;
+  waitingFor: 'rebalance' | null;
+}
+interface VerifyStatus extends VerifyStatusWaiting {
   running: boolean;
   startedAt: string | null;
   objectsVerified: number;
@@ -95,6 +100,32 @@ const verifyActionPending = ref<boolean>(false);
 const stopRequested = ref<boolean>(false);
 let verifyPollTimer: ReturnType<typeof setInterval> | null = null;
 
+// Rebalance: evens out fill across the pool by relocating slices off over-full drives onto under-full
+// ones. bytesToMove is how far the pool still is from the balance point, so it doubles as progress.
+interface RebalanceStatus {
+  running: boolean;
+  targetFill: number;
+  deadband: number;
+  bytesToMove: number;
+  bytesMoved: number;
+  bytesPerSec: number;
+  etaSeconds: number | null;
+  sourceVolumeIds: number[];
+  currentSourceVolumeId: number | null;
+  currentMinObjectSize: number | null;
+  startedAt: string | null;
+  moves: number;
+  copied: number;
+  reconstructed: number;
+  noDest: number;
+  unrecoverable: number;
+  sourceDeleteFailed: number;
+  duplicateRefs: number;
+}
+const rebalanceStatus = ref<RebalanceStatus | null>(null);
+const rebalancePending = ref<boolean>(false);
+const concurrencyPending = ref<boolean>(false);
+
 // Maintenance freeze: when frozen, verify/repair/drain/rebalance are all paused.
 const maintenanceFrozen = ref<boolean | null>(null);
 const freezePending = ref<boolean>(false);
@@ -102,8 +133,122 @@ const freezePending = ref<boolean>(false);
 // The maintenance panel (verify + freeze) collapses when everything is nominal — nothing verifying and
 // maintenance enabled (not frozen) — and auto-expands when a verify is running or maintenance is frozen.
 const maintenanceCollapsed = ref<boolean>(true);
-const maintenanceNominal = computed(() => !verifyStatus.value?.running && maintenanceFrozen.value === false);
+
+// Several kinds of maintenance can be in flight, so the header just says whether ANY is — the detail
+// lives in the panels below (and in the tooltip).
+const maintenanceActivity = computed<string[]>(() => {
+  const what: string[] = [];
+  if (rebalanceStatus.value?.running) what.push('Rebalancing');
+  if (verifyStatus.value?.running) what.push('Verifying');
+  else if (verifyStatus.value?.waiting) what.push('Verify queued');
+  if (volumes.value.some(v => v.isDraining)) what.push('Draining');
+  return what;
+});
+const maintenanceActive = computed(() => maintenanceActivity.value.length > 0);
+
+const maintenanceNominal = computed(() =>
+  !verifyStatus.value?.running && !rebalanceStatus.value?.running && maintenanceFrozen.value === false);
 watch(maintenanceNominal, nominal => { maintenanceCollapsed.value = nominal; }, { immediate: true });
+
+// Fraction of this run's work already done. bytesToMove shrinks as the job works, so moved/(moved+left)
+// is a true progress figure — and it stays honest across a restart, since bytesToMove is recomputed
+// from live volume fills rather than remembered.
+const rebalanceProgress = computed<number>(() => {
+  const s = rebalanceStatus.value;
+  if (!s) return 0;
+  const total = s.bytesMoved + s.bytesToMove;
+  return total > 0 ? Math.min(1, s.bytesMoved / total) : (s.bytesToMove === 0 ? 1 : 0);
+});
+
+// Everything the rebalance declined to move, and why. Empty when the run is clean.
+const rebalanceSkipped = computed<Array<{ label: string; count: number }>>(() => {
+  const s = rebalanceStatus.value;
+  if (!s) return [];
+  return [
+    { label: 'no target', count: s.noDest },
+    { label: 'unrecoverable', count: s.unrecoverable },
+    { label: 'source not freed', count: s.sourceDeleteFailed },
+    { label: 'duplicate slice refs', count: s.duplicateRefs }
+  ].filter(e => e.count > 0);
+});
+
+const rebalanceEta = computed<string>(() => {
+  const secs = rebalanceStatus.value?.etaSeconds;
+  if (secs == null || !isFinite(secs)) return '—';
+  if (secs < 90) return `${Math.round(secs)}s`;
+  if (secs < 5400) return `${Math.round(secs / 60)}m`;
+  if (secs < 172800) return `${(secs / 3600).toFixed(1)}h`;
+  return `${(secs / 86400).toFixed(1)}d`;
+});
+
+// Which size tier the job is shedding — it works biggest-objects-first.
+const rebalanceTierLabel = computed<string>(() => {
+  const min = rebalanceStatus.value?.currentMinObjectSize;
+  if (min == null) return '—';
+  return min > 0 ? `≥ ${formatBytes(min)}` : 'all sizes';
+});
+
+async function fetchRebalanceStatus(): Promise<void> {
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/rebalance`);
+    if (!res.ok) return;
+    rebalanceStatus.value = await res.json();
+  }
+  catch { /* transient poll failure — keep the last known status */ }
+}
+
+// Retune how many slices relocate at once. A running rebalance re-reads this each batch, so the
+// change lands without restarting anything — which is the point: the right value is only discoverable
+// by watching a real rebalance move real data.
+async function applyConcurrency(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const value = parseInt(input.value, 10);
+  if (!Number.isInteger(value) || value < 1 || value > 64) {
+    input.value = String(rebalanceStatus.value?.concurrency ?? '');
+    error.value = 'Concurrency must be a whole number between 1 and 64';
+    return;
+  }
+  concurrencyPending.value = true;
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/rebalance`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ concurrency: value })
+    });
+    if (!res.ok) throw new Error(`Failed to set concurrency (HTTP ${res.status})`);
+    await fetchRebalanceStatus();
+  }
+  catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to set concurrency';
+    input.value = String(rebalanceStatus.value?.concurrency ?? '');
+  }
+  finally {
+    concurrencyPending.value = false;
+  }
+}
+
+// Start the rebalance, or cancel one in flight. Cancelling is safe at any point: a slice is only
+// removed from its source after the copy is verified and the reference has been flipped.
+async function toggleRebalance(): Promise<void> {
+  const running = rebalanceStatus.value?.running === true;
+  if (!running && !confirm(
+    'Start a rebalance? This relocates slices off over-full drives onto under-full ones to even out '
+    + 'fill. It moves data and can run for a long time. You can cancel it at any point.'
+  )) return;
+
+  rebalancePending.value = true;
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/rebalance`, { method: running ? 'DELETE' : 'POST' });
+    if (!res.ok) throw new Error(`Failed to ${running ? 'cancel' : 'start'} rebalance (HTTP ${res.status})`);
+    await fetchRebalanceStatus();
+  }
+  catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to update rebalance';
+  }
+  finally {
+    rebalancePending.value = false;
+  }
+}
 
 interface StorageCounters {
   objectCount: number;
@@ -305,6 +450,17 @@ const EMPTY_STORAGE_COUNTERS: StorageCounters = {
   physicalBytes: 0
 };
 
+const EMPTY_STORAGE_SYSTEM_STATS: StorageStats['system'] = {
+  ...EMPTY_STORAGE_COUNTERS,
+  unavailableObjectCount: 0,
+  unavailableLogicalBytes: 0
+};
+
+// Same reasoning as the per-volume counters: fill in any counter the snapshot omits.
+const systemStats = computed<StorageStats['system'] | null>(() =>
+  storageStats.value ? { ...EMPTY_STORAGE_SYSTEM_STATS, ...storageStats.value.system } : null
+);
+
 // Parse a "group.index" label (e.g. "3.3") into numeric [group, index] for sorting
 function parseGroupIndex(label: string | null): [number, number] | null {
   if (!label) return null;
@@ -340,7 +496,10 @@ const storageVolumeRows = computed<StorageVolumeRow[]>(() => {
   for (const id of Object.keys(statsByVolume)) volumeIds.add(Number(id));
 
   const volumeRows: StorageVolumeRow[] = [...volumeIds].map(volumeId => {
-    const stats = statsByVolume[volumeId] ?? EMPTY_STORAGE_COUNTERS;
+    // Spread over the zeroed defaults rather than trusting the payload: a counter that
+    // was zero when the volume's stats subdocument was first written may be absent
+    // entirely, and an absent counter means zero.
+    const stats = { ...EMPTY_STORAGE_COUNTERS, ...statsByVolume[volumeId] };
     const volume = volumes.value.find(candidate => candidate.id === volumeId) ?? null;
     // group.index physical label (e.g. "3.3"), kept separate from the numeric id
     const groupLabel = volume?.label ?? null;
@@ -1060,8 +1219,9 @@ onMounted(() => {
   fetchVerifyStatus();
   fetchStorageStats();
   fetchFreezeStatus();
+  fetchRebalanceStatus();
   // Keep the verify panel + freeze state live without a manual refresh
-  verifyPollTimer = setInterval(() => { fetchVerifyStatus(); fetchFreezeStatus(); }, 3000);
+  verifyPollTimer = setInterval(() => { fetchVerifyStatus(); fetchFreezeStatus(); fetchRebalanceStatus(); }, 3000);
   storageStatsPollTimer = setInterval(fetchStorageStats, 10000);
   // Close context menu on click anywhere
   document.addEventListener('click', hideContextMenu);
@@ -1098,9 +1258,10 @@ onUnmounted(() => {
           <h2>Maintenance</h2>
           <span
             class="verify-state"
-            :class="verifyStatus?.running ? 'running' : 'idle'"
+            :class="maintenanceActive ? 'running' : 'idle'"
+            :title="maintenanceActivity.length ? maintenanceActivity.join(' · ') : 'Nothing running'"
           >
-            {{ verifyStatus?.running ? 'Verifying' : 'Idle' }}
+            {{ maintenanceActive ? 'Active' : 'Idle' }}
           </span>
           <span
             v-if="maintenanceFrozen !== null"
@@ -1130,7 +1291,110 @@ onUnmounted(() => {
         Maintenance is <strong>frozen</strong> — verify, repair, drain, and rebalance are paused.
       </div>
       <div class="verify-subheader">
-        <h3>Verify</h3>
+        <h3>Rebalance</h3>
+        <div class="verify-actions">
+          <label class="concurrency-control" title="Slices relocated at once. Takes effect immediately, even mid-rebalance. Higher is faster on disks that can absorb the parallel I/O, but seek-bound drives thrash — raise it in small steps and watch the rate.">
+            <span class="verify-stat-label">Concurrency</span>
+            <input
+              type="number"
+              min="1"
+              max="64"
+              step="1"
+              class="concurrency-input"
+              :value="rebalanceStatus?.concurrency ?? ''"
+              :disabled="concurrencyPending"
+              @change="applyConcurrency($event)"
+            />
+          </label>
+          <button
+            @click="toggleRebalance"
+            :disabled="rebalancePending || maintenanceFrozen === true"
+            :class="rebalanceStatus?.running ? 'verify-stop-btn' : 'verify-start-btn'"
+            :title="maintenanceFrozen === true ? 'Paused by the maintenance freeze' : ''"
+          >
+            {{ rebalancePending
+              ? 'Working...'
+              : rebalanceStatus?.running ? 'Cancel Rebalance' : 'Start Rebalance' }}
+          </button>
+        </div>
+      </div>
+
+      <div v-if="rebalanceStatus?.running" class="rebalance-progress">
+        <div class="rebalance-bar">
+          <div class="rebalance-bar-fill" :style="{ width: `${(rebalanceProgress * 100).toFixed(1)}%` }"></div>
+        </div>
+        <span class="rebalance-progress-label">
+          {{ formatBytes(rebalanceStatus.bytesMoved) }} moved,
+          {{ formatBytes(rebalanceStatus.bytesToMove) }} to go
+          ({{ (rebalanceProgress * 100).toFixed(1) }}%)
+        </span>
+      </div>
+
+      <div class="verify-stats">
+        <div class="verify-stat">
+          <span class="verify-stat-label">Target Fill</span>
+          <span class="verify-stat-value">
+            {{ rebalanceStatus ? `${(rebalanceStatus.targetFill * 100).toFixed(1)}%` : '—' }}
+          </span>
+        </div>
+        <div class="verify-stat">
+          <span class="verify-stat-label">Left To Move</span>
+          <span class="verify-stat-value">{{ rebalanceStatus ? formatBytes(rebalanceStatus.bytesToMove) : '—' }}</span>
+        </div>
+        <div class="verify-stat">
+          <span class="verify-stat-label">Rate</span>
+          <span class="verify-stat-value">
+            {{ rebalanceStatus?.running ? `${formatBytes(rebalanceStatus.bytesPerSec)}/s` : '—' }}
+          </span>
+        </div>
+        <div class="verify-stat">
+          <span class="verify-stat-label">ETA</span>
+          <span class="verify-stat-value">{{ rebalanceStatus?.running ? rebalanceEta : '—' }}</span>
+        </div>
+        <div class="verify-stat">
+          <span class="verify-stat-label">Slices Moved</span>
+          <span class="verify-stat-value">
+            {{ (rebalanceStatus?.moves ?? 0).toLocaleString() }}
+            <span v-if="rebalanceStatus" class="rebalance-submetric">
+              ({{ rebalanceStatus.copied.toLocaleString() }} copied / {{ rebalanceStatus.reconstructed.toLocaleString() }} rebuilt)
+            </span>
+          </span>
+        </div>
+        <div class="verify-stat">
+          <span class="verify-stat-label">Now Draining</span>
+          <span class="verify-stat-value">
+            {{ rebalanceStatus?.currentSourceVolumeId != null
+              ? `vol ${rebalanceStatus.currentSourceVolumeId} · ${rebalanceTierLabel}`
+              : '—' }}
+          </span>
+        </div>
+      </div>
+
+      <div v-if="rebalanceStatus && rebalanceStatus.sourceVolumeIds.length > 0" class="verify-targets">
+        <span class="verify-stat-label">Over target:</span>
+        <span
+          v-for="id in rebalanceStatus.sourceVolumeIds"
+          :key="id"
+          class="verify-target-badge"
+          :class="{ 'rebalance-active-source': id === rebalanceStatus.currentSourceVolumeId }"
+        >
+          vol {{ id }}
+        </span>
+      </div>
+      <div v-if="rebalanceSkipped.length > 0" class="verify-volume-errors">
+        <span class="verify-stat-label">Skipped:</span>
+        <span v-for="entry in rebalanceSkipped" :key="entry.label" class="verify-volume-badge">
+          {{ entry.count.toLocaleString() }} {{ entry.label }}
+        </span>
+      </div>
+      <div class="verify-subheader">
+        <!-- Grouped: the subheader is space-between, so a bare sibling would float to the middle. -->
+        <div class="subheader-title">
+          <h3>Verify</h3>
+          <span v-if="verifyStatus?.waiting" class="verify-waiting-pill" title="A rebalance owns the disks; this run is queued and starts when it finishes">
+            Waiting for rebalance
+          </span>
+        </div>
         <div class="verify-actions">
           <button
             @click="startVerify"
@@ -1192,6 +1456,7 @@ onUnmounted(() => {
           vol {{ entry.volumeId }}: {{ entry.count.toLocaleString() }}
         </span>
       </div>
+
       </template>
     </section>
 
@@ -1222,26 +1487,26 @@ onUnmounted(() => {
         </button>
       </div>
       <div v-show="storageTab === 'overview'">
-        <div v-if="storageStats" class="storage-stats">
+        <div v-if="systemStats" class="storage-stats">
           <div class="storage-stat">
             <span class="storage-stat-label">Files</span>
-            <span class="storage-stat-value">{{ storageStats.system.objectCount.toLocaleString() }}</span>
+            <span class="storage-stat-value">{{ systemStats.objectCount.toLocaleString() }}</span>
           </div>
           <div class="storage-stat">
             <span class="storage-stat-label">Logical Data</span>
-            <span class="storage-stat-value">{{ formatBytes(storageStats.system.logicalBytes) }}</span>
+            <span class="storage-stat-value">{{ formatBytes(systemStats.logicalBytes) }}</span>
           </div>
           <div class="storage-stat">
             <span class="storage-stat-label">Data Slices</span>
-            <span class="storage-stat-value">{{ formatBytes(storageStats.system.dataBytes) }}</span>
+            <span class="storage-stat-value">{{ formatBytes(systemStats.dataBytes) }}</span>
           </div>
           <div class="storage-stat">
             <span class="storage-stat-label">Parity Slices</span>
-            <span class="storage-stat-value">{{ formatBytes(storageStats.system.parityBytes) }}</span>
+            <span class="storage-stat-value">{{ formatBytes(systemStats.parityBytes) }}</span>
           </div>
           <div class="storage-stat">
             <span class="storage-stat-label">Physical Total</span>
-            <span class="storage-stat-value">{{ formatBytes(storageStats.system.physicalBytes) }}</span>
+            <span class="storage-stat-value">{{ formatBytes(systemStats.physicalBytes) }}</span>
           </div>
           <div class="storage-stat">
             <span class="storage-stat-label">Total Capacity</span>
@@ -1249,8 +1514,8 @@ onUnmounted(() => {
           </div>
           <div class="storage-stat">
             <span class="storage-stat-label">Unavailable</span>
-            <span class="storage-stat-value" :class="{ 'error-text': storageStats.system.unavailableObjectCount > 0 }">
-              {{ storageStats.system.unavailableObjectCount.toLocaleString() }} / {{ formatBytes(storageStats.system.unavailableLogicalBytes) }}
+            <span class="storage-stat-value" :class="{ 'error-text': systemStats.unavailableObjectCount > 0 }">
+              {{ systemStats.unavailableObjectCount.toLocaleString() }} / {{ formatBytes(systemStats.unavailableLogicalBytes) }}
             </span>
           </div>
         </div>
@@ -1998,6 +2263,14 @@ h2 {
   color: #555;
 }
 
+/* Keeps a status pill hugging its heading instead of drifting into the middle of the
+   space-between subheader. */
+.subheader-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .verify-title {
   display: flex;
   align-items: center;
@@ -2122,6 +2395,76 @@ h2 {
   border-radius: 12px;
   font-size: 12px;
   font-weight: 600;
+}
+
+/* Rebalance */
+.concurrency-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+}
+
+.concurrency-input {
+  width: 56px;
+  padding: 4px 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #333;
+}
+
+.concurrency-input:disabled {
+  opacity: 0.6;
+}
+
+/* A verify held back until the rebalance releases the disks. */
+.verify-waiting-pill {
+  background-color: #fff3e0;
+  color: #e65100;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.rebalance-progress {
+  margin-top: 16px;
+}
+
+.rebalance-bar {
+  width: 100%;
+  height: 8px;
+  background-color: #eee;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.rebalance-bar-fill {
+  height: 100%;
+  background-color: #1565c0;
+  border-radius: 4px;
+  transition: width 0.6s ease;
+}
+
+.rebalance-progress-label {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #666;
+}
+
+.rebalance-submetric {
+  font-size: 12px;
+  font-weight: 400;
+  color: #888;
+}
+
+/* The source currently being drained, among the over-target volumes. */
+.rebalance-active-source {
+  background-color: #1565c0;
+  color: #fff;
 }
 
 /* Storage Panel */

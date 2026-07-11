@@ -32,10 +32,12 @@ vi.mock('../lib/io/manager', () => ({
 
 const verifyResumeMock = vi.fn();
 const verifyStopMock = vi.fn();
+const verifyPauseForRebalanceMock = vi.fn();
 vi.mock('../lib/jobs/verify-volumes-job', () => ({
     verifyVolumesJob: {
         resumePendingJob: verifyResumeMock,
-        stop: verifyStopMock
+        stop: verifyStopMock,
+        pauseForRebalance: verifyPauseForRebalanceMock
     }
 }));
 
@@ -50,10 +52,13 @@ vi.mock('../lib/jobs/drain-volume-job', () => ({
 
 const rebalanceResumeMock = vi.fn();
 const rebalanceStopMock = vi.fn();
+// A pending rebalance owns the disks -> startup parks the scrub before resuming it.
+const rebalanceHasPendingMock = vi.fn().mockResolvedValue(false);
 vi.mock('../lib/jobs/rebalance-job', () => ({
     rebalanceJob: {
         resumePendingJob: rebalanceResumeMock,
-        stop: rebalanceStopMock
+        stop: rebalanceStopMock,
+        hasPendingRun: rebalanceHasPendingMock
     }
 }));
 
@@ -72,6 +77,17 @@ vi.mock('../lib/storage/stats-tracker', () => ({
     storageStatsTracker: {
         start: storageStatsStartMock,
         stop: storageStatsStopMock
+    }
+}));
+
+// Mock the reconciler: its real start() spawns a persistent `udevadm monitor` subprocess, which would
+// leak (orphan to init) when the test worker exits since these tests don't call core.stop().
+const deviceReconcilerStartMock = vi.fn();
+const deviceReconcilerStopMock = vi.fn();
+vi.mock('../lib/io/device-reconciler', () => ({
+    deviceReconciler: {
+        start: deviceReconcilerStartMock,
+        stop: deviceReconcilerStopMock
     }
 }));
 
@@ -107,6 +123,9 @@ describe('Core', () => {
         mkdirMock.mockResolvedValue();
         verifyResumeMock.mockReset();
         verifyStopMock.mockReset();
+        verifyPauseForRebalanceMock.mockReset();
+        rebalanceHasPendingMock.mockReset();
+        rebalanceHasPendingMock.mockResolvedValue(false);
         smartMonitorStartMock.mockReset();
         smartMonitorStopMock.mockReset();
         storageStatsStartMock.mockReset();
@@ -120,6 +139,31 @@ describe('Core', () => {
         smartMonitorStartMock.mockResolvedValue(undefined);
         smartMonitorStopMock.mockResolvedValue(undefined);
         storageStatsStopMock.mockResolvedValue(undefined);
+    });
+
+    it('parks the scrub at startup when a rebalance is pending, rather than starting it to be killed', async () => {
+        rebalanceHasPendingMock.mockResolvedValueOnce(true);
+        const { Core } = await import('../lib/core');
+        const core = new Core();
+
+        await core.start();
+
+        // Must be blocked BEFORE the resume, or the scrub launches and the resuming rebalance
+        // immediately stops it again.
+        expect(verifyPauseForRebalanceMock).toHaveBeenCalled();
+        expect(verifyPauseForRebalanceMock.mock.invocationCallOrder[0])
+            .toBeLessThan(verifyResumeMock.mock.invocationCallOrder[0]);
+    });
+
+    it('does not park the scrub at startup when no rebalance is pending', async () => {
+        rebalanceHasPendingMock.mockResolvedValueOnce(false);
+        const { Core } = await import('../lib/core');
+        const core = new Core();
+
+        await core.start();
+
+        expect(verifyPauseForRebalanceMock).not.toHaveBeenCalled();
+        expect(verifyResumeMock).toHaveBeenCalled();
     });
 
     it('performs the full startup sequence', async () => {
