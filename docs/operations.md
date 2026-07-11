@@ -46,6 +46,55 @@ systemctl restart strubs
 
 > **Restarting is safe, but not free.** STRUBS unmounts its volumes on shutdown, so a restart will fail to unmount cleanly if anything else holds a file open on them (an `rsync`, a script). In-flight relocations are aborted (`IOABORT`) — safe, because a slice is only removed from its source *after* the copy is verified and the reference flipped — but they'll need to be redone. Long-running jobs (scrub, drain, rebalance) checkpoint their progress and resume automatically on boot.
 
+### What STRUBS needs from the host
+
+Worth knowing before you try to sandbox it, because it explains why it needs root.
+
+| | |
+|---|---|
+| **Binaries** | `lsblk`, `parted`, `mkfs.ext4`, `partprobe`, `mount`, `umount`, `smartctl`, `journalctl`, `udevadm` |
+| **Syscalls** | `mount`/`umount` — it mounts each volume itself |
+| **Devices** | Raw reads on `/dev/sd*` (identity, SMART, LED flashing), and `/dev/fuse` |
+| **Hotplug** | udev events, with a periodic scan as backstop |
+| **Logs** | The systemd journal, for the kernel/smartd watcher |
+
+### Running in Docker
+
+You can. Be clear about what it does and doesn't buy you.
+
+STRUBS needs the host's block devices, the `mount` syscall, raw device access, and `/dev/fuse`. Once you've handed a container all of that, **it is no longer a security boundary** — it's a packaging format. That's a perfectly good reason to do it (a pinned Node version, and the native modules here are the fiddly kind: `fuse-native`, `@ronomon/reed-solomon`, `diskusage`), just not the reason people usually reach for a container.
+
+What it takes:
+
+```bash
+docker run -d --name strubs \
+  --privileged \                          # or: --cap-add SYS_ADMIN --cap-add SYS_RAWIO --cap-add MKNOD
+  -v /dev:/dev \                          # NOT --device: STRUBS must SEE new disks appear
+  --device /dev/fuse \
+  -v /run/udev:/run/udev:ro \             # udevadm
+  -v /var/log/journal:/var/log/journal:ro \   # journalctl (kernel + smartd watcher)
+  --mount type=bind,source=/run/strubs,target=/run/strubs,bind-propagation=rshared \
+  -v /var/lib/strubs:/var/lib/strubs \    # instance identity
+  -p 80:80 \
+  strubs
+```
+
+Two of those are easy to get wrong:
+
+- **`-v /dev:/dev`, not `--device=/dev/sdb`.** `--device` maps a *fixed* node. STRUBS is built around disks appearing and vanishing; a static mapping means hotplug never works and a replaced drive never shows up.
+- **`bind-propagation=rshared` on `/run/strubs`.** Every volume STRUBS mounts lands under `/run/strubs/mounts/`, and the FUSE mount is at `/run/strubs/data`. Without shared propagation those mounts exist only inside the container's namespace — the host, and anything else on it, sees an empty directory.
+
+The image needs `smartmontools`, `parted`, `e2fsprogs`, `util-linux`, and `fuse`.
+
+If you *don't* grant everything, two features degrade rather than crash — both have an off switch:
+
+| Missing | What stops working | Set |
+|---|---|---|
+| udev access | Hotplug detection | `STRUBS_DISABLE_UDEV=true` (falls back to periodic scanning) |
+| Journal access | Kernel/smartd errors triggering a targeted verify | `STRUBS_SYSLOG_WATCH_INTERVAL_MS=0` |
+
+**The recommendation: run STRUBS on the host, under systemd.** It's a single-host appliance that already fits that shape, and every sharp edge above simply doesn't exist. Containerise MongoDB separately if you like — that one is a clean win, and it's the piece you most want to be able to move, upgrade, and back up independently.
+
 ## Watching it
 
 ```bash

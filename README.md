@@ -56,9 +56,28 @@ STRUBS doesn't care. Disks are just capacity. It picks the 6 volumes for an obje
 
 STRUBS runs on one machine, and its memory use scales with *in-flight requests*, not with the number of disks or the size of the array. Adding a disk costs you a disk.
 
+### One system that knows both the disk and the object
+
+This is the part that matters most in practice, and it's easy to miss.
+
+Every other option in this list owns **one half** of the problem:
+
+- **RAID, ZFS, btrfs** know about *blocks*. They cannot tell you which of your **files** a dying disk endangers, because at that layer a file isn't a thing. A rebuild re-mirrors the whole spindle, blindly, empty space included — and if it hits a second failure partway through, you find out what you lost afterwards.
+- **MinIO** knows about *objects* and deliberately doesn't touch disks. No SMART, no provisioning, no drive-replacement lifecycle — it assumes something below it manages the drives. That's a clean separation of concerns; it just means you still have to solve the other half yourself.
+
+STRUBS owns both ends, and closes the loop between them:
+
+> the kernel logs an I/O error on `sdf` → the log watcher maps that device to a volume → it triggers a **targeted verification of that drive's objects** → bad slices become tracked faults → the repair worker rebuilds them from parity, gated on the whole-object checksum → if the drive keeps misbehaving it's degraded to read-only, so reads still work and writes stop → you drain it (every slice relocated, even if the disk is now dead) → you flash its LED to find the right bay → you pull it.
+
+All of it inside one service, driven from one API and one UI.
+
+Because it knows objects, it can answer the question you actually care about — **which files are at risk right now** — and repair exactly those. Nothing else in this list can, short of running Ceph.
+
 ### And the obvious alternative
 
 **MinIO** is the closest thing in spirit, and it was still in its infancy when STRUBS was started. Since then its attention has moved toward a commercial product and the open-source edition has been pared back — which makes it an uncomfortable thing to build on if you are a small operator who just wants a stable box in a cupboard that still works in five years. It also expects uniform drives within an erasure set, and is really meant to be run as a multi-node cluster.
+
+**Ceph** does own both halves, and its disk automation is genuinely comparable — device health metrics, SMART collection, LED identify, the lot. But you are taking on a distributed cluster, and the RAM bill above, to get it.
 
 If MinIO or Ceph fits your situation, use them: they have vastly more people behind them. STRUBS exists for the case where they don't.
 
