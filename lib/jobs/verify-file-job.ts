@@ -1,5 +1,5 @@
 import { database, type SliceErrorInfo } from '../database';
-import { categorizeSliceError } from '../slice-error';
+import { categorizeSliceError, isIOAbort } from '../slice-error';
 import { createLogger } from '../log';
 import { fileObjectService, type FileObjectService } from '../io/file-object/service';
 import type { FileObject, StoredObjectRecord } from '../io/file-object';
@@ -240,6 +240,11 @@ export class VerifyFileJob {
             };
         }
         catch (err) {
+            // Our own shutdown cancelled the read -- we learned nothing about this slice. Abort the
+            // whole verify (matching verify-volumes-job) so the caller sees a clear error and we
+            // persist NO verification state: recording it would flag a healthy slice permanently.
+            if (isIOAbort(err))
+                throw err;
             const normalized = this.normalizeSliceError(record, err);
             const message = err instanceof Error ? err.message : String(err);
             sliceResults[descriptor.key] = {

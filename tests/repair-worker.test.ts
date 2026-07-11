@@ -348,6 +348,30 @@ describe('RepairWorker', () => {
         );
     });
 
+    it('does not count IOABORT shutdown artifacts toward quorum (repairs instead of blocking)', async () => {
+        const verifyObject = vi.fn()
+            .mockResolvedValueOnce({ '0': { ok: false, volumeId: 1 } })
+            .mockResolvedValueOnce({ '0': { ok: true, volumeId: 1 } });
+        const { worker, deps } = makeWorker({
+            verifyObject,
+            database: { getObjectById: vi.fn().mockResolvedValue({
+                id: 'obj1', size: 10,
+                dataVolumes: [1, 2, 3, 4], parityVolumes: [5, 6],
+                // 3 entries, but 2 are shutdown artifacts -> only 1 real bad slice, well within quorum
+                sliceErrors: {
+                    '0': { code: 'EIO', category: 'io' },
+                    '2': { code: 'IOABORT', category: 'unknown' },
+                    '3': { code: 'IOABORT', category: 'unknown' }
+                }
+            }) }
+        });
+
+        await worker.processFaults();
+
+        expect(deps.remediationService.markRepairBlocked).not.toHaveBeenCalled();
+        expect(deps.repairSlice).toHaveBeenCalled();
+    });
+
     it('still repairs a within-quorum object with a repairable slice error map', async () => {
         const verifyObject = vi.fn()
             .mockResolvedValueOnce({ '0': { ok: false, volumeId: 1 } })

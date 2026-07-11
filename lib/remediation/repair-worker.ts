@@ -6,6 +6,7 @@ import { notificationService, NotificationService } from '../notify/service';
 import { remediationService, RemediationService } from './service';
 import type { RepairBlockDetails, SliceFault } from './fault';
 import { isMaintenanceFrozen } from '../maintenance';
+import { isIOAbort } from '../slice-error';
 
 type VerifySliceResult = { ok: boolean; volumeId: number | null };
 type VerifyResult = Record<string, VerifySliceResult>;
@@ -367,7 +368,9 @@ export class RepairWorker {
             if (guarded && Array.isArray(guarded.dataVolumes) && Array.isArray(guarded.parityVolumes) && guarded.sliceErrors) {
                 const parityCount = guarded.parityVolumes.length;
                 const totalSlices = guarded.dataVolumes.length + parityCount;
-                const badCount = Object.keys(guarded.sliceErrors).length;
+                // IOABORT entries are shutdown artifacts, not bad slices (see isIOAbort). Counting
+                // them here would block repair of a perfectly healthy object as "below quorum".
+                const badCount = Object.values(guarded.sliceErrors).filter(info => !isIOAbort(info)).length;
                 if (badCount > parityCount) {
                     this.log('skipping repair of %s slice %d: below quorum (%d bad slices > %d parity)', fault.objectId, fault.sliceIndex, badCount, parityCount);
                     await this.deps.remediationService.markRepairBlocked(fault.key, 'insufficient-slices', {

@@ -10,7 +10,7 @@ type RunFn = (command: string, args: string[]) => Promise<{ code: number | null;
 
 type SystemLogWatcherDeps = {
     run: RunFn;
-    ioManager: Pick<typeof ioManager, 'getVolumeEntries'>;
+    ioManager: Pick<typeof ioManager, 'getVolumeByDeviceName'>;
     verifyVolumesJob: Pick<typeof verifyVolumesJob, 'start'>;
     notificationService: NotificationService;
     // Persist a volume's pending-sector high-water (the in-memory Volume is updated separately).
@@ -51,7 +51,10 @@ export class SystemLogWatcher {
     private timer: NodeJS.Timeout | null = null;
     private lastPollAt: Date | null = null;
     private polling = false;
-    private readonly lastTriggered = new Map<string, number>();
+    // Keyed by VOLUME, not device name: several device names now resolve to one volume (smartd names the
+    // disk "sdf", the kernel names the partition "sdf1"). Keyed by name, each would carry its own
+    // cooldown and a single poll could fire two verifies of the same drive, then re-notify every poll.
+    private readonly lastTriggered = new Map<number, number>();
 
     constructor(options?: { triggerCooldownMs?: number }, deps?: Partial<SystemLogWatcherDeps>) {
         this.deps = { ...defaultDeps, ...deps };
@@ -150,10 +153,10 @@ export class SystemLogWatcher {
         if (signal.kind === 'pending' && (signal.count ?? 0) <= volume.pendingSectorHighWater)
             return;
 
-        const last = this.lastTriggered.get(signal.device);
+        const last = this.lastTriggered.get(volumeId);
         const now = this.deps.now();
         if (last !== undefined && now - last < this.cooldownMs)
-            return; // already acted on this device recently
+            return; // already acted on this volume recently, whichever device name reported it
 
         this.log('device %s (volume %d) reported %s; triggering targeted verify', signal.device, volumeId, signal.kind);
 
@@ -161,7 +164,7 @@ export class SystemLogWatcher {
             severity: 'warning',
             title: `Device ${signal.device} reported ${signal.kind}`,
             body: `${signal.detail} — triggering targeted verify of volume ${volumeId}`,
-            dedupeKey: `syslog:${signal.device}:${signal.kind}`,
+            dedupeKey: `syslog:vol${volumeId}:${signal.kind}`,
             context: { device: signal.device, volumeId, kind: signal.kind }
         }).catch(err => {
             this.log.error('failed to notify for %s: %s', signal.device, err instanceof Error ? err.message : String(err));
@@ -170,12 +173,12 @@ export class SystemLogWatcher {
         try {
             const result = await this.deps.verifyVolumesJob.start({ volumeIds: [volumeId] });
             if (result.accepted === false) {
-                this.log('targeted verify for volume %d was not accepted; leaving %s out of cooldown', volumeId, signal.device);
+                this.log('targeted verify for volume %d was not accepted; leaving it out of cooldown', volumeId);
                 return;
             }
             // Arm the cooldown only once the verify run was accepted, so a
-            // transient failure doesn't suppress this device for hours.
-            this.lastTriggered.set(signal.device, now);
+            // transient failure doesn't suppress this volume for hours.
+            this.lastTriggered.set(volumeId, now);
             // Record the pending high-water on the volume (in-memory + persisted) so this standing count
             // won't re-trigger; only a further increase will.
             if (signal.kind === 'pending') {
@@ -188,15 +191,27 @@ export class SystemLogWatcher {
         }
     }
 
+    // smartd names the DISK ("Device: /dev/sdaf"), but the kernel names the PARTITION when the error
+    // comes up through the filesystem ("Buffer I/O error on dev sdf1"). volume.deviceName is the disk,
+    // so a partition-scoped signal has to be mapped back to its parent disk -- otherwise it is dropped
+    // as "not a managed volume", which silently killed the kernel-error half of this watcher.
     private resolveVolume(device: string): Volume | null {
-        for (const [, volume] of this.deps.ioManager.getVolumeEntries()) {
-            const vol = volume as Volume;
-            if (vol.isDeleted)
-                continue;
-            if (vol.deviceName === device)
-                return vol;
-        }
-        return null;
+        const exact = this.deps.ioManager.getVolumeByDeviceName(device);
+        if (exact)
+            return exact;
+        const parent = SystemLogWatcher.parentDiskName(device);
+        if (!parent)
+            return null;
+        return this.deps.ioManager.getVolumeByDeviceName(parent) ?? null;
+    }
+
+    // "sdf1" -> "sdf", "nvme0n1p2" -> "nvme0n1". null when `device` is already a whole disk.
+    static parentDiskName(device: string): string | null {
+        const nvme = /^(nvme\d+n\d+)p\d+$/.exec(device);
+        if (nvme)
+            return nvme[1];
+        const sd = /^([a-zA-Z]+)\d+$/.exec(device);
+        return sd ? sd[1] : null;
     }
 
     private formatSince(date: Date): string {

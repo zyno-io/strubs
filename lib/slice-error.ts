@@ -13,6 +13,15 @@ const CODE_CATEGORY: Record<string, SliceErrorCategory> = {
     EPARITY: 'parity-mismatch'
 };
 
+// IOABORT (io-shutdown.ts) is raised when our own shutdown cancels in-flight I/O. It is
+// evidence about us, not about the slice: we never learned whether the slice is readable.
+// So it must never be persisted as a slice error, and any already-persisted entry must not
+// count toward quorum -- otherwise a restart mid-verify permanently parks a healthy object
+// as below-quorum. Accepts either a thrown Error or a stored SliceErrorInfo (both carry .code).
+export function isIOAbort(subject: unknown): boolean {
+    return (subject as { code?: string } | undefined)?.code === 'IOABORT';
+}
+
 // Derive a SliceErrorCategory from an error code (preferred) with a message-based
 // fallback. The fallback exists so errors raised on paths that don't set a code,
 // and historical-shaped errors, still classify without re-instrumenting every site.

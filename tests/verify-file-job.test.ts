@@ -126,6 +126,22 @@ describe('VerifyFileJob', () => {
         }));
     });
 
+    it('aborts on IOABORT without persisting it as a slice error', async () => {
+        const record = createRecord();
+        databaseMock.getObjectById.mockResolvedValue(record);
+        fileObjectServiceMock.load.mockResolvedValue({} as FileObject);
+        // Our own shutdown cancelled the read: it says nothing about the slice, so it must not be
+        // recorded (a persisted entry would flag a healthy slice and count toward quorum forever).
+        verifySliceMock
+            .mockRejectedValueOnce(Object.assign(new Error('I/O aborted due to shutdown'), { code: 'IOABORT' }))
+            .mockResolvedValue(undefined);
+
+        await expect(job.verify(record.id)).rejects.toMatchObject({ code: 'IOABORT' });
+
+        expect(databaseMock.updateObjectVerificationState).not.toHaveBeenCalled();
+        expect(verifyObjectParityMock).not.toHaveBeenCalled();
+    });
+
     it('does NOT run parity verification when a data slice already errored', async () => {
         const record = createRecord();
         databaseMock.getObjectById.mockResolvedValue(record);

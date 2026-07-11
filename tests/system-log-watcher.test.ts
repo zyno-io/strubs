@@ -44,6 +44,14 @@ describe('SystemLogWatcher parsing', () => {
         expect(signals.map(s => s.device)).toEqual(['sdn', 'sdn']);
         expect(signals[0]).toMatchObject({ kind: 'ioerror', detail: 'critical target error' });
     });
+
+    it('maps a partition name back to its parent disk (whole disks unchanged)', () => {
+        expect(SystemLogWatcher.parentDiskName('sdf1')).toBe('sdf');
+        expect(SystemLogWatcher.parentDiskName('sdaf12')).toBe('sdaf');
+        expect(SystemLogWatcher.parentDiskName('nvme0n1p2')).toBe('nvme0n1');
+        expect(SystemLogWatcher.parentDiskName('sdf')).toBeNull();   // already a disk
+        expect(SystemLogWatcher.parentDiskName('dm-0')).toBeNull();  // not a partition
+    });
 });
 
 describe('SystemLogWatcher poll', () => {
@@ -61,7 +69,12 @@ describe('SystemLogWatcher poll', () => {
         ];
         return {
             run,
-            ioManager: { getVolumeEntries: vi.fn(() => volumes) },
+            ioManager: {
+                getVolumeByDeviceName: vi.fn((name: string) => {
+                    const found = volumes.find(([, vol]) => !vol.isDeleted && vol.deviceName === name);
+                    return found ? found[1] : undefined;
+                })
+            },
             verifyVolumesJob: { start: vi.fn().mockResolvedValue({ startedAt: 'x' }) },
             notificationService: { notify: vi.fn().mockResolvedValue({ delivered: [], failed: [], suppressed: false }) },
             persistPendingHighWater: vi.fn().mockResolvedValue(undefined),
@@ -88,6 +101,24 @@ describe('SystemLogWatcher poll', () => {
         const verifiedVolumes = deps.verifyVolumesJob.start.mock.calls.map((c: any[]) => c[0].volumeIds[0]).sort();
         expect(verifiedVolumes).toEqual([1, 2]);
         expect(deps.notificationService.notify).toHaveBeenCalledTimes(2);
+    });
+
+    it('triggers verify for a filesystem I/O error, which names the PARTITION not the disk', async () => {
+        // When a filesystem aborts, the kernel logs the error against the partition (sdf1) while the
+        // volume's deviceName is the disk (sdf). Without the parent-disk mapping this is dropped as
+        // "not a managed volume" -- a live I/O error on a managed volume, silently ignored.
+        const deps = makeDeps({
+            volumes: [[13, mkVol(13, 'sdf')]],
+            run: vi.fn(async (_cmd: string, args: string[]) => args.includes('-k')
+                ? { code: 0, stdout: 'Buffer I/O error on dev sdf1, logical block 488144896, lost sync page write' }
+                : { code: 0, stdout: '' })
+        });
+        const watcher = new SystemLogWatcher({}, deps);
+
+        await watcher.poll();
+
+        expect(deps.verifyVolumesJob.start).toHaveBeenCalledTimes(1);
+        expect(deps.verifyVolumesJob.start.mock.calls[0][0].volumeIds).toEqual([13]);
     });
 
     it('does not re-trigger a device within the cooldown window', async () => {
