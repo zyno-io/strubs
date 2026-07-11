@@ -5,6 +5,7 @@ import { ioManager } from '../io/manager';
 import { runtimeConfig } from '../runtime-config';
 import { isMaintenanceFrozen } from '../maintenance';
 import type { Volume } from '../io/volume';
+import { domainLoadForObject, domainLoadFor } from '../io/failure-domain';
 import type { ContentDocument } from '../database/types';
 
 // Persisted drain progress (so a restart resumes the in-flight drain before routine maintenance).
@@ -274,7 +275,7 @@ export class DrainVolumeJob {
         // defaulting it to a bogus large requirement that would falsely block relocation.
         const declared = (doc as { sliceSize?: number }).sliceSize;
         const sliceBytes = typeof declared === 'number' ? declared : Math.ceil(((doc as { size?: number }).size ?? 0) / Math.max(1, dataVols.length));
-        const target = this.pickTarget(objectVols, sliceBytes);
+        const target = this.pickTarget(objectVols, sliceBytes, volumeId);
         if (!target) { s.noDest++; this.log('no relocation target for object %s (all healthy volumes in use or full)', (doc as { id?: string }).id); return; }
 
         const object = await this.deps.loadObject(doc);
@@ -321,16 +322,23 @@ export class DrainVolumeJob {
 
     // Emptiest healthy WRITABLE volume the object doesn't already use (draining volumes are already
     // excluded from getWritableVolumes()). Distinct-volume constraint keeps one slice per drive.
-    private pickTarget(objectVols: Set<number>, sliceBytes: number): Volume | null {
+    // Ranked by FAILURE DOMAIN first, then free space. Draining a disk relocates every slice it holds;
+    // picking purely by emptiness will happily stack a third slice of an object into an enclosure that
+    // already holds two, so a box outage then takes it below quorum even though every disk is fine.
+    // The write planner spreads across groups — a drain must not quietly undo that.
+    private pickTarget(objectVols: Set<number>, sliceBytes: number, movingFrom: number): Volume | null {
+        const load = domainLoadForObject(objectVols, movingFrom, id => this.deps.getVolume(id));
         let best: Volume | null = null;
         let bestFree = -1;
+        let bestLoad = Infinity;
         for (const v of this.deps.getWritableVolumes()) {
             if (objectVols.has(v.id))
                 continue;
             const free = (v.bytesFree ?? 0) - v.bytesPending;
             if (free < sliceBytes)
                 continue;
-            if (free > bestFree) { bestFree = free; best = v; }
+            const l = domainLoadFor(v, load);
+            if (l < bestLoad || (l === bestLoad && free > bestFree)) { bestLoad = l; bestFree = free; best = v; }
         }
         return best;
     }

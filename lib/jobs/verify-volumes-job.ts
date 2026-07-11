@@ -1,7 +1,7 @@
 import os from 'os';
 import PQueue from 'p-queue';
 import { database, type SliceErrorInfo } from '../database';
-import { categorizeSliceError } from '../slice-error';
+import { categorizeSliceError, isIOAbort } from '../slice-error';
 import { runtimeConfig } from '../runtime-config';
 import { fileObjectService, type FileObjectService } from '../io/file-object/service';
 import type { StoredObjectRecord, FileObject } from '../io/file-object';
@@ -42,6 +42,9 @@ export type VerifyVolumesStatus = {
     scope: 'full' | 'targeted';
     mode: VerifyMode;
     volumeIds: number[];
+    // Requested (and persisted), but held back until a rebalance finishes. Not running, not lost.
+    waiting: boolean;
+    waitingFor: 'rebalance' | null;
 };
 
 type VerifyVolumesObjectResult = {
@@ -50,7 +53,7 @@ type VerifyVolumesObjectResult = {
     volumeImpacts: Map<number, VolumeErrorCounters>;
 };
 
-type VerifyStartResult = { startedAt: string; accepted: boolean };
+type VerifyStartResult = { startedAt: string; accepted: boolean; deferred?: boolean };
 
 const defaultDeps: VerifyVolumesJobDeps = {
     database,
@@ -162,6 +165,8 @@ export class VerifyVolumesJob {
     private startedAt: string | null = null;
     private volumeFilter: Set<number> | null = null;
     private startGuard = false;
+    private waitingForRebalance = false;
+    private blockedByRebalance = false;
     private progress = {
         objectsVerified: 0,
         errors: {
@@ -200,8 +205,11 @@ export class VerifyVolumesJob {
                 const persistedCursorId = await this.loadPersistedCursorId();
                 const persistedMode = await this.loadPersistedMode();
                 const restoredCount = await this.getResumedObjectsVerified(existing, persistedFilter);
+                const accepted = this.filterCoversRequest(persistedFilter, requestedFilter);
+                if (this.deferForRebalance())
+                    return { startedAt: existing, accepted, deferred: true };
                 this.launch(existing, true, persistedFilter, restoredCount, persistedCursorId, persistedMode);
-                return { startedAt: existing, accepted: this.filterCoversRequest(persistedFilter, requestedFilter) };
+                return { startedAt: existing, accepted };
             }
 
             await this.persistVolumeFilter(requestedFilter);
@@ -210,6 +218,9 @@ export class VerifyVolumesJob {
 
             const startedAt = new Date().toISOString();
             await this.deps.runtimeConfig.set('verifyStartedAt', startedAt);
+            // Persisted above, so the request is not lost — the rebalance resumes it when it finishes.
+            if (this.deferForRebalance())
+                return { startedAt, accepted: true, deferred: true };
             this.launch(startedAt, false, requestedFilter, 0, null, requestedMode);
             return { startedAt, accepted: true };
         }
@@ -230,6 +241,8 @@ export class VerifyVolumesJob {
             const existing = await this.deps.runtimeConfig.get('verifyStartedAt');
             if (typeof existing !== 'string' || !existing.length)
                 return;
+            if (this.deferForRebalance())
+                return; // state stays persisted; the rebalance calls back here when it finishes
             this.log('resuming verify job started at %s', existing);
             const persistedFilter = await this.loadPersistedVolumeFilter();
             const persistedCursorId = await this.loadPersistedCursorId();
@@ -242,11 +255,48 @@ export class VerifyVolumesJob {
         }
     }
 
+    // A rebalance relocates slices out from under a scrub: the two fight over the same spindles, and
+    // verifying a volume whose slices are moving re-verifies a moving target. So a rebalance takes the
+    // disks for its duration -- it parks any running scrub (cursor preserved) and blocks new ones. A
+    // verify requested meanwhile is PERSISTED and queued, never dropped.
+    async pauseForRebalance(): Promise<void> {
+        this.blockedByRebalance = true;
+        if (this.isRunning()) {
+            this.log('rebalance starting: pausing verify (its cursor is preserved)');
+            await this.stop({ preserveState: true });
+            this.waitingForRebalance = true; // paused mid-run -> it is queued, not finished
+        }
+    }
+
+    // Rebalance finished (or was cancelled): hand the disks back and start whatever was queued.
+    async releaseForRebalance(): Promise<void> {
+        this.blockedByRebalance = false;
+        await this.resumePendingJob();
+    }
+
+    // Hold the run back while a rebalance is in flight. The caller has already persisted the request,
+    // so this only decides whether to launch NOW. Returns true when the run was deferred.
+    private deferForRebalance(): boolean {
+        if (!this.blockedByRebalance)
+            return false;
+        this.waitingForRebalance = true;
+        this.log('rebalance in progress: verify queued, will start when the rebalance finishes');
+        return true;
+    }
+
     async stop(options?: { preserveState?: boolean }): Promise<void> {
         const running = this.running;
         const run = this.activeRun;
-        if (!running || !run)
+        if (!running || !run) {
+            // A run queued behind a rebalance isn't "running", but Stop must still be able to drop it —
+            // otherwise it would silently start the moment the rebalance ends.
+            if (this.waitingForRebalance && !options?.preserveState) {
+                this.log('stop requested: discarding the verify queued behind the rebalance');
+                this.waitingForRebalance = false;
+                await this.clearPersistedRun();
+            }
             return;
+        }
         this.log('stop requested');
         run.cancelled = true;
 
@@ -272,12 +322,15 @@ export class VerifyVolumesJob {
             this.volumeFilter = null;
         }
 
-        if (!options?.preserveState) {
-            await this.deps.runtimeConfig.delete('verifyStartedAt');
-            await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
-            await this.deps.runtimeConfig.delete(VERIFY_CURSOR_ID_KEY);
-            await this.deps.runtimeConfig.delete(VERIFY_MODE_KEY);
-        }
+        if (!options?.preserveState)
+            await this.clearPersistedRun();
+    }
+
+    private async clearPersistedRun(): Promise<void> {
+        await this.deps.runtimeConfig.delete('verifyStartedAt');
+        await this.deps.runtimeConfig.delete(VERIFY_VOLUME_IDS_KEY);
+        await this.deps.runtimeConfig.delete(VERIFY_CURSOR_ID_KEY);
+        await this.deps.runtimeConfig.delete(VERIFY_MODE_KEY);
     }
 
     // Resolve true if the promise settles within the window, false on timeout.
@@ -309,6 +362,7 @@ export class VerifyVolumesJob {
         const volumeIds = this.volumeFilter
             ? Array.from(this.volumeFilter).sort((a, b) => a - b)
             : [];
+        const waiting = !this.isRunning() && this.waitingForRebalance;
         return {
             running: this.isRunning(),
             startedAt: this.startedAt,
@@ -317,7 +371,9 @@ export class VerifyVolumesJob {
             concurrency: this.currentConcurrency,
             scope: volumeIds.length ? 'targeted' : 'full',
             mode: this.currentMode,
-            volumeIds
+            volumeIds,
+            waiting,
+            waitingFor: waiting ? 'rebalance' : null
         };
     }
 
@@ -325,6 +381,7 @@ export class VerifyVolumesJob {
         if (this.running)
             return;
 
+        this.waitingForRebalance = false;
         this.startedAt = startedAt;
         this.currentMode = mode;
         this.applyVolumeFilter(volumeIds);
@@ -551,7 +608,7 @@ export class VerifyVolumesJob {
                     await verifier.verifySlice(sliceIndex);
                 }
                 catch (err) {
-                    if (this.isIOAbortError(err)) {
+                    if (isIOAbort(err)) {
                         run.cancelled = true;
                         this.log('object %s verification aborted due to I/O shutdown', record.id);
                         return null;
@@ -611,7 +668,7 @@ export class VerifyVolumesJob {
             };
         }
         catch (err) {
-            if (this.isIOAbortError(err)) {
+            if (isIOAbort(err)) {
                 run.cancelled = true;
                 this.log('object %s verification aborted due to I/O shutdown', record.id);
                 return null;
@@ -851,10 +908,6 @@ export class VerifyVolumesJob {
         return Math.max(1, Math.min(cpuCount, effective));
     }
 
-    private isIOAbortError(err: unknown): boolean {
-        const errorObj = err as Error & { code?: string };
-        return errorObj?.code === 'IOABORT';
-    }
 
     private async mergeVolumeResults(
         aggregate: Map<number, VolumeErrorCounters>,

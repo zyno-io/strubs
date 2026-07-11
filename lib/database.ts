@@ -161,8 +161,8 @@ export class Database {
         return this.contentRepository.countObjectsVerifiedSince(startedAt, volumeIds);
     }
 
-    async findObjectsOnVolume(volumeIds: number[], limit: number, afterId?: ObjectIdentifier): Promise<ContentDocument[]> {
-        return this.contentRepository.findObjectsOnVolume(volumeIds, limit, afterId);
+    async findObjectsOnVolume(volumeIds: number[], limit: number, afterId?: ObjectIdentifier, opts?: { minSize?: number }): Promise<ContentDocument[]> {
+        return this.contentRepository.findObjectsOnVolume(volumeIds, limit, afterId, opts);
     }
 
     async countObjectsOnVolume(volumeId: number, opts?: { excludeDead?: boolean }): Promise<number> {

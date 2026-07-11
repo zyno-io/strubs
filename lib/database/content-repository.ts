@@ -322,7 +322,15 @@ export class ContentRepository {
     // --- drain/drain support ---
 
     // Objects with a slice on any of the given volumes, _id-ordered for cursor resume.
-    async findObjectsOnVolume(volumeIds: number[], limit: number, afterId?: ObjectIdentifier): Promise<ContentDocument[]> {
+    // minSize restricts the scan to objects at or above a size (bytes). The rebalance uses it to shed
+    // the big objects first; it's a plain filter on top of the existing _id-ordered scan, so there is
+    // no blocking sort to fall over on a multi-million-document volume.
+    async findObjectsOnVolume(
+        volumeIds: number[],
+        limit: number,
+        afterId?: ObjectIdentifier,
+        opts?: { minSize?: number }
+    ): Promise<ContentDocument[]> {
         if (!volumeIds.length)
             return [];
         const afterFilter = this.idAfterFilter(afterId);
@@ -331,6 +339,8 @@ export class ContentRepository {
             ...(afterFilter ?? {}),
             $or: [{ dataVolumes: { $in: volumeIds } }, { parityVolumes: { $in: volumeIds } }]
         };
+        if (opts?.minSize)
+            (query as Record<string, unknown>).size = { $gte: opts.minSize };
         const objects = await this.collection.find<ContentDocument>(query, { sort: { _id: 1 }, limit }).toArray();
         return objects.map(object => this.normalize(object));
     }

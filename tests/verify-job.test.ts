@@ -68,6 +68,60 @@ describe('VerifyVolumesJob', () => {
         });
     });
 
+    describe('deferral behind a rebalance', () => {
+        it('queues a requested verify instead of running it, and persists the request', async () => {
+            const deps = createDeps();
+            deps.runtimeConfig.get.mockResolvedValue(null);
+            const job = new VerifyVolumesJob(deps);
+
+            await job.pauseForRebalance();
+            const result = await job.start({ volumeIds: [13] });
+
+            expect(result.accepted).toBe(true);
+            expect(result.deferred).toBe(true);
+            expect(job.isRunning()).toBe(false);
+            // Persisted, so it is queued rather than dropped -- the rebalance restarts it later.
+            expect(deps.runtimeConfig.set).toHaveBeenCalledWith('verifyStartedAt', result.startedAt);
+            expect(job.getStatus()).toMatchObject({ running: false, waiting: true, waitingFor: 'rebalance' });
+        });
+
+        it('starts the queued verify once the rebalance releases the disks', async () => {
+            const deps = createDeps();
+            deps.runtimeConfig.get.mockResolvedValue(null);
+            deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
+            const job = new VerifyVolumesJob(deps);
+
+            await job.pauseForRebalance();
+            await job.start();
+            expect(job.getStatus().waiting).toBe(true);
+
+            // The rebalance finished: the persisted run must now actually launch.
+            deps.runtimeConfig.get.mockResolvedValue('2026-01-01T00:00:00.000Z');
+            await job.releaseForRebalance();
+
+            const running = (job as unknown as { running: Promise<void> | null }).running;
+            if (running) await running;
+            expect(deps.database.findObjectsNeedingVerification).toHaveBeenCalled();
+            expect(job.getStatus().waiting).toBe(false);
+        });
+
+        it('lets Stop discard a verify that is queued behind a rebalance', async () => {
+            // Without this, Stop would appear to do nothing and the run would spring to life later.
+            const deps = createDeps();
+            deps.runtimeConfig.get.mockResolvedValue(null);
+            const job = new VerifyVolumesJob(deps);
+
+            await job.pauseForRebalance();
+            await job.start();
+            expect(job.getStatus().waiting).toBe(true);
+
+            await job.stop();
+
+            expect(job.getStatus()).toMatchObject({ waiting: false, waitingFor: null });
+            expect(deps.runtimeConfig.delete.mock.calls.map(c => c[0])).toContain('verifyStartedAt');
+        });
+    });
+
     it('reports targeted verification scope while a filtered run is active', () => {
         const job = new VerifyVolumesJob(createDeps());
         Object.assign(job as unknown as {
