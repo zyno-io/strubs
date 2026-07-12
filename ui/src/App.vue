@@ -80,6 +80,64 @@ const getApiBaseUrl = (): string => {
 
 const apiBaseUrl = getApiBaseUrl();
 
+// --- admin authentication ---
+// The management API requires a session; the UI is served from the same (admin) origin, so the session
+// cookie rides along automatically on same-origin fetches. We just gate the app behind a login screen.
+const authChecked = ref<boolean>(false);   // have we asked the server yet?
+const authenticated = ref<boolean>(false);
+const loginPassword = ref<string>('');
+const loginError = ref<string | null>(null);
+const loginPending = ref<boolean>(false);
+
+// Every API call goes through this: a 401 anywhere means the session expired, so drop back to login.
+async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  const res = await fetch(input, init);
+  if (res.status === 401) {
+    authenticated.value = false;
+    authChecked.value = true;
+  }
+  return res;
+}
+
+async function checkAuth(): Promise<void> {
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/auth/status`);
+    if (res.ok) authenticated.value = (await res.json()).authenticated === true;
+  }
+  catch { /* leave unauthenticated; the login screen will show */ }
+  finally { authChecked.value = true; }
+}
+
+async function login(): Promise<void> {
+  loginError.value = null;
+  loginPending.value = true;
+  try {
+    const res = await fetch(`${apiBaseUrl}/$/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: loginPassword.value })
+    });
+    if (res.status === 401) { loginError.value = 'Incorrect password'; return; }
+    if (!res.ok) { loginError.value = `Login failed (HTTP ${res.status})`; return; }
+    loginPassword.value = '';
+    authenticated.value = true;
+    startApp();
+  }
+  catch (err) {
+    loginError.value = err instanceof Error ? err.message : 'Login failed';
+  }
+  finally {
+    loginPending.value = false;
+  }
+}
+
+async function logout(): Promise<void> {
+  try { await fetch(`${apiBaseUrl}/$/session`, { method: 'DELETE' }); }
+  catch { /* clearing local state below is what matters */ }
+  authenticated.value = false;
+  stopApp();
+}
+
 // Verify job state
 // Verify defers to a running rebalance: the request is persisted and queued, not dropped.
 interface VerifyStatusWaiting {
@@ -190,7 +248,7 @@ const rebalanceTierLabel = computed<string>(() => {
 
 async function fetchRebalanceStatus(): Promise<void> {
   try {
-    const res = await fetch(`${apiBaseUrl}/$/rebalance`);
+    const res = await apiFetch(`${apiBaseUrl}/$/rebalance`);
     if (!res.ok) return;
     rebalanceStatus.value = await res.json();
   }
@@ -210,7 +268,7 @@ async function applyConcurrency(event: Event): Promise<void> {
   }
   concurrencyPending.value = true;
   try {
-    const res = await fetch(`${apiBaseUrl}/$/rebalance`, {
+    const res = await apiFetch(`${apiBaseUrl}/$/rebalance`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ concurrency: value })
@@ -238,7 +296,7 @@ async function toggleRebalance(): Promise<void> {
 
   rebalancePending.value = true;
   try {
-    const res = await fetch(`${apiBaseUrl}/$/rebalance`, { method: running ? 'DELETE' : 'POST' });
+    const res = await apiFetch(`${apiBaseUrl}/$/rebalance`, { method: running ? 'DELETE' : 'POST' });
     if (!res.ok) throw new Error(`Failed to ${running ? 'cancel' : 'start'} rebalance (HTTP ${res.status})`);
     await fetchRebalanceStatus();
   }
@@ -274,7 +332,7 @@ let storageStatsPollTimer: ReturnType<typeof setInterval> | null = null;
 
 async function fetchStorageStats(): Promise<void> {
   try {
-    const res = await fetch(`${apiBaseUrl}/$/storage-stats`);
+    const res = await apiFetch(`${apiBaseUrl}/$/storage-stats`);
     if (!res.ok) return;
     storageStats.value = await res.json();
   } catch {
@@ -285,7 +343,7 @@ async function fetchStorageStats(): Promise<void> {
 // Poll the maintenance-freeze state; tolerant of transient errors so polling continues.
 async function fetchFreezeStatus(): Promise<void> {
   try {
-    const res = await fetch(`${apiBaseUrl}/$/maintenance-freeze`);
+    const res = await apiFetch(`${apiBaseUrl}/$/maintenance-freeze`);
     if (!res.ok) return;
     maintenanceFrozen.value = (await res.json()).frozen;
   } catch {
@@ -304,7 +362,7 @@ async function toggleFreeze(): Promise<void> {
   if (!confirm(msg)) return;
   freezePending.value = true;
   try {
-    const res = await fetch(`${apiBaseUrl}/$/maintenance-freeze`, {
+    const res = await apiFetch(`${apiBaseUrl}/$/maintenance-freeze`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ frozen: next })
@@ -325,7 +383,7 @@ async function toggleFreeze(): Promise<void> {
 // Poll the verify job status; tolerant of transient errors so polling continues
 async function fetchVerifyStatus(): Promise<void> {
   try {
-    const res = await fetch(`${apiBaseUrl}/$/verify-volumes`);
+    const res = await apiFetch(`${apiBaseUrl}/$/verify-volumes`);
     if (!res.ok) return;
     verifyStatus.value = await res.json();
     if (!verifyStatus.value?.running) stopRequested.value = false;
@@ -339,7 +397,7 @@ async function startVerify(): Promise<void> {
   if (verifyActionPending.value) return;
   verifyActionPending.value = true;
   try {
-    const res = await fetch(`${apiBaseUrl}/$/verify-volumes`, {
+    const res = await apiFetch(`${apiBaseUrl}/$/verify-volumes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({})
@@ -369,7 +427,7 @@ async function stopVerify(): Promise<void> {
   if (stopRequested.value) return;
   if (!confirm('Stop the running verify job?')) return;
   stopRequested.value = true;
-  fetch(`${apiBaseUrl}/$/verify-volumes`, { method: 'DELETE' }).catch(() => {});
+  apiFetch(`${apiBaseUrl}/$/verify-volumes`, { method: 'DELETE' }).catch(() => {});
 }
 
 // Format an ISO timestamp for display
@@ -671,8 +729,8 @@ async function fetchData(): Promise<void> {
     error.value = null;
 
     const [volumesRes, blockDevicesRes] = await Promise.all([
-      fetch(`${apiBaseUrl}/$/volumes`),
-      fetch(`${apiBaseUrl}/$/blockDevices?sort=sysfsPath`)
+      apiFetch(`${apiBaseUrl}/$/volumes`),
+      apiFetch(`${apiBaseUrl}/$/blockDevices?sort=sysfsPath`)
     ]);
 
     if (!volumesRes.ok || !blockDevicesRes.ok) {
@@ -698,8 +756,8 @@ async function refreshDevices(): Promise<void> {
     error.value = null;
 
     const [volumesRes, blockDevicesRes] = await Promise.all([
-      fetch(`${apiBaseUrl}/$/volumes`),
-      fetch(`${apiBaseUrl}/$/blockDevices/reload`, { method: 'POST' })
+      apiFetch(`${apiBaseUrl}/$/volumes`),
+      apiFetch(`${apiBaseUrl}/$/blockDevices/reload`, { method: 'POST' })
     ]);
 
     if (!volumesRes.ok || !blockDevicesRes.ok) {
@@ -844,7 +902,7 @@ async function createVolumes(): Promise<void> {
           body.wipe = Date.now();
         }
 
-        const response = await fetch(`${apiBaseUrl}/$/volumes`, {
+        const response = await apiFetch(`${apiBaseUrl}/$/volumes`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
@@ -940,7 +998,7 @@ async function saveLabel(): Promise<void> {
 
   savingLabel.value = true;
   try {
-    const response = await fetch(`${apiBaseUrl}/$/volumes/${editingVolumeId.value}`, {
+    const response = await apiFetch(`${apiBaseUrl}/$/volumes/${editingVolumeId.value}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: editLabelValue.value || null })
@@ -991,7 +1049,7 @@ async function saveComment(): Promise<void> {
 
   savingComment.value = true;
   try {
-    const response = await fetch(`${apiBaseUrl}/$/volumes/${editingCommentVolumeId.value}`, {
+    const response = await apiFetch(`${apiBaseUrl}/$/volumes/${editingCommentVolumeId.value}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ comment: editCommentValue.value || null })
@@ -1031,7 +1089,7 @@ async function toggleVolumeEnabled(): Promise<void> {
   }
 
   try {
-    const response = await fetch(`${apiBaseUrl}/$/volumes/${volumeId}`, {
+    const response = await apiFetch(`${apiBaseUrl}/$/volumes/${volumeId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ isEnabled: nextEnabled })
@@ -1065,7 +1123,7 @@ async function toggleVolumeReadOnly(): Promise<void> {
   hideContextMenu();
 
   try {
-    const response = await fetch(`${apiBaseUrl}/$/volumes/${volumeId}`, {
+    const response = await apiFetch(`${apiBaseUrl}/$/volumes/${volumeId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ isReadOnly: nextReadOnly })
@@ -1105,7 +1163,7 @@ async function toggleVolumeDrain(): Promise<void> {
   }
 
   try {
-    const response = await fetch(`${apiBaseUrl}/$/volumes/${volumeId}/drain`, {
+    const response = await apiFetch(`${apiBaseUrl}/$/volumes/${volumeId}/drain`, {
       method: cancelling ? 'DELETE' : 'POST'
     });
 
@@ -1144,7 +1202,7 @@ async function sendIdentifyBeat(): Promise<void> {
   const target = identifyDrive.value;
   if (target === null) return;
   try {
-    const response = await fetch(`${apiBaseUrl}/$/volumes/${target.volumeId}/identify`, { method: 'POST' });
+    const response = await apiFetch(`${apiBaseUrl}/$/volumes/${target.volumeId}/identify`, { method: 'POST' });
     if (!response.ok) {
       let message = `Failed to identify drive (HTTP ${response.status})`;
       try { const text = await response.text(); if (text) message += `: ${text}`; } catch { /* ignore */ }
@@ -1162,7 +1220,7 @@ function stopIdentify(): void {
   identifyDrive.value = null;
   // Best-effort immediate stop; even if it doesn't land, the server's TTL stops the reads within ~3s.
   if (target !== null)
-    void fetch(`${apiBaseUrl}/$/volumes/${target.volumeId}/identify`, { method: 'DELETE' }).catch(() => undefined);
+    void apiFetch(`${apiBaseUrl}/$/volumes/${target.volumeId}/identify`, { method: 'DELETE' }).catch(() => undefined);
 }
 
 // Set the shared sort field (used by the clickable table headers)
@@ -1193,7 +1251,7 @@ async function deleteVolume(): Promise<void> {
   }
 
   try {
-    const response = await fetch(`${apiBaseUrl}/$/volumes/${volumeId}`, {
+    const response = await apiFetch(`${apiBaseUrl}/$/volumes/${volumeId}`, {
       method: 'DELETE'
     });
 
@@ -1214,31 +1272,66 @@ async function deleteVolume(): Promise<void> {
   }
 }
 
-onMounted(() => {
+// Load data and start the live-refresh timers. Called once authenticated (on mount if the session is
+// already valid, or right after a successful login).
+function startApp(): void {
   fetchData();
   fetchVerifyStatus();
   fetchStorageStats();
   fetchFreezeStatus();
   fetchRebalanceStatus();
-  // Keep the verify panel + freeze state live without a manual refresh
-  verifyPollTimer = setInterval(() => { fetchVerifyStatus(); fetchFreezeStatus(); fetchRebalanceStatus(); }, 3000);
-  storageStatsPollTimer = setInterval(fetchStorageStats, 10000);
-  // Close context menu on click anywhere
+  if (verifyPollTimer === null)
+    verifyPollTimer = setInterval(() => { fetchVerifyStatus(); fetchFreezeStatus(); fetchRebalanceStatus(); }, 3000);
+  if (storageStatsPollTimer === null)
+    storageStatsPollTimer = setInterval(fetchStorageStats, 10000);
+}
+
+function stopApp(): void {
+  if (verifyPollTimer !== null) { clearInterval(verifyPollTimer); verifyPollTimer = null; }
+  if (storageStatsPollTimer !== null) { clearInterval(storageStatsPollTimer); storageStatsPollTimer = null; }
+}
+
+onMounted(async () => {
   document.addEventListener('click', hideContextMenu);
+  await checkAuth();
+  if (authenticated.value)
+    startApp();
 });
 
 onUnmounted(() => {
-  if (verifyPollTimer !== null) clearInterval(verifyPollTimer);
-  if (storageStatsPollTimer !== null) clearInterval(storageStatsPollTimer);
+  stopApp();
   if (identifyDrive.value !== null) stopIdentify(); // stop flashing if the view is torn down mid-identify
   document.removeEventListener('click', hideContextMenu);
 });
 </script>
 
 <template>
-  <div class="container">
+  <!-- Login gate: nothing renders until we know the auth state, then either the login card or the app. -->
+  <div v-if="!authChecked" class="auth-loading">Loading…</div>
+
+  <div v-else-if="!authenticated" class="login-screen">
+    <form class="login-card" @submit.prevent="login">
+      <h1>STRUBS</h1>
+      <p class="login-sub">Administrator sign in</p>
+      <input
+        v-model="loginPassword"
+        type="password"
+        placeholder="Admin password"
+        autocomplete="current-password"
+        autofocus
+        :disabled="loginPending"
+      />
+      <button type="submit" :disabled="loginPending || !loginPassword">
+        {{ loginPending ? 'Signing in…' : 'Sign in' }}
+      </button>
+      <p v-if="loginError" class="login-error">{{ loginError }}</p>
+    </form>
+  </div>
+
+  <div v-else class="container">
     <header>
       <h1>STRUBS</h1>
+      <button @click="logout" class="logout-btn" title="Sign out">Sign out</button>
     </header>
 
     <div class="controls">
@@ -1932,6 +2025,43 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.auth-loading {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 60vh; color: #888; font-size: 15px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.login-screen {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 80vh; padding: 20px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+.login-card {
+  display: flex; flex-direction: column; gap: 14px;
+  width: 320px; max-width: 100%; padding: 32px;
+  border: 1px solid #e0e0e0; border-radius: 10px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.06); background: #fff;
+}
+.login-card h1 { margin: 0; font-size: 22px; text-align: center; }
+.login-sub { margin: -6px 0 6px; text-align: center; color: #888; font-size: 13px; }
+.login-card input {
+  padding: 10px 12px; font-size: 15px;
+  border: 1px solid #ccc; border-radius: 6px;
+}
+.login-card button {
+  padding: 10px; font-size: 15px; font-weight: 600; color: #fff;
+  background: #1565c0; border: none; border-radius: 6px; cursor: pointer;
+}
+.login-card button:disabled { opacity: 0.6; cursor: default; }
+.login-error { margin: 0; color: #c62828; font-size: 13px; text-align: center; }
+
+.logout-btn {
+  padding: 6px 12px; font-size: 13px; font-weight: 600;
+  color: #555; background: #f2f2f2; border: 1px solid #ddd;
+  border-radius: 6px; cursor: pointer;
+}
+.logout-btn:hover { background: #e8e8e8; }
+
 .container {
   width: 100%;
   margin: 0 auto;

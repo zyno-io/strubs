@@ -168,14 +168,41 @@ describe('HttpServer', () => {
         expect(typeof resData.body).toBe('string');
     });
 
-    it('ORIGIN SPLIT: an object-role listener 404s any /$/ path (never routes to mgmt)', async () => {
+    it('WRONG SCHEME: an admin path on the object listener is 421, never routes to mgmt', async () => {
         const server = await importServer('object');
         const { req, res, resData } = createReqRes('GET', '/$/volumes');
+        req.headers.host = 'objectstorage';
 
         await server._handleHttpRequest(req, res);
 
         expect(mgmtHandle).not.toHaveBeenCalled();   // the management handler is unreachable here
-        expect(resData.status).toBe(404);
+        expect(resData.status).toBe(421);            // "use HTTPS", not a bare 404
+    });
+
+    it('WRONG SCHEME: a real browser navigation (Sec-Fetch-Mode: navigate) is 308-redirected to HTTPS', async () => {
+        const server = await importServer('object');
+        const { req, res, resData } = createReqRes('GET', '/$/ui');
+        req.headers.host = 'objectstorage';
+        req.headers['sec-fetch-mode'] = 'navigate';
+
+        await server._handleHttpRequest(req, res);
+
+        expect(resData.status).toBe(308);
+        expect(resData.headers['Location']).toBe('https://objectstorage/$/ui');
+    });
+
+    it('WRONG SCHEME: a script fetch (no navigate) is NOT redirected -- it gets 421', async () => {
+        // A 308 of a script fetch would re-send the admin cookie cross-scheme (cookies are not
+        // port-scoped, :80/:443 are same-site) and reopen the XSS->wipe path. Scripts cannot forge
+        // Sec-Fetch-Mode: navigate, so they must never be redirected.
+        const server = await importServer('object');
+        const { req, res, resData } = createReqRes('POST', '/$/volumes');
+        req.headers.host = 'objectstorage';
+        req.headers['sec-fetch-mode'] = 'cors';
+
+        await server._handleHttpRequest(req, res);
+
+        expect(resData.status).toBe(421);
     });
 
     it('ORIGIN SPLIT: an admin-role listener 404s object paths (never serves object content)', async () => {

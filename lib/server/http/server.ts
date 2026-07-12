@@ -16,6 +16,7 @@ import { ObjectOptionsRequest } from './object-options-request';
 import { HttpHelpers } from './helpers';
 import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError } from './errors';
 import { adminAuth, parseCookies, SESSION_COOKIE } from './admin-auth';
+import { config } from '../../config';
 
 const log = createLogger('http-server');
 
@@ -210,11 +211,11 @@ export class HttpServer {
     private _resolveRoute(method: string, path: string): RouteHandler | null {
         const isAdminPath = path.startsWith('/$/');
 
-        // Enforce the origin boundary. A path meant for the other surface is Not Found here -- the
-        // separation is what stops object-hosted script from reaching the admin API, so it must be a
-        // hard 404, never served and never redirected.
+        // Enforce the origin boundary. An admin path on the object listener means "wrong scheme/port":
+        // signal that clearly (see _wrongSchemeRoute) rather than a bare 404. An object path on the
+        // admin listener is a hard 404 -- object CONTENT must never be served from the admin origin.
         if (this.role === 'object' && isAdminPath)
-            return this._notFoundRoute;
+            return this._wrongSchemeRoute;
         if (this.role === 'admin' && !isAdminPath)
             return this._notFoundRoute;
 
@@ -225,6 +226,24 @@ export class HttpServer {
     }
 
     private _notFoundRoute: RouteHandler = async (_id, req, res) => this._outputHttpNotFound(req, res);
+
+    // The admin API was reached over plain HTTP (the object origin). Point the caller at HTTPS.
+    // A genuine top-level browser navigation is redirected so typing the bare host lands on the login;
+    // everything else -- crucially any script fetch, which cannot forge Sec-Fetch-Mode: navigate --
+    // gets a 421 instead. A redirect here would be dangerous: cookies are not port-scoped and :80/:443
+    // are same-site, so 308-ing a POST would re-send the admin cookie to :443 and reopen the XSS->wipe
+    // path the origin split exists to close.
+    private _wrongSchemeRoute: RouteHandler = async (_id, req, res) => {
+        const host = (req.headers.host ?? '').replace(/:\d+$/, '');
+        const target = `https://${host}${config.adminPort === 443 ? '' : ':' + config.adminPort}${req.url}`;
+        if (req.method === 'GET' && req.headers['sec-fetch-mode'] === 'navigate' && host) {
+            res.writeHead(308, 'Permanent Redirect', { Location: target });
+            res.end();
+            return;
+        }
+        res.writeHead(421, 'Misdirected Request', { 'Content-Type': 'text/plain' });
+        res.end(`the management API is HTTPS-only; use ${host ? target : `https://<host>:${config.adminPort}${req.url}`}\n`);
+    };
 
     // Reachable without a credential on the admin origin: the static UI (which is the login page) and
     // the session endpoints themselves. Everything else under /$/ requires auth.
