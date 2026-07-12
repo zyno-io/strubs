@@ -1,3 +1,4 @@
+import fs from 'fs';
 import http from 'http';
 import https from 'https';
 import querystring from 'querystring';
@@ -13,13 +14,17 @@ import { ObjectPutRequest } from './object-put-request';
 import { ObjectDeleteRequest } from './object-delete-request';
 import { ObjectOptionsRequest } from './object-options-request';
 import { HttpHelpers } from './helpers';
-import { HttpBadRequestError, HttpNotFoundError } from './errors';
+import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError } from './errors';
+import { adminAuth, parseCookies, SESSION_COOKIE } from './admin-auth';
 
 const log = createLogger('http-server');
 
 type HttpRequest = http.IncomingMessage & {
     url: string;
     params: querystring.ParsedUrlQuery;
+    // Set by the server (never from a client header) when the request arrived on the trusted admin
+    // Unix socket. Handlers use it for the lockout-recovery path (reset the password with no current one).
+    trusted?: boolean;
 };
 
 type HttpResponse = http.ServerResponse;
@@ -55,20 +60,26 @@ export type HttpServerRole = 'object' | 'admin' | 'all';
 export interface HttpServerOptions {
     role?: HttpServerRole;
     tls?: { key: Buffer; cert: Buffer };
+    // A trusted admin listener (the root-only Unix socket) serves the management API with NO credential
+    // check -- the boundary is filesystem permissions, not the network. Never set this on a TCP listener.
+    trusted?: boolean;
 }
 
 export class HttpServer {
-    public port: number;
+    // A number is a TCP port; a string is a Unix socket path (the trusted admin socket).
+    public port: number | string;
     public readonly role: HttpServerRole;
+    private readonly _trusted: boolean;
     private _requestCount = 0;
     private readonly _server: http.Server;
     private readonly _routes: Record<string, RouteHandler>;
     private readonly _managementRoute: RouteHandler;
     private readonly deps: HttpServerDependencies;
 
-    constructor(port = 80, server?: http.Server, deps?: Partial<HttpServerDependencies>, options?: HttpServerOptions) {
+    constructor(port: number | string = 80, server?: http.Server, deps?: Partial<HttpServerDependencies>, options?: HttpServerOptions) {
         this.port = port;
         this.role = options?.role ?? 'all';
+        this._trusted = options?.trusted ?? false;
         this.deps = { ...defaultDeps, ...deps };
 
         this._server = server ?? (options?.tls
@@ -89,6 +100,18 @@ export class HttpServer {
     }
 
     start(): void {
+        if (typeof this.port === 'string') {
+            // Unix socket: remove a stale socket file from an unclean shutdown, then bind and lock it
+            // down to root-only. chmod after listen -- the file does not exist until then.
+            try { fs.unlinkSync(this.port); }
+            catch { /* not there, fine */ }
+            const socketPath = this.port;
+            this._server.listen(socketPath, () => {
+                try { fs.chmodSync(socketPath, 0o600); }
+                catch (err) { log.error('failed to chmod admin socket %s: %s', socketPath, err); }
+            });
+            return;
+        }
         this._server.listen(this.port);
     }
 
@@ -121,12 +144,25 @@ export class HttpServer {
         if (!request)
             return;
 
+        // Mark trust from the listener, not from any client-supplied header (which we ignore entirely).
+        request.trusted = this._trusted;
+
         const method = req.method!.toUpperCase();
         this._logRequestStart(requestId, request, method);
 
         const handler = this._resolveRoute(method, request.url);
         if (!handler)
             return this._outputHttpBadRequest('unsupported method', req, res);
+
+        // Admin authentication. Only management (`/$/`) paths on the admin TCP listener are gated: a
+        // non-admin path here is already Not Found (handled above), and must not get an auth challenge.
+        // The trusted Unix socket is gated by filesystem permissions; login and the static UI are exempt
+        // because they are HOW you authenticate.
+        if (this.role === 'admin' && !this._trusted && request.url.startsWith('/$/')
+            && !this._isAuthExempt(method, request.url)) {
+            if (!await this._authorizeAdmin(request))
+                return this._outputHttpUnauthorized(res);
+        }
 
         try {
             await handler(requestId, request, res);
@@ -190,6 +226,35 @@ export class HttpServer {
 
     private _notFoundRoute: RouteHandler = async (_id, req, res) => this._outputHttpNotFound(req, res);
 
+    // Reachable without a credential on the admin origin: the static UI (which is the login page) and
+    // the session endpoints themselves. Everything else under /$/ requires auth.
+    private _isAuthExempt(method: string, path: string): boolean {
+        if (path === '/$/ui' || path.startsWith('/$/ui/'))
+            return true; // login page + its assets
+        if (path === '/$/session')
+            return true; // POST login / DELETE logout
+        if (path === '/$/auth/status')
+            return true; // lets the SPA decide login-vs-dashboard
+        return false;
+    }
+
+    private async _authorizeAdmin(req: HttpRequest): Promise<boolean> {
+        const auth = req.headers.authorization;
+        if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
+            if (await adminAuth.verifyBearer(auth.slice(7).trim()))
+                return true;
+        }
+        const cookies = parseCookies(req.headers.cookie);
+        return adminAuth.verifySession(cookies[SESSION_COOKIE]);
+    }
+
+    private _outputHttpUnauthorized(res: HttpResponse): void {
+        // No WWW-Authenticate: Basic -- that would pop the browser's native auth dialog on the admin UI,
+        // which uses a login page instead. A bare 401 lets the SPA render its login form.
+        res.writeHead(401, 'Unauthorized');
+        res.end('401');
+    }
+
     private async _handleHttpManagementRequest(requestId: number, req: HttpRequest, res: HttpResponse): Promise<void> {
         try {
             const response = await HttpMgmt.handle(requestId, req, res);
@@ -197,6 +262,8 @@ export class HttpServer {
         } catch (err) {
             if (err instanceof HttpBadRequestError) {
                 this._outputHttpBadRequest(err.message, req, res);
+            } else if (err instanceof HttpUnauthorizedError) {
+                this._outputHttpUnauthorized(res);
             } else if (err instanceof HttpNotFoundError) {
                 this._outputHttpNotFound(req, res);
             } else {

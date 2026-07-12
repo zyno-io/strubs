@@ -9,6 +9,7 @@ import { VolumeRepository, type VolumeVerifyErrors } from './database/volume-rep
 import { RuntimeConfigRepository } from './database/runtime-config';
 import { FaultRepository, type FaultDocument, type FaultUpsert } from './database/fault-repository';
 import { StorageStatsRepository } from './database/storage-stats-repository';
+import { AdminTokenRepository, type AdminTokenDocument } from './database/admin-token-repository';
 import type { ContainerPath, ContentDocument, ObjectIdentifier, ObjectVerificationStateUpdate, SliceErrorInfo } from './database/types';
 import type { StorageStatsDelta, StorageStatsSnapshot } from './storage/stats';
 export type { ContentDocument, ObjectVerificationStateUpdate, SliceErrorInfo, SliceErrorCategory, SliceVerificationTimes } from './database/types';
@@ -26,12 +27,14 @@ export class Database {
         runtimeConfig: Collection<{ key: string; value: unknown }> | null;
         faults: Collection<FaultDocument> | null;
         storageStats: Collection<any> | null;
+        adminTokens: Collection<AdminTokenDocument> | null;
     } = {
         volumes: null,
         content: null,
         runtimeConfig: null,
         faults: null,
-        storageStats: null
+        storageStats: null,
+        adminTokens: null
     };
     private readonly _containerCache = new ContainerCache();
     private _repositories: {
@@ -40,12 +43,14 @@ export class Database {
         runtimeConfig: RuntimeConfigRepository | null;
         faults: FaultRepository | null;
         storageStats: StorageStatsRepository | null;
+        adminTokens: AdminTokenRepository | null;
     } = {
         volumes: null,
         content: null,
         runtimeConfig: null,
         faults: null,
-        storageStats: null
+        storageStats: null,
+        adminTokens: null
     };
 
     constructor() {
@@ -65,6 +70,7 @@ export class Database {
             this._collections.runtimeConfig = this._db.collection('runtimeConfig');
             this._collections.faults = this._db.collection('faults');
             this._collections.storageStats = this._db.collection('storageStats');
+            this._collections.adminTokens = this._db.collection('adminTokens');
             this._repositories = {
                 volumes: new VolumeRepository(this._collections.volumes),
                 content: new ContentRepository(
@@ -75,10 +81,12 @@ export class Database {
                 ),
                 runtimeConfig: new RuntimeConfigRepository(this._collections.runtimeConfig),
                 faults: new FaultRepository(this._collections.faults),
-                storageStats: new StorageStatsRepository(this._collections.storageStats)
+                storageStats: new StorageStatsRepository(this._collections.storageStats),
+                adminTokens: new AdminTokenRepository(this._collections.adminTokens)
             };
             await this.ensureContentIndexes();
             await this.ensureFaultIndexes();
+            await this.adminTokenRepository.ensureIndexes();
 
             log('connected');
         }
@@ -129,6 +137,30 @@ export class Database {
 
     async deleteRuntimeConfig(key: string): Promise<void> {
         await this.runtimeConfigRepository.delete(key);
+    }
+
+    async createAdminToken(doc: { selector: string; secretHash: string; name: string }): Promise<void> {
+        await this.adminTokenRepository.create(doc);
+    }
+
+    async getAdminTokenBySelector(selector: string): Promise<AdminTokenDocument | null> {
+        return this.adminTokenRepository.getBySelector(selector);
+    }
+
+    async touchAdminToken(selector: string): Promise<void> {
+        await this.adminTokenRepository.touch(selector);
+    }
+
+    async listAdminTokens(): Promise<AdminTokenDocument[]> {
+        return this.adminTokenRepository.list();
+    }
+
+    async setAdminTokenDisabled(selector: string, disabled: boolean): Promise<boolean> {
+        return this.adminTokenRepository.setDisabled(selector, disabled);
+    }
+
+    async removeAdminToken(selector: string): Promise<boolean> {
+        return this.adminTokenRepository.remove(selector);
     }
 
     async getObjectById(id: ObjectIdentifier): Promise<ContentDocument> {
@@ -357,6 +389,19 @@ export class Database {
         if (!this._collections.storageStats)
             throw new Error('database not initialized');
         return this._collections.storageStats;
+    }
+
+    private get adminTokenCollection(): Collection<AdminTokenDocument> {
+        if (!this._collections.adminTokens)
+            throw new Error('database not initialized');
+        return this._collections.adminTokens;
+    }
+
+    private get adminTokenRepository(): AdminTokenRepository {
+        if (!this._repositories.adminTokens) {
+            this._repositories.adminTokens = new AdminTokenRepository(this.adminTokenCollection);
+        }
+        return this._repositories.adminTokens;
     }
 
     private get volumeRepository(): VolumeRepository {

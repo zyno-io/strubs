@@ -100,6 +100,11 @@ vi.mock('../lib/server/manager', () => ({
     },
 }));
 
+const adminBootstrapMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('../lib/server/http/admin-auth', () => ({
+    adminAuth: { bootstrap: adminBootstrapMock },
+}));
+
 const createLoggerMock = vi.fn(() => {
     const logger = vi.fn();
     logger.error = vi.fn();

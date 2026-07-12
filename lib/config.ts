@@ -69,6 +69,8 @@ export class Config {
     tlsCertPath: string | null;
     tlsKeyPath: string | null;
     tlsExtraHosts: string[];
+    // Root-only Unix socket serving the admin API without a credential (local ops / lockout recovery).
+    adminSocketPath: string;
 
     // Notifications. Slack is optional; when no webhook is set only the log
     // transport is active. Severity/cooldown tune routing and de-duplication.
@@ -174,6 +176,7 @@ export class Config {
         this.tlsKeyPath = process.env.STRUBS_TLS_KEY || null;
         this.tlsExtraHosts = (process.env.STRUBS_TLS_HOSTS || '')
             .split(',').map(h => h.trim()).filter(Boolean);
+        this.adminSocketPath = process.env.STRUBS_ADMIN_SOCKET || '/run/strubs/admin.sock';
         this.drainConcurrency = parsePositiveInt(process.env.STRUBS_DRAIN_CONCURRENCY, DEFAULT_DRAIN_CONCURRENCY);
         this.deviceReconcileIntervalMs = parseNonNegativeInt(
             process.env.STRUBS_DEVICE_RECONCILE_INTERVAL_MS,

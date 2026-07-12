@@ -188,15 +188,38 @@ describe('HttpServer', () => {
         expect(resData.status).toBe(404);
     });
 
-    it('ORIGIN SPLIT: an admin-role listener still serves /$/ routes', async () => {
+    it('AUTH GATE: an admin /$/ route without a session is 401 (never reaches mgmt)', async () => {
         const server = await importServer('admin');
         const { req, res, resData } = createReqRes('GET', '/$/volumes');
+
+        await server._handleHttpRequest(req, res);
+
+        expect(mgmtHandle).not.toHaveBeenCalled();
+        expect(resData.status).toBe(401);
+    });
+
+    it('AUTH GATE: a valid session cookie reaches the mgmt handler', async () => {
+        const { adminAuth, SESSION_COOKIE } = await import('../lib/server/http/admin-auth');
+        const token = adminAuth.createSession();
+        const server = await importServer('admin');
+        const { req, res, resData } = createReqRes('GET', '/$/volumes');
+        req.headers.cookie = `${SESSION_COOKIE}=${token}`;
         mgmtHandle.mockResolvedValueOnce({ healthy: true });
 
         await server._handleHttpRequest(req, res);
 
         expect(mgmtHandle).toHaveBeenCalledTimes(1);
         expect(resData.status).toBe(200);
+    });
+
+    it('AUTH GATE: the login endpoint and static UI are reachable unauthenticated', async () => {
+        const server = await importServer('admin');
+        for (const path of ['/$/session', '/$/ui', '/$/ui/index.html', '/$/auth/status']) {
+            mgmtHandle.mockResolvedValueOnce({ ok: true });
+            const { req, res, resData } = createReqRes(path === '/$/session' ? 'POST' : 'GET', path);
+            await server._handleHttpRequest(req, res);
+            expect(resData.status, path).not.toBe(401);
+        }
     });
 
     it('dispatches GET to ObjectGetRequest when object exists', async () => {

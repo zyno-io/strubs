@@ -41,7 +41,8 @@ describe('database helpers', () => {
             deleteOne: vi.fn(),
             updateOne: vi.fn(),
             updateMany: vi.fn(),
-            createIndexes: vi.fn().mockResolvedValue([])
+            createIndexes: vi.fn().mockResolvedValue([]),
+            createIndex: vi.fn().mockResolvedValue("idx"),
         };
         const storageStats = {
             findOne: vi.fn(),
@@ -160,6 +161,7 @@ describe('database helpers', () => {
         const content = {
             content: true,
             createIndexes: vi.fn().mockResolvedValue([]),
+            createIndex: vi.fn().mockResolvedValue("idx"),
             indexes: vi.fn().mockResolvedValue([]),
             dropIndex: vi.fn().mockResolvedValue({})
         };
@@ -184,6 +186,7 @@ describe('database helpers', () => {
         const volumes = { volume: true };
         const content = {
             createIndexes: vi.fn().mockResolvedValue([]),
+            createIndex: vi.fn().mockResolvedValue("idx"),
             indexes: vi.fn().mockResolvedValue([
                 { name: '_id_' },
                 { name: 'dataVolume0Verification' },

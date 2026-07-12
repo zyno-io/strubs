@@ -17,6 +17,10 @@ type ServerManagerDeps = {
     // config.adminPort, so object-hosted script can never reach the admin cookie.
     createObjectServer: () => ServerLifecycle;
     createAdminServer: () => Promise<ServerLifecycle>;
+    // A root-only Unix socket serving the admin API with NO credential check -- local ops and lockout
+    // recovery. The boundary is filesystem permissions (0600 root), which a reverse proxy or SSRF
+    // cannot inherit the way a localhost TCP port could.
+    createAdminSocketServer: () => ServerLifecycle;
     // Returns null when FUSE is disabled. The import is dynamic so that a disabled FUSE never loads the
     // native fuse-native binding (fuse-native/index.js pulls it in at require-time) -- STRUBS then runs
     // on a host with no /dev/fuse or no binding built. Object access is unaffected.
@@ -29,6 +33,7 @@ const defaultDeps: ServerManagerDeps = {
         const tls = await ensureTlsMaterial();
         return new HttpServer(config.adminPort, undefined, undefined, { role: 'admin', tls });
     },
+    createAdminSocketServer: () => new HttpServer(config.adminSocketPath, undefined, undefined, { role: 'admin', trusted: true }),
     createFuseServer: () => {
         if (!config.fuseEnabled)
             return null;
@@ -67,12 +72,11 @@ export class ServerManager {
         log('starting server manager');
         const objectServer = this.deps.createObjectServer();
         const adminServer = await this.deps.createAdminServer();
+        const adminSocketServer = this.deps.createAdminSocketServer();
         const fuseServer = await this.deps.createFuseServer();
         if (!fuseServer)
             log('FUSE disabled: the HTTP object API is the only local access path (set STRUBS_FUSE_ENABLED=true to mount)');
-        this.servers = fuseServer
-            ? [objectServer, adminServer, fuseServer]
-            : [objectServer, adminServer];
+        this.servers = [objectServer, adminServer, adminSocketServer, ...(fuseServer ? [fuseServer] : [])];
         for (const server of this.servers)
             await Promise.resolve(server.start());
     }

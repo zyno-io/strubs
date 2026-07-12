@@ -16,6 +16,8 @@ const fuseStartMock = vi.fn();
 const fuseStopMock = vi.fn();
 const adminStartMock = vi.fn();
 const adminStopMock = vi.fn();
+const socketStartMock = vi.fn();
+const socketStopMock = vi.fn();
 
 const HttpServerMock = vi.fn(function () {
     return {
@@ -48,6 +50,8 @@ describe('serverManager', () => {
         fuseStopMock.mockClear();
         adminStartMock.mockClear();
         adminStopMock.mockClear();
+        socketStartMock.mockClear();
+        socketStopMock.mockClear();
         HttpServerMock.mockClear();
         FuseServerMock.mockClear();
     });
@@ -57,6 +61,7 @@ describe('serverManager', () => {
         const manager = new ServerManager({
             createObjectServer: () => ({ start: httpStartMock, stop: httpStopMock }),
             createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
+            createAdminSocketServer: () => ({ start: socketStartMock, stop: socketStopMock }),
             createFuseServer: () => ({ start: fuseStartMock, stop: fuseStopMock })
         });
 
@@ -71,6 +76,7 @@ describe('serverManager', () => {
         const manager = new ServerManager({
             createObjectServer: () => ({ start: httpStartMock, stop: httpStopMock }),
             createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
+            createAdminSocketServer: () => ({ start: socketStartMock, stop: socketStopMock }),
             createFuseServer: async () => ({ start: fuseStartMock, stop: fuseStopMock })
         });
 
@@ -84,6 +90,7 @@ describe('serverManager', () => {
         const manager = new ServerManager({
             createObjectServer: () => ({ start: httpStartMock, stop: httpStopMock }),
             createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
+            createAdminSocketServer: () => ({ start: socketStartMock, stop: socketStopMock }),
             createFuseServer: () => null   // STRUBS_FUSE_ENABLED=false
         });
 
@@ -102,6 +109,7 @@ describe('serverManager', () => {
         const manager = new ServerManager({
             createObjectServer: () => ({ start: httpStartMock, stop: httpStopMock }),
             createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
+            createAdminSocketServer: () => ({ start: socketStartMock, stop: socketStopMock }),
             createFuseServer: () => ({ start: fuseStartMock, stop: fuseStopMock })
         });
 
@@ -118,6 +126,7 @@ describe('serverManager', () => {
         const manager = new ServerManager({
             createObjectServer,
             createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
+            createAdminSocketServer: () => ({ start: socketStartMock, stop: socketStopMock }),
             createFuseServer: () => ({ start: fuseStartMock, stop: fuseStopMock })
         });
 

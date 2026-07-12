@@ -1,7 +1,8 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { HttpHelpers } from './helpers';
-import { HttpBadRequestError, HttpNotFoundError } from './errors';
+import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError } from './errors';
+import { adminAuth, parseCookies, sessionSetCookie, sessionClearCookie, SESSION_COOKIE } from './admin-auth';
 import { ioManager } from '../../io/manager';
 import { deviceProvisioner } from '../../io/device-provisioner';
 import type { CachedDevice } from '../../io/device-discovery';
@@ -100,7 +101,7 @@ type RouteParams = Record<string, unknown>;
 type FileInfoRouteParams = RouteParams & { normalizedPath: string };
 type VerifyFileRouteParams = RouteParams & { objectId: string };
 type UiRouteParams = RouteParams & { assetPath?: string };
-type RouteHandler = (req: HttpRequest, params: RouteParams) => Promise<unknown>;
+type RouteHandler = (req: HttpRequest, params: RouteParams, res: HttpResponse) => Promise<unknown>;
 type RouteDefinition = {
     method: string;
     match: (url: string) => RouteParams | null;
@@ -127,7 +128,7 @@ type DebugResponse = {
 export class HttpMgmt {
     private static readonly routes: RouteDefinition[] = HttpMgmt.createRoutes();
 
-    static async handle(_requestId: number, req: HttpRequest, _res: HttpResponse): Promise<unknown> {
+    static async handle(_requestId: number, req: HttpRequest, res: HttpResponse): Promise<unknown> {
         const method = req.method?.toUpperCase();
         const url = req.url;
         if (!method || !url)
@@ -137,7 +138,9 @@ export class HttpMgmt {
         if (!route)
             throw new HttpNotFoundError();
 
-        return route.handler.call(this, req, route.params);
+        // res is passed through so the few handlers that manage cookies (login/logout) can reach it;
+        // the vast majority ignore it.
+        return route.handler.call(this, req, route.params, res);
     }
 
     private static async handleVolumesRequest(req: HttpRequest): Promise<VolumeStatus[]> {
@@ -319,6 +322,76 @@ export class HttpMgmt {
 
     private static async handleFaultsRequest(): Promise<{ faults: SliceFault[] }> {
         return { faults: remediationService.listFaults() };
+    }
+
+    // --- admin authentication ---
+
+    // Auth-exempt (the gate lets these through): tells the SPA whether to show login or the dashboard,
+    // and whether a bootstrap password is still in effect.
+    private static async handleAuthStatusRequest(req: HttpRequest): Promise<{ authenticated: boolean; passwordSet: boolean }> {
+        const cookies = parseCookies(req.headers.cookie);
+        const authed = adminAuth.verifySession(cookies[SESSION_COOKIE])
+            || await this.bearerAuthorized(req);
+        return { authenticated: authed, passwordSet: await adminAuth.isPasswordSet() };
+    }
+
+    // Auth-exempt. Verifies the password and mints a session cookie. A failed attempt is a 401.
+    private static async handleSessionCreateRequest(req: HttpRequest, _params: unknown, res: HttpResponse): Promise<{ ok: true }> {
+        const payload = await this.parseJsonBody<{ password?: unknown }>(req);
+        if (typeof payload.password !== 'string' || !payload.password)
+            throw new HttpBadRequestError('password is required');
+        if (!await adminAuth.verifyPassword(payload.password))
+            throw new HttpUnauthorizedError('invalid password');
+        res.setHeader('Set-Cookie', sessionSetCookie(adminAuth.createSession()));
+        return { ok: true };
+    }
+
+    // Auth-exempt. Logout: drop this session and clear the cookie.
+    private static async handleSessionDeleteRequest(req: HttpRequest, _params: unknown, res: HttpResponse): Promise<{ ok: true }> {
+        const cookies = parseCookies(req.headers.cookie);
+        adminAuth.destroySession(cookies[SESSION_COOKIE]);
+        res.setHeader('Set-Cookie', sessionClearCookie());
+        return { ok: true };
+    }
+
+    // Requires auth (not exempt). Changing the password invalidates every existing session, so other
+    // logged-in browsers must re-authenticate.
+    private static async handleAdminPasswordRequest(req: HttpRequest): Promise<{ ok: true }> {
+        const payload = await this.parseJsonBody<{ currentPassword?: unknown; newPassword?: unknown }>(req);
+        if (typeof payload.newPassword !== 'string' || payload.newPassword.length < 8)
+            throw new HttpBadRequestError('newPassword must be at least 8 characters');
+        // The trusted Unix socket is the lockout-recovery path: reset the password with NO current one
+        // (you use the socket precisely because you have lost the password). Over the network, the
+        // current password is required -- a live session must not silently rotate the credential.
+        if (!req.trusted) {
+            if (typeof payload.currentPassword !== 'string' || !await adminAuth.verifyPassword(payload.currentPassword))
+                throw new HttpUnauthorizedError('current password is incorrect');
+        }
+        await adminAuth.setPassword(payload.newPassword);
+        adminAuth.destroyAllSessions();
+        return { ok: true };
+    }
+
+    private static async handleAdminTokensListRequest(): Promise<{ tokens: unknown[] }> {
+        return { tokens: await database.listAdminTokens() };
+    }
+
+    // The token is returned ONCE, here, and never again (only its hash is stored).
+    private static async handleAdminTokenCreateRequest(req: HttpRequest): Promise<{ token: string; selector: string }> {
+        const payload = await this.parseJsonBody<{ name?: unknown }>(req);
+        const name = typeof payload.name === 'string' && payload.name.trim() ? payload.name.trim() : 'unnamed';
+        return adminAuth.createToken(name);
+    }
+
+    private static async handleAdminTokenDeleteRequest(_req: HttpRequest, params: { selector: string }): Promise<{ removed: boolean }> {
+        return { removed: await database.removeAdminToken(params.selector) };
+    }
+
+    private static async bearerAuthorized(req: HttpRequest): Promise<boolean> {
+        const auth = req.headers.authorization;
+        return typeof auth === 'string' && auth.startsWith('Bearer ')
+            ? adminAuth.verifyBearer(auth.slice(7).trim())
+            : false;
     }
 
     private static normalizeSeverity(raw: unknown, fallback: Severity = 'info'): Severity {
@@ -922,6 +995,41 @@ export class HttpMgmt {
             },
             {
                 method: 'GET',
+                match: url => url === '/$/auth/status' ? {} : null,
+                handler: async req => this.handleAuthStatusRequest(req)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/session' ? {} : null,
+                handler: async (req, _p, res) => this.handleSessionCreateRequest(req, _p, res)
+            },
+            {
+                method: 'DELETE',
+                match: url => url === '/$/session' ? {} : null,
+                handler: async (req, _p, res) => this.handleSessionDeleteRequest(req, _p, res)
+            },
+            {
+                method: 'PUT',
+                match: url => url === '/$/admin/password' ? {} : null,
+                handler: async req => this.handleAdminPasswordRequest(req)
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/admin/tokens' ? {} : null,
+                handler: async () => this.handleAdminTokensListRequest()
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/admin/tokens' ? {} : null,
+                handler: async req => this.handleAdminTokenCreateRequest(req)
+            },
+            {
+                method: 'DELETE',
+                match: url => this.matchAdminTokenRoute(url),
+                handler: async (req, params) => this.handleAdminTokenDeleteRequest(req, params as { selector: string })
+            },
+            {
+                method: 'GET',
                 match: url => url === '/$/faults' ? {} : null,
                 handler: async () => this.handleFaultsRequest()
             },
@@ -1069,6 +1177,11 @@ export class HttpMgmt {
             return null;
         const assetPath = remainder.slice(1);
         return { assetPath };
+    }
+
+    private static matchAdminTokenRoute(url: string): { selector: string } | null {
+        const match = /^\/\$\/admin\/tokens\/([^/]+)$/.exec(url);
+        return match ? { selector: decodeURIComponent(match[1]) } : null;
     }
 
     private static matchFileInfoRoute(url: string): FileInfoRouteParams | null {

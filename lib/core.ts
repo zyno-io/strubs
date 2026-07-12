@@ -4,6 +4,7 @@ import { config } from './config';
 import { database } from './database';
 import { ioManager } from './io/manager';
 import { serverManager } from './server/manager';
+import { adminAuth } from './server/http/admin-auth';
 import { verifyVolumesJob } from './jobs/verify-volumes-job';
 import { drainVolumeJob } from './jobs/drain-volume-job';
 import { rebalanceJob } from './jobs/rebalance-job';
@@ -74,6 +75,9 @@ export class Core {
             // Resume any pending verify run before exposing HTTP, so an inbound
             // verify/scrub request can't race the resume for job state.
             await verifyVolumesJob.resumePendingJob();
+            // Ensure an admin password exists before the admin API is reachable -- generates and logs a
+            // random one on first start (never a default, never an unauthenticated setter).
+            await adminAuth.bootstrap();
             await serverManager.start();
             // Maintenance freeze gates ALL automatic verify+repair at startup: with
             // the flag set we never start the scheduler or repair worker, so the
