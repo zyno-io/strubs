@@ -89,7 +89,7 @@ Digest's only real advantage is avoiding a cleartext password on plaintext HTTP.
 
 | | |
 |---|---|
-| **Password** | Single, no username. Stored **argon2id** in a small `auth` collection. Never logged, never returned by any endpoint. |
+| **Password** | Single, no username. Hashed with **scrypt** (built into Node — no native dependency; argon2id's marginal edge is not worth the build cost in a codebase that fights native modules) in `runtimeConfig`. Never logged, never returned by any endpoint. |
 | **UI login** | `POST /$/session {password}` → httpOnly, `SameSite=Strict`, `Secure`-when-TLS session cookie. `DELETE /$/session` = logout. Idle + absolute expiry. |
 | **Lockout** | Rate-limit and back off on repeated failures — a single password with no username is a small keyspace to guess at. |
 | **Bootstrap** | On first start with no password set, **generate a random one and print it to the log**. Never a default password, and **never an unauthenticated "set the password" endpoint** — that path would itself be the hole we are closing. Force a change on first login. |
@@ -98,21 +98,21 @@ Digest's only real advantage is avoiding a cleartext password on plaintext HTTP.
 
 # TLS
 
-Four listeners, and **admin is its own origin** (see the blocker above — this is not merely "HTTPS-only", it is a different port so object-hosted script cannot reach the admin cookie).
+Three listeners, and **admin is its own origin** (see the blocker above — a different port *and* scheme, so object-hosted script cannot reach the admin cookie).
 
 | Listener | Serves | Auth |
 |---|---|---|
-| **HTTP :80** | Object API only | Basic / anonymous |
-| **HTTPS :443** | Object API only | Basic / anonymous |
-| **HTTPS :{adminPort}** | Management API + UI **only** | admin session / bearer |
+| **HTTP :80** | Object API **only** | Basic / anonymous |
+| **HTTPS :443** | Management API + UI **only** | admin session / bearer |
 | **Unix socket** | Management API | none — filesystem boundary (`0600 root:root`) |
 
-- Object content is never served on the admin port; `/$/` is never served on the object ports. A cross-listener request is a **404**, not a redirect — the separation is the security boundary, so it must be hard, not "usually".
-- The object API stays on plain HTTP as well as HTTPS, for compatibility. Basic credentials on HTTP are in the clear; that is the documented compatibility trade, and HTTPS is right there for clients that care.
-- The admin port is **HTTPS-only**, so the session cookie is unconditionally `Secure` and bearer tokens are never sniffable.
-- A bare `GET /` on the admin port serves the login page; there is no HTTP→HTTPS redirect to reason about, because the admin listener has no HTTP.
+The object API is on **:80 (HTTP)** and admin is on **:443 (HTTPS)** — chosen so the two are hard-separated by both port and scheme. `http://host/bucket/evil.html` is origin `http://host:80`, which has no `/$/` routes, so object-hosted script physically cannot reach the admin API; a stray request across the boundary is a **404**, never a redirect.
 
-Ports become configurable (today `80` is hardcoded at `server.ts:56`).
+- **The object API is HTTP-only for now.** Basic credentials on :80 are in the clear — the documented, trusted-network compatibility trade. Object-over-TLS, if ever wanted, goes on a *third* port so it can never re-merge with the admin origin.
+- The admin port is **HTTPS-only**, so the session cookie is unconditionally `Secure` and bearer tokens are never sniffable.
+- `GET /` on :443 serves the login page. No HTTP→HTTPS redirect to reason about — the admin listener has no HTTP.
+
+Ports are configurable (`STRUBS_HTTP_PORT` / `STRUBS_ADMIN_PORT`), defaulting to 80 / 443; today `80` is hardcoded at `server.ts:56`.
 
 ## Self-issued certificate
 
