@@ -360,10 +360,15 @@ export class HttpMgmt {
         return { ok: true };
     }
 
-    // Auth-exempt. Logout: drop this session and clear the cookie.
+    // Auth-exempt. Logout: clear the cookie AND bump the session epoch.
+    //
+    // Sessions are stateless signed tokens, so there is nothing server-side to forget -- clearing the
+    // cookie alone would leave a copied token valid until it expired. Bumping the epoch revokes every
+    // outstanding token, so on this single-admin system "log out" means "log out everywhere". That is the
+    // safe reading, and unlike an in-memory denylist it survives a restart.
     private static async handleSessionDeleteRequest(req: HttpRequest, _params: unknown, res: HttpResponse): Promise<{ ok: true }> {
-        const cookies = parseCookies(req.headers.cookie);
-        adminAuth.destroySession(cookies[SESSION_COOKIE]);
+        void req;
+        await adminAuth.destroyAllSessions();
         res.setHeader('Set-Cookie', sessionClearCookie());
         return { ok: true };
     }
@@ -382,7 +387,7 @@ export class HttpMgmt {
                 throw new HttpUnauthorizedError('current password is incorrect');
         }
         await adminAuth.setPassword(payload.newPassword);
-        adminAuth.destroyAllSessions();
+        await adminAuth.destroyAllSessions();
         return { ok: true };
     }
 

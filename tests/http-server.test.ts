@@ -11,6 +11,23 @@ vi.mock('../lib/log', () => ({
     createLogger: createLoggerMock,
 }));
 
+// Sessions are now stateless signed tokens whose key lives in runtimeConfig, so minting one needs a
+// database. In-memory store: enough for adminAuth.bootstrap() and the object-authz choke point.
+const { runtimeStore } = vi.hoisted(() => ({ runtimeStore: new Map<string, unknown>() }));
+vi.mock('../lib/database', () => ({
+    database: {
+        getRuntimeConfig: vi.fn(async (key: string) => runtimeStore.has(key) ? runtimeStore.get(key) : null),
+        setRuntimeConfig: vi.fn(async (key: string, value: unknown) => { runtimeStore.set(key, value); }),
+        getAdminTokenBySelector: vi.fn(async () => null),
+        touchAdminToken: vi.fn(async () => undefined),
+        getBucketByName: vi.fn(async () => null),
+        getBucketById: vi.fn(async () => null),
+        getCredentialByAccessKeyId: vi.fn(async () => null),
+        touchCredential: vi.fn(async () => undefined),
+        getObjectById: vi.fn(async () => { const e: any = new Error('not found'); e.code = 'ENOENT'; throw e; }),
+    }
+}));
+
 const httpHelpersGetObjectMeta = vi.fn();
 vi.mock('../lib/server/http/helpers', () => ({
     HttpHelpers: {
@@ -156,8 +173,10 @@ describe('HttpServer', () => {
     });
 
     // The 'all' role gates /$/ behind auth (defence in depth), so mgmt-routing tests need a session.
+    // bootstrap() loads the persisted signing key that stateless session tokens are minted with.
     const authCookie = async (): Promise<string> => {
         const { adminAuth, SESSION_COOKIE } = await import('../lib/server/http/admin-auth');
+        await adminAuth.bootstrap();
         return `${SESSION_COOKIE}=${adminAuth.createSession()}`;
     };
 
@@ -276,6 +295,7 @@ describe('HttpServer', () => {
 
     it('AUTH GATE: a valid session cookie reaches the mgmt handler', async () => {
         const { adminAuth, SESSION_COOKIE } = await import('../lib/server/http/admin-auth');
+        await adminAuth.bootstrap();
         const token = adminAuth.createSession();
         const server = await importServer('admin');
         const { req, res, resData } = createReqRes('GET', '/$/volumes');

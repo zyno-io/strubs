@@ -16,7 +16,7 @@ import { ObjectOptionsRequest } from './object-options-request';
 import { authorizeObjectRequest } from './object-authz';
 import { HttpHelpers } from './helpers';
 import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError, HttpTooManyRequestsError } from './errors';
-import { adminAuth, parseCookies, SESSION_COOKIE } from './admin-auth';
+import { adminAuth, parseCookies, sessionSetCookie, SESSION_COOKIE } from './admin-auth';
 import { config } from '../../config';
 
 const log = createLogger('http-server');
@@ -178,7 +178,7 @@ export class HttpServer {
             if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && this._isCrossSite(request))
                 return this._outputHttpForbidden(res, 'cross-site request refused');
             // Authenticate everything except the login endpoint and the static UI (which are HOW you auth).
-            if (!this._isAuthExempt(method, request.url) && !await this._authorizeAdmin(request))
+            if (!this._isAuthExempt(method, request.url) && !await this._authorizeAdmin(request, res))
                 return this._outputHttpUnauthorized(res);
         }
 
@@ -302,14 +302,24 @@ export class HttpServer {
         res.end(message);
     }
 
-    private async _authorizeAdmin(req: HttpRequest): Promise<boolean> {
+    private async _authorizeAdmin(req: HttpRequest, res: HttpResponse): Promise<boolean> {
         const auth = req.headers.authorization;
         if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
             if (await adminAuth.verifyBearer(auth.slice(7).trim()))
                 return true;
         }
         const cookies = parseCookies(req.headers.cookie);
-        return adminAuth.verifySession(cookies[SESSION_COOKIE]);
+        const token = cookies[SESSION_COOKIE];
+        if (!adminAuth.verifySession(token))
+            return false;
+
+        // Sliding expiry: the session's idle clock lives inside the token, so it only advances when we
+        // hand back a fresh one. Re-issue once the token is old enough, so an actively-used session never
+        // idles out -- while the absolute cap, anchored to the original issue time, is untouched.
+        const refreshed = adminAuth.refreshSession(token);
+        if (refreshed)
+            res.setHeader('Set-Cookie', sessionSetCookie(refreshed));
+        return true;
     }
 
     private _outputHttpUnauthorized(res: HttpResponse): void {

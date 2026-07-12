@@ -7,12 +7,23 @@ import { scryptHash, scryptVerify } from './secret-hash';
 const log = createLogger('admin-auth');
 
 const PASSWORD_KEY = 'adminPasswordHash';
+const SESSION_SECRET_KEY = 'adminSessionSecret';
+const SESSION_EPOCH_KEY = 'adminSessionEpoch';
 
-// Sessions live in memory: one process, and losing them on restart just means re-login. Idle timeout
-// bounds an abandoned session; the absolute cap bounds a stolen cookie.
+// Idle timeout bounds an abandoned session; the absolute cap bounds a stolen cookie. A session is
+// re-issued (its idle clock reset) once it is older than SESSION_REFRESH_AFTER_MS, so an actively-used
+// session slides forward without ever moving the absolute anchor.
 const SESSION_IDLE_MS = 12 * 60 * 60 * 1000;
 const SESSION_ABSOLUTE_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_REFRESH_AFTER_MS = 60 * 60 * 1000;
+const CLOCK_SKEW_MS = 60 * 1000;
 export const SESSION_COOKIE = 'strubs_admin';
+
+type SessionPayload = {
+    iat: number;     // issued-at of the SESSION (fixed; anchors the absolute cap)
+    sat: number;     // issued-at of THIS token (moves on refresh; anchors the idle timeout)
+    epoch: number;   // revocation generation; a mismatch invalidates the token
+};
 
 export function parseCookies(header: string | undefined): Record<string, string> {
     const out: Record<string, string> = {};
@@ -34,8 +45,6 @@ export function sessionClearCookie(): string {
     return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`;
 }
 
-type SessionEntry = { createdAt: number; lastSeen: number };
-
 // Login throttle: a single password with no username is a small keyspace, and scrypt-per-attempt is
 // expensive, so cap the rate of failed attempts. Global (one admin) rather than per-IP, since a LAN
 // attacker can rotate source addresses.
@@ -47,7 +56,8 @@ const LOGIN_LOCKOUT_MS = 30 * 1000;
 const LOGIN_MAX_CONCURRENT = 3;
 
 export class AdminAuth {
-    private readonly sessions = new Map<string, SessionEntry>();
+    private sessionSecret: Buffer | null = null;
+    private sessionEpoch = 0;
     private loginFailures = 0;
     private loginLockedUntil = 0;
     private loginInFlight = 0;
@@ -113,6 +123,7 @@ export class AdminAuth {
     // On first start with no password, generate a random one and print it ONCE. Never a default
     // password, and never an unauthenticated "set password" endpoint -- that would be the hole itself.
     async bootstrap(): Promise<void> {
+        await this.loadSessionKeys();
         if (await this.isPasswordSet())
             return;
         const generated = crypto.randomBytes(18).toString('base64url');
@@ -123,35 +134,107 @@ export class AdminAuth {
         log.error('=================================================================');
     }
 
-    // --- sessions ---
+    // --- sessions (STATELESS, signed) ---
+    //
+    // Sessions used to be an in-memory Map, which meant every deploy silently logged the operator out.
+    // They are now a signed token carrying their own state, so nothing is kept server-side and a restart
+    // is invisible. The signing key lives in runtimeConfig, so it survives the restart too -- a key
+    // regenerated on boot would have exactly the bug we are fixing.
+    //
+    // The cost of statelessness is that you cannot revoke one token by forgetting it. So revocation is an
+    // EPOCH, also persisted: every token carries the epoch it was minted under, and bumping the epoch
+    // invalidates every outstanding token at once. Logout and password-change both bump it. On a
+    // single-admin system "log out" therefore means "log out everywhere", which is the safe reading --
+    // and, unlike a server-side denylist, it cannot be undone by a restart.
+
+    private async loadSessionKeys(): Promise<void> {
+        const stored = await database.getRuntimeConfig(SESSION_SECRET_KEY);
+        // 32 bytes of hex = 64 chars. Anything shorter/absent is not a key we are willing to sign with.
+        let secret: string;
+        if (typeof stored === 'string' && stored.length >= 64) {
+            secret = stored;
+        }
+        else {
+            secret = crypto.randomBytes(32).toString('hex');
+            await database.setRuntimeConfig(SESSION_SECRET_KEY, secret);
+            log('generated a new admin session signing key');
+        }
+        this.sessionSecret = Buffer.from(secret, 'hex');
+
+        const epoch = await database.getRuntimeConfig(SESSION_EPOCH_KEY);
+        this.sessionEpoch = typeof epoch === 'number' ? epoch : 0;
+    }
+
+    private sign(body: string): string {
+        if (!this.sessionSecret)
+            throw new Error('session signing key is not loaded');
+        return crypto.createHmac('sha256', this.sessionSecret).update(body).digest('base64url');
+    }
+
+    private mintToken(payload: SessionPayload): string {
+        const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+        return `${body}.${this.sign(body)}`;
+    }
+
+    // Returns the payload if the signature and all time/epoch bounds hold, else null. FAILS CLOSED: an
+    // unloaded key, a bad signature, a stale epoch, or a malformed token are all simply "not a session".
+    private readToken(token: string | undefined): SessionPayload | null {
+        if (!token || !this.sessionSecret) return null;
+        const dot = token.indexOf('.');
+        if (dot < 1) return null;
+        const body = token.slice(0, dot);
+        const presented = token.slice(dot + 1);
+
+        let expected: string;
+        try { expected = this.sign(body); }
+        catch { return null; }
+        const a = Buffer.from(presented);
+        const b = Buffer.from(expected);
+        if (a.length !== b.length || !crypto.timingSafeEqual(a, b))
+            return null;
+
+        let payload: SessionPayload;
+        try { payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')); }
+        catch { return null; }
+        if (typeof payload?.iat !== 'number' || typeof payload?.sat !== 'number' || typeof payload?.epoch !== 'number')
+            return null;
+
+        // Revoked wholesale (logout / password change).
+        if (payload.epoch !== this.sessionEpoch) return null;
+
+        const now = Date.now();
+        if (now - payload.iat > SESSION_ABSOLUTE_MS) return null;   // absolute cap on a stolen cookie
+        if (now - payload.sat > SESSION_IDLE_MS) return null;       // idle timeout
+        // Reject a token minted in the future (clock skew / forged iat beyond our signing).
+        if (payload.iat > now + CLOCK_SKEW_MS || payload.sat > now + CLOCK_SKEW_MS) return null;
+        return payload;
+    }
 
     createSession(): string {
-        const token = crypto.randomBytes(32).toString('base64url');
         const now = Date.now();
-        this.sessions.set(token, { createdAt: now, lastSeen: now });
-        return token;
+        return this.mintToken({ iat: now, sat: now, epoch: this.sessionEpoch });
     }
 
     verifySession(token: string | undefined): boolean {
-        if (!token) return false;
-        const s = this.sessions.get(token);
-        if (!s) return false;
-        const now = Date.now();
-        if (now - s.lastSeen > SESSION_IDLE_MS || now - s.createdAt > SESSION_ABSOLUTE_MS) {
-            this.sessions.delete(token);
-            return false;
-        }
-        s.lastSeen = now;
-        return true;
+        return this.readToken(token) !== null;
     }
 
-    destroySession(token: string | undefined): void {
-        if (token) this.sessions.delete(token);
+    // Sliding expiry: the idle timeout is measured from `sat` (session activity time), which only moves
+    // when we re-issue the cookie. Re-mint once the token is past a fraction of the idle window, so an
+    // actively-used session never expires while keeping the absolute cap anchored at the original `iat`.
+    // Returns null when the token is still fresh enough to leave alone.
+    refreshSession(token: string | undefined): string | null {
+        const payload = this.readToken(token);
+        if (!payload) return null;
+        if (Date.now() - payload.sat < SESSION_REFRESH_AFTER_MS) return null;
+        return this.mintToken({ iat: payload.iat, sat: Date.now(), epoch: payload.epoch });
     }
 
-    // Invalidate every session -- used after a password change so old cookies stop working.
-    destroyAllSessions(): void {
-        this.sessions.clear();
+    // Revoke every outstanding session. Used by logout and by a password change. Persisted, so it also
+    // holds across a restart (a server-side denylist would not).
+    async destroyAllSessions(): Promise<void> {
+        this.sessionEpoch++;
+        await database.setRuntimeConfig(SESSION_EPOCH_KEY, this.sessionEpoch);
     }
 
     // --- bearer tokens (selector.secret; selector indexed plaintext, secret hashed) ---
