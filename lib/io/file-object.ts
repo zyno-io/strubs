@@ -21,6 +21,7 @@ type ResolveablePromise = Promise<void> & { resolve: () => void };
 export interface StoredObjectRecord extends ContentDocument {
     id: string;
     containerId?: string | null;
+    bucketId?: string | null;
     isFile: boolean;
     name: string;
     size: number;
@@ -77,6 +78,7 @@ export class FileObject extends Duplex {
     id: string | null = null;
     idBuf: Buffer | null = null;
     containerId: string | null = null;
+    bucketId: string | null = null;
     name: string | null = null;
     size = 0;
     mime: string | null = null;
@@ -168,6 +170,7 @@ export class FileObject extends Duplex {
         const dbObject: StoredObjectRecord = {
             id: this.id,
             containerId: this.containerId,
+            bucketId: this.bucketId,
             isFile: true,
             name: this.name ?? '',
             size: this.size,
@@ -200,6 +203,7 @@ export class FileObject extends Duplex {
         this.idBuf = Buffer.from(this.id, 'hex');
         this.size = record.size;
         this.containerId = record.containerId || null;
+        this.bucketId = record.bucketId || null;
         this.name = record.name;
         // Mongo hands md5 back as a BSON Binary, not a Buffer; unwrap it so the whole-object md5 gate
         // (which calls Buffer.equals) works. Normal reads never compare it, so this was latent until
@@ -317,6 +321,7 @@ export class FileObject extends Duplex {
         return {
             id: this.id,
             containerId: this.containerId,
+            bucketId: this.bucketId,
             isFile: true,
             name: this.name ?? '',
             size: this.size,

@@ -1,4 +1,4 @@
-import { Collection, ObjectId, type Filter } from 'mongodb';
+import { Collection, ObjectId, type AnyBulkWriteOperation, type Filter } from 'mongodb';
 
 import { config } from '../config';
 import { constants } from '../constants';
@@ -25,10 +25,19 @@ export class ContentRepository {
 
     async createObjectRecord(object: ContentDocument & { id: string; containerId?: ObjectIdentifier }): Promise<void> {
         const { id, ...rest } = object;
+        const containerMongoId = this.toMongoId(object.containerId);
+        const bucketMongoId = object.bucketId ? this.toMongoId(object.bucketId) : null;
+        // An object inside a container MUST carry its bucket. If it didn't, we'd write bucketId:null and
+        // the additive backfill ({ bucketId: { $exists: false } }) would then skip it forever, silently
+        // excluding it from stats and authorisation. Fail loudly instead. bucketId:null is valid ONLY for
+        // a genuine root object (containerId null) -- production has none, and Phase 3 rejects them.
+        if (containerMongoId && !bucketMongoId)
+            throw createError('EINVAL', 'object in a container must have a bucketId');
         const insertDoc: ContentDocument = {
             ...rest,
             _id: new ObjectId(id),
-            containerId: this.toMongoId(object.containerId)
+            containerId: containerMongoId,
+            bucketId: bucketMongoId
         };
         await this.collection.insertOne(insertDoc);
     }
@@ -614,11 +623,23 @@ export class ContentRepository {
     }
 
     async resolveContainer(path: ContainerPath, shouldCreateIfNotExists = false): Promise<string | null> {
+        return (await this.resolveContainerWithBucket(path, shouldCreateIfNotExists)).containerId;
+    }
+
+    // Resolve a container path, returning BOTH the leaf container id and the bucket (top-level) id. The
+    // bucket is simply the id of the first path component's container, captured on the first iteration.
+    // Any container created along the way is stamped with its bucketId at insert time, so new writes are
+    // covered without a backfill; existing containers get their bucketId from backfillBucketIds().
+    async resolveContainerWithBucket(
+        path: ContainerPath,
+        shouldCreateIfNotExists = false
+    ): Promise<{ containerId: string | null; bucketId: string | null }> {
         const components = typeof path === 'string'
             ? path.split('/').filter(component => component.length > 0)
             : [ ...path ];
 
         let containerId: string | null = null;
+        let bucketId: string | null = null;
         let shouldSkipLookup = false;
 
         while (components.length) {
@@ -628,6 +649,7 @@ export class ContentRepository {
             const cachedId = this.cache.get(name, containerId);
             if (cachedId) {
                 containerId = cachedId;
+                bucketId ??= containerId;
                 continue;
             }
 
@@ -646,17 +668,21 @@ export class ContentRepository {
 
                 shouldSkipLookup = true;
 
+                // Preallocate the _id so the bucketId can be stamped in the SAME insert -- atomic, with
+                // no window where a crash could leave a new top-level container unstamped. A nested
+                // container inherits the already-known bucket; a brand-new top-level container IS its own
+                // bucket, so it is stamped with its own preallocated id.
+                const newId = new ObjectId();
+                const bucketMongoId = bucketId ? this.toMongoId(bucketId) : newId;
                 const insertDoc: ContentDocument = {
+                    _id: newId,
                     containerId: this.toMongoId(containerId),
                     name,
-                    isContainer: true
+                    isContainer: true,
+                    bucketId: bucketMongoId
                 };
-                const insertResult = await this.collection.insertOne(insertDoc);
-                object = {
-                    ...insertDoc,
-                    _id: insertResult.insertedId
-                };
-
+                await this.collection.insertOne(insertDoc);
+                object = insertDoc;
                 object.containerId = containerId;
             }
             else if (!object.isContainer) {
@@ -671,8 +697,149 @@ export class ContentRepository {
             this.cache.remember(normalized.id, normalized.name, normalized.containerId ?? null);
 
             containerId = normalized.id;
+            bucketId ??= containerId;
         }
 
-        return containerId;
+        return { containerId, bucketId };
+    }
+
+    // One-off backfill of bucketId onto every pre-existing document. Purely additive: it only ever
+    // $sets bucketId on documents that lack it ({ bucketId: { $exists: false } }), so it never rewrites
+    // an existing value and is safe to re-run and to run alongside live writes (which already carry it).
+    //
+    // Strategy: the container tree is small (~55k nodes), so load it into memory, resolve each node's
+    // root ancestor once (memoised, cycle/orphan guarded), stamp the containers, then stamp their
+    // children (files + any still-unstamped sub-containers) with a handful of grouped updateMany calls
+    // -- one bounded batch per bucket -- rather than a per-object walk over millions of documents.
+    async backfillBucketIds(
+        opts: { apply?: boolean; batchSize?: number } = {}
+    ): Promise<{ containersStamped: number; objectsStamped: number; skippedContainers: number }> {
+        const apply = opts.apply !== false;
+        const batchSize = opts.batchSize ?? 1000;
+
+        const containers = await this.collection
+            .find({ isContainer: true }, { projection: { _id: 1, containerId: 1, bucketId: 1 } })
+            .toArray();
+
+        const parentOf = new Map<string, string | null>();
+        for (const c of containers) {
+            const cid = (c._id as ObjectId).toHexString();
+            const parent = c.containerId ? (c.containerId as ObjectId).toHexString() : null;
+            parentOf.set(cid, parent);
+        }
+
+        // Resolve the root ancestor (the bucket) for a container id. Returns null if the chain hits a
+        // missing parent (orphan) or a cycle -- such nodes are left unstamped rather than mis-bucketed.
+        const bucketCache = new Map<string, string | null>();
+        const resolveBucket = (start: string): string | null => {
+            const chain: string[] = [];
+            let current: string | null = start;
+            while (current !== null) {
+                const cached = bucketCache.get(current);
+                if (cached !== undefined) {
+                    for (const node of chain) bucketCache.set(node, cached);
+                    return cached;
+                }
+                if (chain.includes(current)) {                     // cycle
+                    for (const node of chain) bucketCache.set(node, null);
+                    return null;
+                }
+                chain.push(current);
+                if (!parentOf.has(current)) {                      // orphan: parent doc missing
+                    for (const node of chain) bucketCache.set(node, null);
+                    return null;
+                }
+                const parent: string | null = parentOf.get(current) ?? null;
+                if (parent === null) {                             // reached a root -> current IS the bucket
+                    for (const node of chain) bucketCache.set(node, current);
+                    return current;
+                }
+                current = parent;
+            }
+            return null;
+        };
+
+        // Group container ids by their resolved bucket, so children can be stamped per-bucket in bulk.
+        // byBucket holds EVERY resolvable container (even already-stamped ones) so that children left
+        // unstamped by an earlier partial run still get covered. containerBulk holds only containers that
+        // are themselves still missing bucketId, so the dry-run count matches apply's modifiedCount.
+        const byBucket = new Map<string, ObjectId[]>();
+        const containerBulk: AnyBulkWriteOperation<ContentDocument>[] = [];
+        let skippedContainers = 0;
+        for (const c of containers) {
+            const cid = (c._id as ObjectId).toHexString();
+            const bucket = resolveBucket(cid);
+            if (!bucket) { skippedContainers++; continue; }
+            const bucketOid = new ObjectId(bucket);
+            if (c.bucketId === undefined) {
+                containerBulk.push({
+                    updateOne: {
+                        filter: { _id: c._id as ObjectId, bucketId: { $exists: false } },
+                        update: { $set: { bucketId: bucketOid } }
+                    }
+                });
+            }
+            let ids = byBucket.get(bucket);
+            if (!ids) { ids = []; byBucket.set(bucket, ids); }
+            ids.push(c._id as ObjectId);
+        }
+
+        let containersStamped = 0;
+        let objectsStamped = 0;
+        if (!apply) {
+            // Dry run: report what WOULD be stamped without writing. Exclude sub-containers from the
+            // object count -- in apply mode the container pass stamps them first, so the child updateMany
+            // only ever touches files; mirror that here so the dry-run numbers match the real run.
+            containersStamped = containerBulk.length;
+            for (const [bucket, ids] of byBucket) {
+                objectsStamped += await this.collection.countDocuments({
+                    containerId: { $in: ids },
+                    isContainer: { $ne: true },
+                    bucketId: { $exists: false }
+                });
+                void bucket;
+            }
+            return { containersStamped, objectsStamped, skippedContainers };
+        }
+
+        for (let i = 0; i < containerBulk.length; i += batchSize) {
+            const res = await this.collection.bulkWrite(containerBulk.slice(i, i + batchSize), { ordered: false });
+            containersStamped += res.modifiedCount ?? 0;
+        }
+
+        for (const [bucket, ids] of byBucket) {
+            const bucketOid = new ObjectId(bucket);
+            for (let i = 0; i < ids.length; i += batchSize) {
+                const res = await this.collection.updateMany(
+                    { containerId: { $in: ids.slice(i, i + batchSize) }, bucketId: { $exists: false } },
+                    { $set: { bucketId: bucketOid } }
+                );
+                objectsStamped += res.modifiedCount ?? 0;
+            }
+        }
+
+        return { containersStamped, objectsStamped, skippedContainers };
+    }
+
+    // Per-bucket object count and logical size in a single grouped aggregation over the denormalised
+    // bucketId -- the number the UI needs, without a recursive walk of tens of thousands of containers.
+    async computeBucketStats(): Promise<Array<{ bucketId: string; objectCount: number; logicalBytes: number }>> {
+        const rows = await this.collection.aggregate<{ _id: ObjectId | null; objectCount: number; logicalBytes: number }>([
+            { $match: { isFile: true, bucketId: { $ne: null } } },
+            {
+                $group: {
+                    _id: '$bucketId',
+                    objectCount: { $sum: 1 },
+                    logicalBytes: { $sum: { $ifNull: ['$size', 0] } }
+                }
+            }
+        ]).toArray();
+        return rows
+            .filter(row => row._id)
+            .map(row => ({
+                bucketId: (row._id as ObjectId).toHexString(),
+                objectCount: row.objectCount ?? 0,
+                logicalBytes: row.logicalBytes ?? 0
+            }));
     }
 }

@@ -172,8 +172,9 @@ export class ObjectPutRequest {
         }
 
         if (containerComponents.length) {
-            const containerId = await database.getOrCreateContainer(containerComponents);
+            const { containerId, bucketId } = await database.getOrCreateContainerWithBucket(containerComponents);
             object.containerId = containerId;
+            object.bucketId = bucketId;
         }
 
         object.name = fileName;

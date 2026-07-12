@@ -6,6 +6,7 @@ import type { StoredObjectRecord } from '../lib/io/file-object';
 
 const databaseMock = {
     getOrCreateContainer: vi.fn(),
+    getOrCreateContainerWithBucket: vi.fn(),
 };
 
 vi.mock('../lib/database', () => ({
@@ -151,6 +152,7 @@ vi.mock('../lib/io/file-object', () => ({
 
 const resetMocks = (): void => {
     databaseMock.getOrCreateContainer.mockReset();
+    databaseMock.getOrCreateContainerWithBucket.mockReset();
     applyDefaultBehavior();
     MockFileObject.instances = [];
 };
@@ -297,7 +299,7 @@ describe('ObjectPutRequest', () => {
     it('stores a new object successfully', async () => {
         const req = createRequest('PUT', '/photos/cat.jpg', { 'content-length': '12' });
         const res = createResponse();
-        databaseMock.getOrCreateContainer.mockResolvedValue('container123');
+        databaseMock.getOrCreateContainerWithBucket.mockResolvedValue({ containerId: 'container123', bucketId: 'bucket123' });
 
         const putRequest = new ObjectPutRequest(1, req as any, res as any);
         const promise = putRequest.process();
@@ -493,7 +495,7 @@ describe('ObjectPutRequest', () => {
     });
 
     it('propagates container creation failures', async () => {
-        databaseMock.getOrCreateContainer.mockRejectedValue(new Error('db down'));
+        databaseMock.getOrCreateContainerWithBucket.mockRejectedValue(new Error('db down'));
         const req = createRequest('PUT', '/photos/cat.jpg', { 'content-length': '1' });
         const res = createResponse();
         const putRequest = new ObjectPutRequest(9, req as any, res as any);

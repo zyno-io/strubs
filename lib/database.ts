@@ -236,6 +236,18 @@ export class Database {
         return this.getContainer(path, true);
     }
 
+    async getOrCreateContainerWithBucket(path: ContainerPath): Promise<{ containerId: string | null; bucketId: string | null }> {
+        return this.contentRepository.resolveContainerWithBucket(path, true);
+    }
+
+    async backfillBucketIds(opts?: { apply?: boolean; batchSize?: number }): Promise<{ containersStamped: number; objectsStamped: number; skippedContainers: number }> {
+        return this.contentRepository.backfillBucketIds(opts);
+    }
+
+    async computeBucketStats(): Promise<Array<{ bucketId: string; objectCount: number; logicalBytes: number }>> {
+        return this.contentRepository.computeBucketStats();
+    }
+
     async deleteObjectById(id: ObjectIdentifier): Promise<void> {
         await this.contentRepository.deleteObjectById(id);
     }
@@ -296,6 +308,10 @@ export class Database {
             await this.contentCollection.createIndexes([
                 { key: { containerId: 1, name: 1 }, name: 'containerContents', unique: true },
                 { key: { containerId: 1 }, name: 'containerId' },
+                // Sparse: pre-backfill documents have no bucketId yet; once backfill completes every
+                // document carries one, so the sparse index covers the whole collection. Used by
+                // authorisation (bucket lookup by id) and the per-bucket stats aggregation.
+                { key: { bucketId: 1 }, name: 'bucketId', sparse: true },
                 { key: { lastVerifiedAt: 1 }, name: 'lastVerifiedAt' },
                 { key: { sliceErrors: 1 }, name: 'sliceErrors', sparse: true },
                 { key: { dataVolumes: 1 }, name: 'dataVolumes', sparse: true },
@@ -360,6 +376,20 @@ export class Database {
         }
         else {
             delete normalized.containerId;
+        }
+
+        const bucketIdValue = object.bucketId;
+        if (bucketIdValue instanceof ObjectId) {
+            (normalized as ContentDocument).bucketId = bucketIdValue.toHexString();
+        }
+        else if (typeof bucketIdValue === 'string') {
+            (normalized as ContentDocument).bucketId = bucketIdValue;
+        }
+        else if (bucketIdValue === null) {
+            (normalized as ContentDocument).bucketId = null;
+        }
+        else {
+            delete (normalized as ContentDocument).bucketId;
         }
 
         return normalized;

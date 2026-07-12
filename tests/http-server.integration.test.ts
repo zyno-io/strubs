@@ -307,6 +307,12 @@ const createDatabaseMock = () => {
             }
             return lastId;
         }),
+        getOrCreateContainerWithBucket: vi.fn(async (pathValue: string | string[]) => {
+            const containerId = await mock.getOrCreateContainer(pathValue);
+            const components = normalizeComponents(pathValue);
+            const bucketId = components.length ? containerIdsByPath.get(components[0]) ?? null : null;
+            return { containerId, bucketId };
+        }),
         getObjectByPath: vi.fn(async (pathValue: string) => {
             const normalized = pathValue.replace(/^\/+/, '');
             const components = normalized.split('/').filter(Boolean);
@@ -336,6 +342,7 @@ const createDatabaseMock = () => {
             mock.createObjectRecord.mockClear();
             mock.deleteObjectById.mockClear();
             mock.getOrCreateContainer.mockClear();
+            mock.getOrCreateContainerWithBucket.mockClear();
             mock.getObjectByPath.mockClear();
             mock.getObjectById.mockClear();
         }

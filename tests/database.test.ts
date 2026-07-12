@@ -231,11 +231,13 @@ describe('database helpers', () => {
         const { db, content } = createDbWithCollections();
         const id = new ObjectId().toHexString();
         const containerId = new ObjectId().toHexString();
+        const bucketId = new ObjectId().toHexString();
         content.insertOne.mockResolvedValue({});
 
         await db.createObjectRecord({
             id,
             containerId,
+            bucketId,
             name: 'photo.jpg',
             isFile: true,
             size: 42,
@@ -247,7 +249,20 @@ describe('database helpers', () => {
         const insertDoc = content.insertOne.mock.calls[0][0];
         expect(insertDoc._id.toHexString()).toBe(id);
         expect(insertDoc.containerId?.toHexString()).toBe(containerId);
+        expect(insertDoc.bucketId?.toHexString()).toBe(bucketId);
         expect(insertDoc.name).toBe('photo.jpg');
+    });
+
+    it('refuses to create a contained object with no bucketId', async () => {
+        const { db, content } = createDbWithCollections();
+        content.insertOne.mockResolvedValue({});
+        await expect(db.createObjectRecord({
+            id: new ObjectId().toHexString(),
+            containerId: new ObjectId().toHexString(),
+            name: 'stray.jpg',
+            isFile: true
+        } as any)).rejects.toThrow(/bucketId/);
+        expect(content.insertOne).not.toHaveBeenCalled();
     });
 
     it('looks up objects by id and normalizes responses', async () => {
@@ -338,12 +353,16 @@ describe('database helpers', () => {
             })
             .mockResolvedValue(null);
 
-        const newId = new ObjectId();
-        content.insertOne.mockResolvedValue({ insertedId: newId });
+        content.insertOne.mockResolvedValue({});
 
         const result = await db.getContainer('photos/2025', true);
 
-        expect(result).toBe(newId.toHexString());
+        // The container id is now the _id preallocated in the insert doc (stamped atomically with its
+        // bucketId), not a driver-returned insertedId.
+        const insertDoc = content.insertOne.mock.calls.at(-1)![0];
+        expect(result).toBe(insertDoc._id.toHexString());
+        // '2025' is nested; its bucket is the top-level 'photos' container.
+        expect(insertDoc.bucketId?.toHexString()).toBe(existingContainerId.toHexString());
         expect(content.findOne).toHaveBeenCalledTimes(2);
     });
 
@@ -662,18 +681,20 @@ describe('database helpers', () => {
 
     it('creates containers when requested and caches the results', async () => {
         const { db, content } = createDbWithCollections();
-        const firstId = new ObjectId();
-        const secondId = new ObjectId();
 
         content.findOne.mockResolvedValueOnce(null);
-        content.insertOne
-            .mockResolvedValueOnce({ insertedId: firstId })
-            .mockResolvedValueOnce({ insertedId: secondId });
+        content.insertOne.mockResolvedValue({});
 
         const id = await db.getContainer('photos/2024', true);
 
-        expect(id).toBe(secondId.toHexString());
+        const firstDoc = content.insertOne.mock.calls[0][0];    // photos (top-level bucket)
+        const secondDoc = content.insertOne.mock.calls[1][0];   // 2024 (nested)
+        expect(id).toBe(secondDoc._id.toHexString());
         expect(content.insertOne).toHaveBeenCalledTimes(2);
+        // A brand-new top-level container is its own bucket; the nested one inherits it -- both stamped
+        // in their single insert, no follow-up write.
+        expect(firstDoc.bucketId?.toHexString()).toBe(firstDoc._id.toHexString());
+        expect(secondDoc.bucketId?.toHexString()).toBe(firstDoc._id.toHexString());
 
         content.findOne.mockClear();
         content.insertOne.mockClear();
@@ -688,26 +709,25 @@ describe('database helpers', () => {
     it('skips empty path segments while resolving containers', async () => {
         const { db, content } = createDbWithCollections();
         content.findOne.mockResolvedValue(null);
-        const firstId = new ObjectId();
-        const secondId = new ObjectId();
-        content.insertOne
-            .mockResolvedValueOnce({ insertedId: firstId })
-            .mockResolvedValueOnce({ insertedId: secondId });
+        content.insertOne.mockResolvedValue({});
 
         const id = await db.getContainer('foo//bar', true);
-        expect(id).toBe(secondId.toHexString());
+        const secondDoc = content.insertOne.mock.calls[1][0];
+        expect(id).toBe(secondDoc._id.toHexString());
         expect(content.insertOne).toHaveBeenCalledTimes(2);
     });
 
     it('accepts container paths supplied as arrays', async () => {
         const { db, content } = createDbWithCollections();
         content.findOne.mockResolvedValue(null);
-        const insertedId = new ObjectId();
-        content.insertOne.mockResolvedValue({ insertedId });
+        content.insertOne.mockResolvedValue({});
 
         const id = await db.getContainer(['archive'], true);
 
-        expect(id).toBe(insertedId.toHexString());
+        const insertDoc = content.insertOne.mock.calls[0][0];
+        expect(id).toBe(insertDoc._id.toHexString());
+        // single top-level container -> its own bucket
+        expect(insertDoc.bucketId?.toHexString()).toBe(insertDoc._id.toHexString());
     });
 
     it('throws when asked for a container that cannot be created', async () => {

@@ -7,6 +7,11 @@ export interface ContentDocument {
     _id?: ObjectId;
     id?: string;
     containerId?: ObjectId | string | null;
+    // Top-level container (the bucket) this document belongs to, denormalised so authorisation and
+    // per-bucket stats don't have to walk the container chain to the root on every request. For a
+    // top-level container it is the document's own _id; for everything nested it is the root ancestor.
+    // Additive: absent on pre-backfill documents (treated as "unknown bucket", never as a wildcard).
+    bucketId?: ObjectId | string | null;
     name: string;
     isContainer?: boolean;
     isFile?: boolean;
