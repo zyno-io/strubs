@@ -2,16 +2,9 @@ import crypto from 'crypto';
 
 import { database } from '../../database';
 import { createLogger } from '../../log';
+import { scryptHash, scryptVerify } from './secret-hash';
 
 const log = createLogger('admin-auth');
-
-// Password/secret hashing uses Node's built-in scrypt -- memory-hard, no native dependency (this
-// codebase fights native modules; a pure-stdlib primitive is worth more here than argon2id's marginal
-// edge). Format: scrypt$N$r$p$saltB64$hashB64, self-describing so parameters can change over time.
-const SCRYPT_N = 16384;
-const SCRYPT_r = 8;
-const SCRYPT_p = 1;
-const SCRYPT_KEYLEN = 32;
 
 const PASSWORD_KEY = 'adminPasswordHash';
 
@@ -39,46 +32,6 @@ export function sessionSetCookie(token: string): string {
 }
 export function sessionClearCookie(): string {
     return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`;
-}
-
-function scryptHash(secret: string): Promise<string> {
-    const salt = crypto.randomBytes(16);
-    return new Promise((resolve, reject) => {
-        crypto.scrypt(secret, salt, SCRYPT_KEYLEN, { N: SCRYPT_N, r: SCRYPT_r, p: SCRYPT_p }, (err, key) => {
-            if (err) return reject(err);
-            resolve(`scrypt$${SCRYPT_N}$${SCRYPT_r}$${SCRYPT_p}$${salt.toString('base64')}$${key.toString('base64')}`);
-        });
-    });
-}
-
-function scryptVerify(secret: string, stored: string): Promise<boolean> {
-    return new Promise(resolve => {
-        const parts = stored.split('$');
-        if (parts.length !== 6 || parts[0] !== 'scrypt')
-            return resolve(false);
-        const [, n, r, p, saltB64, hashB64] = parts;
-        const salt = Buffer.from(saltB64, 'base64');
-        const expected = Buffer.from(hashB64, 'base64');
-        // FAIL CLOSED against a malformed/corrupt stored hash. Pin EVERY field to exactly what we write:
-        //   - empty/short `expected` would make scrypt(keylen=0) + timingSafeEqual(empty,empty) return
-        //     TRUE (any password verifies);
-        //   - N/r/p of 0 are accepted by Node as "use defaults", so a zeroed param field must be rejected
-        //     rather than silently re-deriving under different work factors.
-        if (expected.length !== SCRYPT_KEYLEN || salt.length !== 16
-            || Number(n) !== SCRYPT_N || Number(r) !== SCRYPT_r || Number(p) !== SCRYPT_p) {
-            log.error('refusing to verify against a malformed stored hash');
-            return resolve(false);
-        }
-        try {
-            crypto.scrypt(secret, salt, SCRYPT_KEYLEN, { N: SCRYPT_N, r: SCRYPT_r, p: SCRYPT_p }, (err, key) => {
-                if (err || key.length !== expected.length) return resolve(false);
-                resolve(crypto.timingSafeEqual(key, expected));
-            });
-        }
-        catch {
-            resolve(false);
-        }
-    });
 }
 
 type SessionEntry = { createdAt: number; lastSeen: number };

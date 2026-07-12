@@ -73,11 +73,27 @@ vi.mock('../lib/storage/stats-tracker', () => ({
 }));
 
 const databaseCountOnVolumeMock = vi.fn().mockResolvedValue(0);
+const databaseBucketAuthMock = {
+    getRuntimeConfig: vi.fn(async () => false),
+    setRuntimeConfig: vi.fn(async () => undefined),
+    listBuckets: vi.fn(async () => [] as any[]),
+    computeBucketStats: vi.fn(async () => [] as any[]),
+    setBucketPolicy: vi.fn(async () => true),
+    getBucketByName: vi.fn(async () => null),
+    listCredentials: vi.fn(async () => [] as any[]),
+    createCredential: vi.fn(async () => undefined),
+    setCredentialGrants: vi.fn(async () => true),
+    setCredentialEnabled: vi.fn(async () => true),
+    setCredentialSecretHash: vi.fn(async () => true),
+    removeCredential: vi.fn(async () => true)
+};
+
 vi.mock('../lib/database', () => ({
     database: {
         softDeleteVolume: databaseSoftDeleteMock,
         updateVolumeFlags: databaseUpdateFlagsMock,
-        countObjectsOnVolume: databaseCountOnVolumeMock
+        countObjectsOnVolume: databaseCountOnVolumeMock,
+        ...databaseBucketAuthMock
     }
 }));
 
@@ -1184,4 +1200,95 @@ describe('HttpMgmt.handle', () => {
         includeReq.params.includeDeleted = 'true';
         const included = await HttpMgmt.handle(3, includeReq, nullResponse);
         expect(included).toHaveLength(2);
+    });
+
+    describe('bucket auth endpoints', () => {
+        beforeEach(() => {
+            for (const fn of Object.values(databaseBucketAuthMock)) fn.mockClear();
+            databaseBucketAuthMock.getRuntimeConfig.mockResolvedValue(false as any);
+            databaseBucketAuthMock.setBucketPolicy.mockResolvedValue(true as any);
+            databaseBucketAuthMock.setCredentialGrants.mockResolvedValue(true as any);
+            databaseBucketAuthMock.setCredentialEnabled.mockResolvedValue(true as any);
+            databaseBucketAuthMock.setCredentialSecretHash.mockResolvedValue(true as any);
+        });
+
+        it('GET /$/buckets merges policy, stats, and activity', async () => {
+            databaseBucketAuthMock.listBuckets.mockResolvedValue([
+                { id: 'aaaaaaaaaaaaaaaaaaaaaaaa', name: 'photo', publicRead: true },
+                { id: 'bbbbbbbbbbbbbbbbbbbbbbbb', name: 'empty' }
+            ] as any);
+            databaseBucketAuthMock.computeBucketStats.mockResolvedValue([
+                { bucketId: 'aaaaaaaaaaaaaaaaaaaaaaaa', objectCount: 5, logicalBytes: 100 }
+            ] as any);
+            const res = await HttpMgmt.handle(1, createRequest('GET', '/$/buckets'), nullResponse) as any;
+            expect(res.enforced).toBe(false);
+            const photo = res.buckets.find((b: any) => b.name === 'photo');
+            expect(photo).toMatchObject({ publicRead: true, publicWrite: null, objectCount: 5, logicalBytes: 100 });
+            const empty = res.buckets.find((b: any) => b.name === 'empty');
+            expect(empty).toMatchObject({ objectCount: 0, logicalBytes: 0 });
+        });
+
+        it('PUT /$/buckets/{id}/policy validates and forwards booleans', async () => {
+            const id = 'a'.repeat(24);
+            const res = await HttpMgmt.handle(1, createRequest('PUT', `/$/buckets/${id}/policy`, { publicRead: true, publicWrite: false }), nullResponse) as any;
+            expect(res).toEqual({ updated: true });
+            expect(databaseBucketAuthMock.setBucketPolicy).toHaveBeenCalledWith(id, { publicRead: true, publicWrite: false });
+        });
+
+        it('PUT /$/buckets/{id}/policy rejects a non-boolean', async () => {
+            const id = 'a'.repeat(24);
+            await expect(HttpMgmt.handle(1, createRequest('PUT', `/$/buckets/${id}/policy`, { publicRead: 'yes' }), nullResponse))
+                .rejects.toThrow(/boolean/);
+        });
+
+        it('POST /$/credentials returns a secret once and stores a hash + validated grants', async () => {
+            const res = await HttpMgmt.handle(1, createRequest('POST', '/$/credentials', {
+                name: 'app', grants: [{ bucket: 'photo', read: true, write: false }, { bucket: '*', read: true, write: false }]
+            }), nullResponse) as any;
+            expect(typeof res.accessKeyId).toBe('string');
+            expect(typeof res.secret).toBe('string');
+            const stored = databaseBucketAuthMock.createCredential.mock.calls[0][0] as any;
+            expect(stored.secretHash).toMatch(/^scrypt\$/);
+            expect(stored).not.toHaveProperty('secret');
+            expect(stored.grants).toHaveLength(2);
+            expect(stored.enabled).toBe(true);
+        });
+
+        it('POST /$/credentials rejects an invalid grant bucket', async () => {
+            await expect(HttpMgmt.handle(1, createRequest('POST', '/$/credentials', {
+                name: 'bad', grants: [{ bucket: 'Bad Name', read: true, write: true }]
+            }), nullResponse)).rejects.toThrow(/valid bucket name/);
+            expect(databaseBucketAuthMock.createCredential).not.toHaveBeenCalled();
+        });
+
+        it('PUT /$/credentials/{id} validates the whole payload before any write', async () => {
+            // Valid grants but a malformed `enabled`: nothing must be written (no partial grant change
+            // that outlives the verify-cache), and the request is rejected.
+            await expect(HttpMgmt.handle(1, createRequest('PUT', '/$/credentials/AKIA123', {
+                grants: [{ bucket: 'photo', read: true, write: false }], enabled: 'yes'
+            }), nullResponse)).rejects.toThrow(/boolean/);
+            expect(databaseBucketAuthMock.setCredentialGrants).not.toHaveBeenCalled();
+            expect(databaseBucketAuthMock.setCredentialEnabled).not.toHaveBeenCalled();
+        });
+
+        it('POST /$/credentials/{id}/rotate issues a fresh secret', async () => {
+            const res = await HttpMgmt.handle(1, createRequest('POST', '/$/credentials/AKIA123/rotate', {}), nullResponse) as any;
+            expect(typeof res.secret).toBe('string');
+            expect(databaseBucketAuthMock.setCredentialSecretHash).toHaveBeenCalledWith('AKIA123', expect.stringMatching(/^scrypt\$/));
+        });
+
+        it('DELETE /$/credentials/{id} removes it', async () => {
+            databaseBucketAuthMock.removeCredential.mockResolvedValue(true as any);
+            const res = await HttpMgmt.handle(1, createRequest('DELETE', '/$/credentials/AKIA123'), nullResponse) as any;
+            expect(res).toEqual({ removed: true });
+            expect(databaseBucketAuthMock.removeCredential).toHaveBeenCalledWith('AKIA123');
+        });
+
+        it('GET and PUT /$/auth/settings read and write the authEnforced flag', async () => {
+            const get = await HttpMgmt.handle(1, createRequest('GET', '/$/auth/settings'), nullResponse) as any;
+            expect(get).toEqual({ authEnforced: false });
+            const put = await HttpMgmt.handle(1, createRequest('PUT', '/$/auth/settings', { authEnforced: true }), nullResponse) as any;
+            expect(put).toEqual({ authEnforced: true });
+            expect(databaseBucketAuthMock.setRuntimeConfig).toHaveBeenCalledWith('authEnforced', true);
+        });
     });

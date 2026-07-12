@@ -15,6 +15,11 @@ export interface ContentDocument {
     name: string;
     isContainer?: boolean;
     isFile?: boolean;
+    // Bucket access policy, meaningful only on a top-level container (the bucket itself). Absent means
+    // "default" -- interpreted as open (public) while authEnforced is false, so behaviour is unchanged
+    // until the policy is explicitly set. publicWrite grants anonymous PUT *and DELETE*.
+    publicRead?: boolean;
+    publicWrite?: boolean;
     size?: number;
     chunkSize?: number;
     sliceSize?: number | null;

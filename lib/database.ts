@@ -10,9 +10,11 @@ import { RuntimeConfigRepository } from './database/runtime-config';
 import { FaultRepository, type FaultDocument, type FaultUpsert } from './database/fault-repository';
 import { StorageStatsRepository } from './database/storage-stats-repository';
 import { AdminTokenRepository, type AdminTokenDocument } from './database/admin-token-repository';
+import { CredentialRepository, type CredentialDocument, type Grant } from './database/credential-repository';
 import type { ContainerPath, ContentDocument, ObjectIdentifier, ObjectVerificationStateUpdate, SliceErrorInfo } from './database/types';
 import type { StorageStatsDelta, StorageStatsSnapshot } from './storage/stats';
 export type { ContentDocument, ObjectVerificationStateUpdate, SliceErrorInfo, SliceErrorCategory, SliceVerificationTimes } from './database/types';
+export type { CredentialDocument, Grant } from './database/credential-repository';
 export type { FaultDocument, FaultUpsert } from './database/fault-repository';
 export type { StorageStatsDelta, StorageStatsSnapshot } from './storage/stats';
 
@@ -28,13 +30,15 @@ export class Database {
         faults: Collection<FaultDocument> | null;
         storageStats: Collection<any> | null;
         adminTokens: Collection<AdminTokenDocument> | null;
+        credentials: Collection<CredentialDocument> | null;
     } = {
         volumes: null,
         content: null,
         runtimeConfig: null,
         faults: null,
         storageStats: null,
-        adminTokens: null
+        adminTokens: null,
+        credentials: null
     };
     private readonly _containerCache = new ContainerCache();
     private _repositories: {
@@ -44,13 +48,15 @@ export class Database {
         faults: FaultRepository | null;
         storageStats: StorageStatsRepository | null;
         adminTokens: AdminTokenRepository | null;
+        credentials: CredentialRepository | null;
     } = {
         volumes: null,
         content: null,
         runtimeConfig: null,
         faults: null,
         storageStats: null,
-        adminTokens: null
+        adminTokens: null,
+        credentials: null
     };
 
     constructor() {
@@ -71,6 +77,7 @@ export class Database {
             this._collections.faults = this._db.collection('faults');
             this._collections.storageStats = this._db.collection('storageStats');
             this._collections.adminTokens = this._db.collection('adminTokens');
+            this._collections.credentials = this._db.collection('credentials');
             this._repositories = {
                 volumes: new VolumeRepository(this._collections.volumes),
                 content: new ContentRepository(
@@ -82,11 +89,13 @@ export class Database {
                 runtimeConfig: new RuntimeConfigRepository(this._collections.runtimeConfig),
                 faults: new FaultRepository(this._collections.faults),
                 storageStats: new StorageStatsRepository(this._collections.storageStats),
-                adminTokens: new AdminTokenRepository(this._collections.adminTokens)
+                adminTokens: new AdminTokenRepository(this._collections.adminTokens),
+                credentials: new CredentialRepository(this._collections.credentials)
             };
             await this.ensureContentIndexes();
             await this.ensureFaultIndexes();
             await this.adminTokenRepository.ensureIndexes();
+            await this.credentialRepository.ensureIndexes();
 
             log('connected');
         }
@@ -165,6 +174,58 @@ export class Database {
 
     async removeAllAdminTokens(): Promise<number> {
         return this.adminTokenRepository.removeAll();
+    }
+
+    // --- object-API credentials ---
+
+    async createCredential(doc: CredentialDocument): Promise<void> {
+        await this.credentialRepository.create(doc);
+    }
+
+    async getCredentialByAccessKeyId(accessKeyId: string): Promise<CredentialDocument | null> {
+        return this.credentialRepository.getByAccessKeyId(accessKeyId);
+    }
+
+    async listCredentials(): Promise<CredentialDocument[]> {
+        return this.credentialRepository.list();
+    }
+
+    async setCredentialEnabled(accessKeyId: string, enabled: boolean): Promise<boolean> {
+        return this.credentialRepository.setEnabled(accessKeyId, enabled);
+    }
+
+    async setCredentialGrants(accessKeyId: string, grants: Grant[]): Promise<boolean> {
+        return this.credentialRepository.setGrants(accessKeyId, grants);
+    }
+
+    async setCredentialSecretHash(accessKeyId: string, secretHash: string): Promise<boolean> {
+        return this.credentialRepository.setSecretHash(accessKeyId, secretHash);
+    }
+
+    async touchCredential(accessKeyId: string, when: Date): Promise<void> {
+        await this.credentialRepository.touch(accessKeyId, when);
+    }
+
+    async removeCredential(accessKeyId: string): Promise<boolean> {
+        return this.credentialRepository.remove(accessKeyId);
+    }
+
+    // --- buckets ---
+
+    async getBucketByName(name: string): Promise<ContentDocument | null> {
+        return this.contentRepository.getBucketByName(name);
+    }
+
+    async getBucketById(id: ObjectIdentifier): Promise<ContentDocument | null> {
+        return this.contentRepository.getBucketById(id);
+    }
+
+    async listBuckets(): Promise<ContentDocument[]> {
+        return this.contentRepository.listBuckets();
+    }
+
+    async setBucketPolicy(id: ObjectIdentifier, policy: { publicRead?: boolean; publicWrite?: boolean }): Promise<boolean> {
+        return this.contentRepository.setBucketPolicy(id, policy);
     }
 
     async getObjectById(id: ObjectIdentifier): Promise<ContentDocument> {
@@ -436,6 +497,19 @@ export class Database {
             this._repositories.adminTokens = new AdminTokenRepository(this.adminTokenCollection);
         }
         return this._repositories.adminTokens;
+    }
+
+    private get credentialsCollection(): Collection<CredentialDocument> {
+        if (!this._collections.credentials)
+            throw new Error('database not initialized');
+        return this._collections.credentials;
+    }
+
+    private get credentialRepository(): CredentialRepository {
+        if (!this._repositories.credentials) {
+            this._repositories.credentials = new CredentialRepository(this.credentialsCollection);
+        }
+        return this._repositories.credentials;
     }
 
     private get volumeRepository(): VolumeRepository {

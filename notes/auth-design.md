@@ -331,6 +331,8 @@ The pipeline is entirely under our control, so there is no need to discover unkn
 4. Flip authEnforced = true, and tighten each bucket's public flags.
 ```
 
+> **⚠️ Phase-5 prerequisite — object-listener TLS.** The object API is plain **HTTP:80**, and object credentials are HTTP **Basic** (`accessKeyId:secret`, base64, *not* encrypted). Flipping `authEnforced` on the plaintext listener would put every credential on the wire in the clear. So before enforcement is relied upon, either the object API must gain a **TLS listener** and clients must use it, **or** the plaintext listener must **reject Basic** (serve only anonymous/public traffic, 400/upgrade-required on `Authorization: Basic`). Enabling `authEnforced` today logs a loud warning to this effect; the model is otherwise built and dark. This is the one real gap between "dark" and "flip".
+
 Keep an **anonymous-request counter per bucket** anyway, surfaced in the UI. Not because we don't know who the consumers are — but because it turns "we've updated everything" into *knowing* we have, and it costs almost nothing at the choke point we're already building.
 
 ---

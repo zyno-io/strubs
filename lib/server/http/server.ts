@@ -13,6 +13,7 @@ import { ObjectHeadRequest } from './object-head-request';
 import { ObjectPutRequest } from './object-put-request';
 import { ObjectDeleteRequest } from './object-delete-request';
 import { ObjectOptionsRequest } from './object-options-request';
+import { authorizeObjectRequest } from './object-authz';
 import { HttpHelpers } from './helpers';
 import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError, HttpTooManyRequestsError } from './errors';
 import { adminAuth, parseCookies, SESSION_COOKIE } from './admin-auth';
@@ -181,6 +182,22 @@ export class HttpServer {
                 return this._outputHttpUnauthorized(res);
         }
 
+        // Bucket authorisation for object-content requests. The single choke point: it runs before the
+        // object handler on any listener that serves content, never on the admin origin or the trusted
+        // socket, and never for /$/ paths (handled above). DARK by default (authEnforced=false) -- it
+        // allows every request and only bumps a per-bucket counter -- so today's behaviour is unchanged
+        // until an operator flips the switch.
+        if (this.role !== 'admin' && !this._trusted && !request.url.startsWith('/$/')) {
+            const decision = await authorizeObjectRequest(request.url, method, request.headers.authorization);
+            if (!decision.allow) {
+                if (decision.status === 401)
+                    return this._outputHttpObjectUnauthorized(res, decision.message);
+                if (decision.status === 503)
+                    return this._outputHttpServiceUnavailable(res, decision.message);
+                return this._outputHttpForbidden(res, decision.message);
+            }
+        }
+
         try {
             await handler(requestId, request, res);
         }
@@ -300,6 +317,23 @@ export class HttpServer {
         // which uses a login page instead. A bare 401 lets the SPA render its login form.
         res.writeHead(401, 'Unauthorized');
         res.end('401');
+    }
+
+    // Object-API 401: DOES carry WWW-Authenticate: Basic, so a browser prompts for credentials and a
+    // public-read bucket keeps working from <img src>. (This is the object origin, not the admin UI.)
+    private _outputHttpObjectUnauthorized(res: HttpResponse, message: string): void {
+        res.writeHead(401, 'Unauthorized', {
+            'WWW-Authenticate': 'Basic realm="strubs"',
+            'Content-Type': 'text/plain'
+        });
+        res.end(message);
+    }
+
+    // Authorization could not be evaluated (e.g. a DB error while enforced). Fail closed with a 503 rather
+    // than serving the object or leaking an unhandled rejection out of the request path.
+    private _outputHttpServiceUnavailable(res: HttpResponse, message: string): void {
+        res.writeHead(503, 'Service Unavailable', { 'Content-Type': 'text/plain' });
+        res.end(message);
     }
 
     private async _handleHttpManagementRequest(requestId: number, req: HttpRequest, res: HttpResponse): Promise<void> {

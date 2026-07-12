@@ -821,6 +821,45 @@ export class ContentRepository {
         return { containersStamped, objectsStamped, skippedContainers };
     }
 
+    // --- buckets (a bucket IS a top-level container: containerId null, isContainer true) ---
+
+    async getBucketByName(name: string): Promise<ContentDocument | null> {
+        const doc = await this.collection.findOne({ containerId: null, isContainer: true, name });
+        return doc ? this.normalize(doc) : null;
+    }
+
+    async getBucketById(id: ObjectIdentifier): Promise<ContentDocument | null> {
+        const mongoId = this.toMongoId(id);
+        if (!mongoId) return null;
+        const doc = await this.collection.findOne({ _id: mongoId, containerId: null, isContainer: true });
+        return doc ? this.normalize(doc) : null;
+    }
+
+    async listBuckets(): Promise<ContentDocument[]> {
+        const docs = await this.collection
+            .find({ containerId: null, isContainer: true }, { projection: { _id: 1, name: 1, publicRead: 1, publicWrite: 1 } })
+            .toArray();
+        return docs.map(doc => this.normalize(doc));
+    }
+
+    // Set a bucket's access policy. This is the ONLY writer of publicRead/publicWrite and it fires only on
+    // an explicit operator action (admin API/UI) -- never automatically -- so it does not mutate existing
+    // data as a side effect of the rollout. Scoped to top-level containers so a nested path can't be
+    // mistaken for a bucket.
+    async setBucketPolicy(id: ObjectIdentifier, policy: { publicRead?: boolean; publicWrite?: boolean }): Promise<boolean> {
+        const mongoId = this.toMongoId(id);
+        if (!mongoId) return false;
+        const set: Record<string, boolean> = {};
+        if (policy.publicRead !== undefined) set.publicRead = policy.publicRead;
+        if (policy.publicWrite !== undefined) set.publicWrite = policy.publicWrite;
+        if (!Object.keys(set).length) return false;
+        const res = await this.collection.updateOne(
+            { _id: mongoId, containerId: null, isContainer: true },
+            { $set: set }
+        );
+        return res.matchedCount === 1;
+    }
+
     // Per-bucket object count and logical size in a single grouped aggregation over the denormalised
     // bucketId -- the number the UI needs, without a recursive walk of tens of thousands of containers.
     async computeBucketStats(): Promise<Array<{ bucketId: string; objectCount: number; logicalBytes: number }>> {

@@ -1,6 +1,11 @@
+import crypto from 'crypto';
 import { promises as fs } from 'fs';
 import path from 'path';
+import { createLogger } from '../../log';
 import { HttpHelpers } from './helpers';
+import { scryptHash } from './secret-hash';
+import { clearCredentialCache, getBucketActivity, invalidateAuthEnforcedCache, isValidBucketName } from './object-authz';
+import type { Grant } from '../../database/credential-repository';
 import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError, HttpTooManyRequestsError } from './errors';
 import { adminAuth, parseCookies, sessionSetCookie, sessionClearCookie, SESSION_COOKIE } from './admin-auth';
 import { ioManager } from '../../io/manager';
@@ -124,6 +129,8 @@ type DebugResponse = {
     priorityStats: Array<{ volumeId: number; highCount: number; waiters: number }>;
     verifyStatus: VerifyVolumesStatus;
 };
+
+const log = createLogger('mgmt');
 
 export class HttpMgmt {
     private static readonly routes: RouteDefinition[] = HttpMgmt.createRoutes();
@@ -399,6 +406,187 @@ export class HttpMgmt {
     // silently break CI); this is the explicit "lock everyone out" action for a suspected compromise.
     private static async handleAdminTokensPurgeRequest(): Promise<{ removed: number }> {
         return { removed: await database.removeAllAdminTokens() };
+    }
+
+    // --- buckets ---
+
+    // List every bucket with its policy, object count + logical size (a single $group on the denormalised
+    // bucketId), and the in-memory anonymous/authenticated request counters. Buckets with zero files
+    // still appear (they have no stats row) so the UI can show and configure them.
+    private static async handleBucketsListRequest(): Promise<{ buckets: unknown[]; enforced: boolean }> {
+        const [buckets, stats, enforced] = await Promise.all([
+            database.listBuckets(),
+            database.computeBucketStats(),
+            database.getRuntimeConfig('authEnforced')
+        ]);
+        const statsById = new Map(stats.map(s => [s.bucketId, s]));
+        const activity = getBucketActivity();
+        const rows = buckets.map(b => {
+            const s = b.id ? statsById.get(b.id) : undefined;
+            return {
+                id: b.id,
+                name: b.name,
+                publicRead: b.publicRead ?? null,     // null = unset (open while dark)
+                publicWrite: b.publicWrite ?? null,
+                objectCount: s?.objectCount ?? 0,
+                logicalBytes: s?.logicalBytes ?? 0,
+                activity: activity[b.name ?? ''] ?? { anon: 0, auth: 0 }
+            };
+        });
+        return { buckets: rows, enforced: enforced === true };
+    }
+
+    private static async handleBucketPolicyRequest(req: HttpRequest, params: { id: string }): Promise<{ updated: boolean }> {
+        const payload = await this.parseJsonBody<{ publicRead?: unknown; publicWrite?: unknown }>(req);
+        const policy: { publicRead?: boolean; publicWrite?: boolean } = {};
+        if (payload.publicRead !== undefined) {
+            if (typeof payload.publicRead !== 'boolean') throw new HttpBadRequestError('publicRead must be a boolean');
+            policy.publicRead = payload.publicRead;
+        }
+        if (payload.publicWrite !== undefined) {
+            if (typeof payload.publicWrite !== 'boolean') throw new HttpBadRequestError('publicWrite must be a boolean');
+            policy.publicWrite = payload.publicWrite;
+        }
+        if (policy.publicRead === undefined && policy.publicWrite === undefined)
+            throw new HttpBadRequestError('publicRead and/or publicWrite is required');
+        const updated = await database.setBucketPolicy(params.id, policy);
+        if (!updated) throw new HttpNotFoundError('bucket not found');
+        return { updated };
+    }
+
+    // --- object-API credentials ---
+
+    private static validateGrants(raw: unknown): Grant[] {
+        if (!Array.isArray(raw))
+            throw new HttpBadRequestError('grants must be an array');
+        return raw.map(g => {
+            if (!g || typeof g !== 'object')
+                throw new HttpBadRequestError('each grant must be an object');
+            const { bucket, read, write } = g as Record<string, unknown>;
+            if (typeof bucket !== 'string' || (bucket !== '*' && !isValidBucketName(bucket)))
+                throw new HttpBadRequestError('grant bucket must be "*" or a valid bucket name');
+            if (typeof read !== 'boolean' || typeof write !== 'boolean')
+                throw new HttpBadRequestError('grant read and write must be booleans');
+            return { bucket, read, write };
+        });
+    }
+
+    private static async handleCredentialsListRequest(): Promise<{ credentials: unknown[] }> {
+        const creds = await database.listCredentials();
+        // secretHash is projected out at the repository; strip _id too and surface only what the UI needs.
+        return {
+            credentials: creds.map(c => ({
+                accessKeyId: c.accessKeyId,
+                name: c.name,
+                grants: c.grants,
+                enabled: c.enabled,
+                createdAt: c.createdAt,
+                lastUsedAt: c.lastUsedAt ?? null,
+                expiresAt: c.expiresAt ?? null
+            }))
+        };
+    }
+
+    // The secret is returned ONCE here and never again (only its scrypt hash is stored).
+    private static async handleCredentialCreateRequest(req: HttpRequest): Promise<{ accessKeyId: string; secret: string }> {
+        const payload = await this.parseJsonBody<{ name?: unknown; grants?: unknown }>(req);
+        const name = typeof payload.name === 'string' && payload.name.trim() ? payload.name.trim() : 'unnamed';
+        const grants = this.validateGrants(payload.grants ?? []);
+        const accessKeyId = crypto.randomBytes(12).toString('base64url');    // 16 chars, opaque
+        const secret = crypto.randomBytes(24).toString('base64url');
+        await database.createCredential({
+            accessKeyId,
+            secretHash: await scryptHash(secret),
+            name,
+            grants,
+            enabled: true,
+            createdAt: new Date()
+        });
+        // Belt-and-suspenders: drop any cached negative so a newly-created credential can never be shadowed
+        // by a stale "no such key" verdict. (Bucket policy is read fresh per request, so it needs no clear.)
+        clearCredentialCache();
+        return { accessKeyId, secret };
+    }
+
+    private static async handleCredentialUpdateRequest(req: HttpRequest, params: { accessKeyId: string }): Promise<{ updated: boolean }> {
+        const payload = await this.parseJsonBody<{ grants?: unknown; enabled?: unknown }>(req);
+        if (payload.grants === undefined && payload.enabled === undefined)
+            throw new HttpBadRequestError('grants and/or enabled is required');
+        // Validate the ENTIRE payload before any DB write, so a malformed `enabled` can't leave a partial
+        // grants change committed with the verify-cache still holding the old (broader) grants.
+        const grants = payload.grants !== undefined ? this.validateGrants(payload.grants) : undefined;
+        let enabled: boolean | undefined;
+        if (payload.enabled !== undefined) {
+            if (typeof payload.enabled !== 'boolean') throw new HttpBadRequestError('enabled must be a boolean');
+            enabled = payload.enabled;
+        }
+
+        let updated = false;
+        try {
+            if (grants !== undefined)
+                updated = await database.setCredentialGrants(params.accessKeyId, grants) || updated;
+            if (enabled !== undefined)
+                updated = await database.setCredentialEnabled(params.accessKeyId, enabled) || updated;
+        }
+        finally {
+            // Clear if ANY write landed -- even if a later write throws -- so a disabled/grant-reduced
+            // credential stops working NOW, not after the verify-cache TTL.
+            if (updated) clearCredentialCache();
+        }
+        if (!updated) throw new HttpNotFoundError('credential not found');
+        return { updated };
+    }
+
+    // Rotate: issue a NEW secret (shown once), invalidating the old one. Returns 404 if the key is gone.
+    private static async handleCredentialRotateRequest(_req: HttpRequest, params: { accessKeyId: string }): Promise<{ accessKeyId: string; secret: string }> {
+        const secret = crypto.randomBytes(24).toString('base64url');
+        const ok = await database.setCredentialSecretHash(params.accessKeyId, await scryptHash(secret));
+        if (!ok) throw new HttpNotFoundError('credential not found');
+        clearCredentialCache();      // the old secret must stop verifying immediately
+        return { accessKeyId: params.accessKeyId, secret };
+    }
+
+    private static async handleCredentialDeleteRequest(_req: HttpRequest, params: { accessKeyId: string }): Promise<{ removed: boolean }> {
+        const removed = await database.removeCredential(params.accessKeyId);
+        if (removed) clearCredentialCache();     // a deleted credential must stop verifying immediately
+        return { removed };
+    }
+
+    // --- auth enforcement setting (the dark switch; NOT flipped here, just exposed) ---
+
+    private static async handleAuthSettingsRequest(): Promise<{ authEnforced: boolean }> {
+        return { authEnforced: (await database.getRuntimeConfig('authEnforced')) === true };
+    }
+
+    private static async handleAuthSettingsSetRequest(req: HttpRequest): Promise<{ authEnforced: boolean }> {
+        const payload = await this.parseJsonBody<{ authEnforced?: unknown }>(req);
+        if (typeof payload.authEnforced !== 'boolean')
+            throw new HttpBadRequestError('authEnforced must be a boolean');
+        if (payload.authEnforced) {
+            // BLOCKER for the real flip (deliberately out of scope here): the object listener is plain
+            // HTTP, so HTTP Basic credentials would cross the wire in cleartext. Before enforcement is
+            // ever relied upon, the object API needs TLS (or the plaintext listener must reject Basic).
+            log.error('WARNING: authEnforced enabled, but the object API is plain HTTP -- Basic '
+                + 'credentials will be sent in CLEARTEXT. Add TLS to the object listener before relying on this.');
+        }
+        await database.setRuntimeConfig('authEnforced', payload.authEnforced);
+        invalidateAuthEnforcedCache();      // so the choke point sees the change without waiting out its TTL
+        return { authEnforced: payload.authEnforced };
+    }
+
+    private static matchBucketPolicyRoute(url: string): { id: string } | null {
+        const match = /^\/\$\/buckets\/([0-9a-f]{24})\/policy$/i.exec(url);
+        return match ? { id: match[1] } : null;
+    }
+
+    private static matchCredentialRoute(url: string): { accessKeyId: string } | null {
+        const match = /^\/\$\/credentials\/([^/]+)$/.exec(url);
+        return match ? { accessKeyId: decodeURIComponent(match[1]) } : null;
+    }
+
+    private static matchCredentialRotateRoute(url: string): { accessKeyId: string } | null {
+        const match = /^\/\$\/credentials\/([^/]+)\/rotate$/.exec(url);
+        return match ? { accessKeyId: decodeURIComponent(match[1]) } : null;
     }
 
     private static async bearerAuthorized(req: HttpRequest): Promise<boolean> {
@@ -1046,6 +1234,51 @@ export class HttpMgmt {
                 method: 'DELETE',
                 match: url => this.matchAdminTokenRoute(url),
                 handler: async (req, params) => this.handleAdminTokenDeleteRequest(req, params as { selector: string })
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/buckets' ? {} : null,
+                handler: async () => this.handleBucketsListRequest()
+            },
+            {
+                method: 'PUT',
+                match: url => this.matchBucketPolicyRoute(url),
+                handler: async (req, params) => this.handleBucketPolicyRequest(req, params as { id: string })
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/credentials' ? {} : null,
+                handler: async () => this.handleCredentialsListRequest()
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/credentials' ? {} : null,
+                handler: async req => this.handleCredentialCreateRequest(req)
+            },
+            {
+                method: 'POST',
+                match: url => this.matchCredentialRotateRoute(url),
+                handler: async (req, params) => this.handleCredentialRotateRequest(req, params as { accessKeyId: string })
+            },
+            {
+                method: 'PUT',
+                match: url => this.matchCredentialRoute(url),
+                handler: async (req, params) => this.handleCredentialUpdateRequest(req, params as { accessKeyId: string })
+            },
+            {
+                method: 'DELETE',
+                match: url => this.matchCredentialRoute(url),
+                handler: async (req, params) => this.handleCredentialDeleteRequest(req, params as { accessKeyId: string })
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/auth/settings' ? {} : null,
+                handler: async () => this.handleAuthSettingsRequest()
+            },
+            {
+                method: 'PUT',
+                match: url => url === '/$/auth/settings' ? {} : null,
+                handler: async req => this.handleAuthSettingsSetRequest(req)
             },
             {
                 method: 'GET',
