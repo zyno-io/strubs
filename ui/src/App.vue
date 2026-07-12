@@ -95,6 +95,7 @@ async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
   if (res.status === 401) {
     authenticated.value = false;
     authChecked.value = true;
+    stopApp();   // session expired: tear down the live-refresh timers rather than poll behind the login screen
   }
   return res;
 }
@@ -1272,6 +1273,183 @@ async function deleteVolume(): Promise<void> {
   }
 }
 
+// ---- Buckets & Access (Phase 4 UI over the dark bucket-auth model) ----
+type BucketRow = {
+  id: string;
+  name: string;
+  publicRead: boolean | null;
+  publicWrite: boolean | null;
+  objectCount: number;
+  logicalBytes: number;
+  activity: { anon: number; auth: number };
+};
+type CredentialGrant = { bucket: string; read: boolean; write: boolean };
+type CredentialRow = {
+  accessKeyId: string;
+  name: string;
+  grants: CredentialGrant[];
+  enabled: boolean;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+};
+
+const accessCollapsed = ref(true);
+const buckets = ref<BucketRow[]>([]);
+const credentials = ref<CredentialRow[]>([]);
+const authEnforced = ref<boolean | null>(null);
+const accessError = ref<string | null>(null);
+const accessBusy = ref(false);
+let accessPollTimer: ReturnType<typeof setInterval> | null = null;
+
+// New-credential form.
+const newCredName = ref('');
+const newCredGrants = ref<CredentialGrant[]>([{ bucket: '*', read: true, write: false }]);
+// A freshly-issued secret is shown ONCE; kept here until the operator dismisses it.
+const issuedSecret = ref<{ accessKeyId: string; secret: string } | null>(null);
+
+async function fetchAccess(): Promise<void> {
+  try {
+    const [bRes, cRes, sRes] = await Promise.all([
+      apiFetch(`${apiBaseUrl}/$/buckets`),
+      apiFetch(`${apiBaseUrl}/$/credentials`),
+      apiFetch(`${apiBaseUrl}/$/auth/settings`)
+    ]);
+    if (!bRes.ok || !cRes.ok || !sRes.ok)
+      throw new Error(`Failed to load access settings (HTTP ${[bRes.status, cRes.status, sRes.status].join('/')})`);
+    const data = await bRes.json();
+    buckets.value = data.buckets;
+    authEnforced.value = data.enforced;
+    credentials.value = (await cRes.json()).credentials;
+    authEnforced.value = (await sRes.json()).authEnforced;
+    accessError.value = null;
+  }
+  catch (err) {
+    // Surface the failure rather than clearing the error and rendering stale state as if healthy.
+    accessError.value = err instanceof Error ? err.message : 'Failed to load access settings';
+  }
+}
+
+// Checkbox handler for the bucket policy toggles. publicWrite gets an explicit, visible confirmation
+// (not just a tooltip) because it also grants anonymous DELETE. Reverts the checkbox on cancel/failure.
+async function onPolicyToggle(bucket: BucketRow, field: 'publicRead' | 'publicWrite', event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const value = input.checked;
+  if (field === 'publicWrite' && value) {
+    if (!confirm(`Make bucket "${bucket.name}" publicly writable?\n\nThis ALSO allows anonymous DELETE — anyone could overwrite or delete any object in this bucket.`)) {
+      input.checked = false;
+      return;
+    }
+  }
+  await setBucketPolicy(bucket, field, value);
+  // Reflect the authoritative state: on failure setBucketPolicy left bucket[field] unchanged, so snap
+  // the checkbox back to it.
+  input.checked = bucket[field] === true;
+}
+
+async function setBucketPolicy(bucket: BucketRow, field: 'publicRead' | 'publicWrite', value: boolean): Promise<void> {
+  accessBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/buckets/${bucket.id}/policy`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [field]: value })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    bucket[field] = value;
+  }
+  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to update bucket policy'; }
+  finally { accessBusy.value = false; }
+}
+
+function addNewGrant(): void {
+  newCredGrants.value.push({ bucket: '*', read: true, write: false });
+}
+function removeNewGrant(index: number): void {
+  newCredGrants.value.splice(index, 1);
+}
+
+async function createCredential(): Promise<void> {
+  accessBusy.value = true;
+  accessError.value = null;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/credentials`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newCredName.value.trim() || 'unnamed', grants: newCredGrants.value })
+    });
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+    issuedSecret.value = await res.json();          // shown once
+    newCredName.value = '';
+    newCredGrants.value = [{ bucket: '*', read: true, write: false }];
+    await fetchAccess();
+  }
+  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to create credential'; }
+  finally { accessBusy.value = false; }
+}
+
+async function toggleCredentialEnabled(cred: CredentialRow): Promise<void> {
+  accessBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/credentials/${encodeURIComponent(cred.accessKeyId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !cred.enabled })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    cred.enabled = !cred.enabled;
+  }
+  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to update credential'; }
+  finally { accessBusy.value = false; }
+}
+
+async function rotateCredential(cred: CredentialRow): Promise<void> {
+  if (!confirm(`Rotate the secret for "${cred.name}"? The current secret stops working immediately.`)) return;
+  accessBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/credentials/${encodeURIComponent(cred.accessKeyId)}/rotate`, { method: 'POST' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    issuedSecret.value = await res.json();          // new secret, shown once
+  }
+  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to rotate credential'; }
+  finally { accessBusy.value = false; }
+}
+
+async function deleteCredential(cred: CredentialRow): Promise<void> {
+  if (!confirm(`Delete credential "${cred.name}" (${cred.accessKeyId})? This cannot be undone.`)) return;
+  accessBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/credentials/${encodeURIComponent(cred.accessKeyId)}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    await fetchAccess();
+  }
+  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to delete credential'; }
+  finally { accessBusy.value = false; }
+}
+
+async function setAuthEnforced(value: boolean): Promise<void> {
+  const msg = value
+    ? 'Enable auth enforcement?\n\nThe object API is plain HTTP, so Basic credentials will cross the wire in CLEARTEXT. Only do this once the object API has TLS (or is on a trusted network). Anonymous access to non-public buckets will start being rejected immediately.'
+    : 'Disable auth enforcement? The object API will accept all requests again.';
+  if (!confirm(msg)) return;
+  accessBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/auth/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ authEnforced: value })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    authEnforced.value = (await res.json()).authEnforced;
+  }
+  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to update enforcement'; }
+  finally { accessBusy.value = false; }
+}
+
+function copySecret(secret: string): void {
+  void navigator.clipboard?.writeText(secret).catch(() => undefined);
+}
+
 // Load data and start the live-refresh timers. Called once authenticated (on mount if the session is
 // already valid, or right after a successful login).
 function startApp(): void {
@@ -1280,15 +1458,20 @@ function startApp(): void {
   fetchStorageStats();
   fetchFreezeStatus();
   fetchRebalanceStatus();
+  fetchAccess();
   if (verifyPollTimer === null)
     verifyPollTimer = setInterval(() => { fetchVerifyStatus(); fetchFreezeStatus(); fetchRebalanceStatus(); }, 3000);
   if (storageStatsPollTimer === null)
     storageStatsPollTimer = setInterval(fetchStorageStats, 10000);
+  // Slower poll: bucket activity counters and credential/last-used state don't need 3s cadence.
+  if (accessPollTimer === null)
+    accessPollTimer = setInterval(fetchAccess, 15000);
 }
 
 function stopApp(): void {
   if (verifyPollTimer !== null) { clearInterval(verifyPollTimer); verifyPollTimer = null; }
   if (storageStatsPollTimer !== null) { clearInterval(storageStatsPollTimer); storageStatsPollTimer = null; }
+  if (accessPollTimer !== null) { clearInterval(accessPollTimer); accessPollTimer = null; }
 }
 
 onMounted(async () => {
@@ -1824,6 +2007,168 @@ onUnmounted(() => {
                   <span class="value comment-value" :title="entry.volume.comment">{{ entry.volume.comment }}</span>
                 </div>
               </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Buckets & Access: bucket sizes/policy, credentials, and the auth-enforcement switch. -->
+    <section class="section access-panel">
+      <div class="verify-header" @click="accessCollapsed = !accessCollapsed">
+        <div class="verify-title">
+          <span class="collapse-chevron">{{ accessCollapsed ? '▸' : '▾' }}</span>
+          <h2>Buckets &amp; Access</h2>
+          <span class="verify-state" :class="authEnforced ? 'running' : 'idle'">
+            {{ authEnforced === null ? '—' : (authEnforced ? 'Enforced' : 'Open') }}
+          </span>
+        </div>
+      </div>
+
+      <!-- Loud banner while the object API is unauthenticated. Rendered OUTSIDE the collapsible body so it
+           is visible even when the panel is collapsed (which it is by default). -->
+      <div v-if="authEnforced === false" class="access-banner warn banner-standalone">
+        <strong>The object API is unauthenticated.</strong>
+        Every bucket is publicly readable and writable regardless of the policy toggles below —
+        they take effect only once enforcement is enabled.
+      </div>
+
+      <div v-if="!accessCollapsed" class="access-body">
+        <div v-if="accessError" class="access-banner error">{{ accessError }}</div>
+
+        <!-- Enforcement switch -->
+        <div class="access-subsection">
+          <div class="access-enforce-row">
+            <div>
+              <div class="access-subtitle">Auth enforcement</div>
+              <div class="access-hint">
+                While off, all object requests are allowed (today's behaviour). Turning it on begins
+                rejecting anonymous access to non-public buckets.
+                <em>The object API is plain HTTP — Basic credentials cross the wire in cleartext.</em>
+              </div>
+            </div>
+            <button
+              class="access-toggle-btn"
+              :class="{ on: authEnforced }"
+              :disabled="accessBusy || authEnforced === null"
+              @click="setAuthEnforced(!authEnforced)"
+            >
+              {{ authEnforced ? 'Enforced' : 'Enable enforcement' }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Buckets -->
+        <div class="access-subsection">
+          <div class="access-subtitle">Buckets</div>
+          <table class="access-table">
+            <thead>
+              <tr>
+                <th>Bucket</th>
+                <th class="num">Objects</th>
+                <th class="num">Size</th>
+                <th>Public read</th>
+                <th>Public write</th>
+                <th class="num" title="Requests seen since the server last started">Anon / Auth</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="b in buckets" :key="b.id">
+                <td class="mono">{{ b.name }}</td>
+                <td class="num">{{ b.objectCount.toLocaleString() }}</td>
+                <td class="num">{{ formatBytes(b.logicalBytes) }}</td>
+                <td>
+                  <label class="access-switch">
+                    <input
+                      type="checkbox"
+                      :checked="b.publicRead === true"
+                      :disabled="accessBusy"
+                      @change="onPolicyToggle(b, 'publicRead', $event)"
+                    />
+                    <span>{{ b.publicRead === null ? 'unset' : (b.publicRead ? 'public' : 'private') }}</span>
+                  </label>
+                </td>
+                <td>
+                  <label class="access-switch" title="Public write also allows anonymous DELETE">
+                    <input
+                      type="checkbox"
+                      :checked="b.publicWrite === true"
+                      :disabled="accessBusy"
+                      @change="onPolicyToggle(b, 'publicWrite', $event)"
+                    />
+                    <span :class="{ 'write-warn': b.publicWrite === true }">
+                      {{ b.publicWrite === null ? 'unset' : (b.publicWrite ? 'public — incl. anon DELETE' : 'private') }}
+                    </span>
+                  </label>
+                </td>
+                <td class="num">{{ b.activity.anon.toLocaleString() }} / {{ b.activity.auth.toLocaleString() }}</td>
+              </tr>
+              <tr v-if="!buckets.length"><td colspan="6" class="access-empty">No buckets.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Credentials -->
+        <div class="access-subsection">
+          <div class="access-subtitle">Credentials</div>
+
+          <!-- A newly-issued secret, shown once. -->
+          <div v-if="issuedSecret" class="access-banner secret">
+            <div><strong>Secret for {{ issuedSecret.accessKeyId }}</strong> — copy it now, it is not shown again.</div>
+            <div class="secret-row">
+              <code class="mono">{{ issuedSecret.secret }}</code>
+              <button class="access-mini-btn" @click="copySecret(issuedSecret.secret)">Copy</button>
+              <button class="access-mini-btn" @click="issuedSecret = null">Dismiss</button>
+            </div>
+          </div>
+
+          <table class="access-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Access key</th>
+                <th>Grants</th>
+                <th>Last used</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="c in credentials" :key="c.accessKeyId" :class="{ disabled: !c.enabled }">
+                <td>{{ c.name }}</td>
+                <td class="mono">{{ c.accessKeyId }}</td>
+                <td>
+                  <span v-for="(g, gi) in c.grants" :key="gi" class="grant-pill">
+                    {{ g.bucket }}:{{ g.read ? 'r' : '' }}{{ g.write ? 'w' : '' }}
+                  </span>
+                </td>
+                <td>{{ formatDateTime(c.lastUsedAt) }}</td>
+                <td class="access-actions">
+                  <button class="access-mini-btn" :disabled="accessBusy" @click="toggleCredentialEnabled(c)">
+                    {{ c.enabled ? 'Disable' : 'Enable' }}
+                  </button>
+                  <button class="access-mini-btn" :disabled="accessBusy" @click="rotateCredential(c)">Rotate</button>
+                  <button class="access-mini-btn danger" :disabled="accessBusy" @click="deleteCredential(c)">Delete</button>
+                </td>
+              </tr>
+              <tr v-if="!credentials.length"><td colspan="5" class="access-empty">No credentials.</td></tr>
+            </tbody>
+          </table>
+
+          <!-- Create form -->
+          <div class="access-create">
+            <div class="access-subtitle small">New credential</div>
+            <div class="access-create-row">
+              <input v-model="newCredName" class="access-input" placeholder="Name (e.g. photo-app)" />
+            </div>
+            <div v-for="(g, gi) in newCredGrants" :key="gi" class="access-grant-row">
+              <input v-model="g.bucket" class="access-input grant-bucket" placeholder="bucket or *" />
+              <label class="access-switch"><input type="checkbox" v-model="g.read" /><span>read</span></label>
+              <label class="access-switch"><input type="checkbox" v-model="g.write" /><span>write</span></label>
+              <button class="access-mini-btn" :disabled="newCredGrants.length <= 1" @click="removeNewGrant(gi)">✕</button>
+            </div>
+            <div class="access-create-row">
+              <button class="access-mini-btn" @click="addNewGrant">+ grant</button>
+              <button class="access-btn primary" :disabled="accessBusy" @click="createCredential">Create credential</button>
             </div>
           </div>
         </div>
@@ -3287,4 +3632,58 @@ h2 {
   outline: none;
   border-color: #2196F3;
 }
+
+/* --- Buckets & Access panel --- */
+.access-body { padding: 4px 18px 18px; display: flex; flex-direction: column; gap: 20px; }
+.access-banner { padding: 10px 12px; border-radius: 6px; font-size: 13px; line-height: 1.45; }
+.access-banner.warn { background: #fff8e1; border: 1px solid #ffe082; color: #7a5b00; }
+.access-banner.error { background: #fdecea; border: 1px solid #f5c6cb; color: #a12622; }
+.access-banner.secret { background: #e8f5e9; border: 1px solid #a5d6a7; color: #1b5e20; display: flex; flex-direction: column; gap: 8px; }
+.access-banner.banner-standalone { margin: 0 18px 4px; }
+.write-warn { color: #c62828; font-weight: 600; }
+.secret-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.secret-row code { background: #fff; padding: 4px 8px; border-radius: 4px; border: 1px solid #c8e6c9; word-break: break-all; }
+
+.access-subsection { display: flex; flex-direction: column; gap: 10px; }
+.access-subtitle { font-size: 14px; font-weight: 600; color: #333; }
+.access-subtitle.small { font-size: 13px; color: #555; }
+.access-hint { font-size: 12px; color: #777; line-height: 1.5; max-width: 640px; }
+.access-hint em { color: #a12622; font-style: normal; }
+
+.access-enforce-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.access-toggle-btn {
+  padding: 8px 16px; border-radius: 6px; border: 1px solid #ccc; background: #f5f5f5;
+  cursor: pointer; font-size: 13px; font-weight: 600; white-space: nowrap;
+}
+.access-toggle-btn.on { background: #e53935; border-color: #e53935; color: #fff; }
+.access-toggle-btn:disabled { opacity: 0.5; cursor: default; }
+
+.access-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.access-table th, .access-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #eee; }
+.access-table th { color: #888; font-weight: 600; font-size: 12px; }
+.access-table th.num, .access-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.access-table tr.disabled td { opacity: 0.5; }
+.access-empty { color: #999; text-align: center; padding: 14px; }
+.mono { font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; }
+
+.access-switch { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; color: #555; }
+.grant-pill { display: inline-block; background: #eef3fb; color: #2c5aa0; border-radius: 4px; padding: 1px 6px; margin: 1px 3px 1px 0; font-size: 11px; font-family: ui-monospace, monospace; }
+
+.access-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.access-mini-btn {
+  padding: 4px 10px; border-radius: 5px; border: 1px solid #ccc; background: #fafafa;
+  cursor: pointer; font-size: 12px;
+}
+.access-mini-btn:hover { background: #f0f0f0; }
+.access-mini-btn.danger { color: #c62828; border-color: #ef9a9a; }
+.access-mini-btn:disabled { opacity: 0.5; cursor: default; }
+
+.access-create { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; padding-top: 12px; border-top: 1px dashed #e0e0e0; }
+.access-create-row { display: flex; align-items: center; gap: 8px; }
+.access-grant-row { display: flex; align-items: center; gap: 12px; }
+.access-input { padding: 6px 9px; border: 1px solid #ccc; border-radius: 5px; font-size: 13px; }
+.access-input.grant-bucket { width: 160px; }
+.access-btn { padding: 7px 14px; border-radius: 6px; border: 1px solid #ccc; background: #f5f5f5; cursor: pointer; font-size: 13px; }
+.access-btn.primary { background: #2196F3; border-color: #2196F3; color: #fff; font-weight: 600; }
+.access-btn:disabled { opacity: 0.5; cursor: default; }
 </style>
