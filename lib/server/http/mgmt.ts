@@ -132,6 +132,10 @@ type DebugResponse = {
 
 const log = createLogger('mgmt');
 
+// Per-bucket counts/sizes are a $group over every file in the array. Cache them: they do not move fast
+// enough to justify re-scanning 3.5M documents on every UI poll.
+const BUCKET_STATS_TTL_MS = 60_000;
+
 export class HttpMgmt {
     private static readonly routes: RouteDefinition[] = HttpMgmt.createRoutes();
 
@@ -415,30 +419,47 @@ export class HttpMgmt {
 
     // --- buckets ---
 
-    // List every bucket with its policy, object count + logical size (a single $group on the denormalised
-    // bucketId), and the in-memory anonymous/authenticated request counters. Buckets with zero files
-    // still appear (they have no stats row) so the UI can show and configure them.
+    // The bucket LIST: names, policy, and request counters. Deliberately does NOT compute object counts
+    // and sizes -- that is a $group across 3.5M documents, and making the UI wait for it just to render
+    // seven bucket names and their toggles is the wrong trade. The counts come from /$/buckets/stats,
+    // which the UI fetches separately and merges in when it arrives.
     private static async handleBucketsListRequest(): Promise<{ buckets: unknown[]; enforced: boolean }> {
-        const [buckets, stats, enforced] = await Promise.all([
+        const [buckets, enforced] = await Promise.all([
             database.listBuckets(),
-            database.computeBucketStats(),
             database.getRuntimeConfig('authEnforced')
         ]);
-        const statsById = new Map(stats.map(s => [s.bucketId, s]));
         const activity = getBucketActivity();
-        const rows = buckets.map(b => {
-            const s = b.id ? statsById.get(b.id) : undefined;
-            return {
-                id: b.id,
-                name: b.name,
-                publicRead: b.publicRead ?? null,     // null = unset (open while dark)
-                publicWrite: b.publicWrite ?? null,
-                objectCount: s?.objectCount ?? 0,
-                logicalBytes: s?.logicalBytes ?? 0,
-                activity: activity[b.name ?? ''] ?? { anon: 0, auth: 0 }
-            };
-        });
+        const rows = buckets.map(b => ({
+            id: b.id,
+            name: b.name,
+            publicRead: b.publicRead ?? null,     // null = unset (open while dark)
+            publicWrite: b.publicWrite ?? null,
+            activity: activity[b.name ?? ''] ?? { anon: 0, auth: 0 }
+        }));
         return { buckets: rows, enforced: enforced === true };
+    }
+
+    // Per-bucket object count + logical size. This is the expensive one (a $group over every file), so it
+    // is cached: the UI polls, and the numbers do not move fast enough to justify re-scanning the
+    // collection every few seconds.
+    private static bucketStatsCache: { at: number; rows: Array<{ bucketId: string; objectCount: number; logicalBytes: number }> } | null = null;
+    private static bucketStatsInFlight: Promise<Array<{ bucketId: string; objectCount: number; logicalBytes: number }>> | null = null;
+
+    private static async handleBucketStatsRequest(): Promise<{ stats: unknown[] }> {
+        const now = Date.now();
+        if (this.bucketStatsCache && now - this.bucketStatsCache.at < BUCKET_STATS_TTL_MS)
+            return { stats: this.bucketStatsCache.rows };
+
+        // Single-flight: several browser tabs polling at once must not each kick off the aggregation.
+        if (!this.bucketStatsInFlight) {
+            this.bucketStatsInFlight = database.computeBucketStats()
+                .then(rows => {
+                    this.bucketStatsCache = { at: Date.now(), rows };
+                    return rows;
+                })
+                .finally(() => { this.bucketStatsInFlight = null; });
+        }
+        return { stats: await this.bucketStatsInFlight };
     }
 
     private static async handleBucketPolicyRequest(req: HttpRequest, params: { id: string }): Promise<{ updated: boolean }> {
@@ -457,6 +478,49 @@ export class HttpMgmt {
         const updated = await database.setBucketPolicy(params.id, policy);
         if (!updated) throw new HttpNotFoundError('bucket not found');
         return { updated };
+    }
+
+    // Browse a container's contents, like a file explorer. `path` is a raw storage path ('' = the root,
+    // which lists the buckets). Paginated by name.
+    //
+    // The path is RE-TRAVERSED on every call rather than trusted: the UI deep-links a path in its URL, and
+    // a link to a since-deleted folder must resolve to "gone", never to some other folder that now
+    // occupies part of the chain.
+    private static async handleBrowseRequest(req: HttpRequest): Promise<{
+        path: string;
+        entries: unknown[];
+        hasMore: boolean;
+    }> {
+        const rawPath = typeof req.params.path === 'string' ? req.params.path : '';
+        const after = typeof req.params.after === 'string' && req.params.after ? req.params.after : undefined;
+        const limit = typeof req.params.limit === 'string' ? parseInt(req.params.limit, 10) : undefined;
+
+        const path = rawPath.replace(/^\/+|\/+$/g, '');
+
+        let containerId: string | null | undefined = null;
+        if (path) {
+            containerId = await database.resolveContainerStrict(path);
+            if (containerId === undefined)
+                throw new HttpNotFoundError(`no such path: ${path}`);
+        }
+
+        const { entries, hasMore } = await database.listContainerEntries(containerId ?? null, {
+            after,
+            limit: Number.isFinite(limit) ? limit : undefined
+        });
+
+        return {
+            path,
+            hasMore,
+            entries: entries.map(e => ({
+                id: e.id,
+                name: e.name,
+                isContainer: e.isContainer === true,
+                isFile: e.isFile === true,
+                size: e.size ?? null,
+                mime: e.mime ?? null
+            }))
+        };
     }
 
     // --- object-API credentials ---
@@ -1249,6 +1313,16 @@ export class HttpMgmt {
                 method: 'PUT',
                 match: url => this.matchBucketPolicyRoute(url),
                 handler: async (req, params) => this.handleBucketPolicyRequest(req, params as { id: string })
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/buckets/stats' ? {} : null,
+                handler: async () => this.handleBucketStatsRequest()
+            },
+            {
+                method: 'GET',
+                match: url => url.split('?')[0] === '/$/browse' ? {} : null,
+                handler: async req => this.handleBrowseRequest(req)
             },
             {
                 method: 'GET',

@@ -26,6 +26,9 @@ class FakeContentCollection {
                 if ('$ne' in cond) {
                     if (this.eq(value, cond.$ne)) return false;
                 }
+                if ('$gt' in cond) {        // the name cursor used to page a container's entries
+                    if (!(value > cond.$gt)) return false;
+                }
             }
             else if (!this.eq(value, cond)) {
                 return false;
@@ -45,8 +48,17 @@ class FakeContentCollection {
         return this.docs.find(doc => this.matches(doc, filter)) ?? null;
     }
 
-    find(filter: Record<string, any>) {
-        const matched = this.docs.filter(doc => this.matches(doc, filter));
+    find(filter: Record<string, any>, opts?: { sort?: Record<string, 1 | -1>; limit?: number }) {
+        let matched = this.docs.filter(doc => this.matches(doc, filter));
+        const sortKey = opts?.sort ? Object.keys(opts.sort)[0] : null;
+        if (sortKey) {
+            const dir = (opts!.sort as any)[sortKey];
+            matched = [...matched].sort((a, b) => {
+                const av = (a as any)[sortKey], bv = (b as any)[sortKey];
+                return (av < bv ? -1 : av > bv ? 1 : 0) * dir;
+            });
+        }
+        if (opts?.limit) matched = matched.slice(0, opts.limit);
         return { toArray: async () => matched.map(doc => ({ ...doc })) };
     }
 
@@ -276,6 +288,72 @@ describe('bucketId denormalisation', () => {
             expect(res.skippedContainers).toBe(1);
             expect(collection.docs.find(d => d.name === 'lost')!.bucketId).toBeUndefined();
             expect(collection.docs.find(d => d.name === 'x.bin')!.bucketId).toBeUndefined();
+        });
+    });
+
+    // The admin UI deep-links a container path in its URL. Restoring that link must ESTABLISH that the
+    // path still exists -- which means asking the database, not the cache. The ordinary resolver trusts a
+    // cache hit and walks on without a query (correct for the write path); here that would answer "yes"
+    // for a folder deleted a minute ago, and the browser would then render a container that is gone.
+    describe('resolveContainerStrict (deep-link restore)', () => {
+        it('resolves an existing path, and returns null for the root', async () => {
+            await repo.resolveContainerWithBucket('photo/2024', true);
+            const spain = collection.docs.find(d => d.name === '2024')!;
+
+            expect(await repo.resolveContainerStrict('photo/2024')).toBe((spain._id as ObjectId).toHexString());
+            expect(await repo.resolveContainerStrict('')).toBeNull();          // the root, not "missing"
+        });
+
+        it('returns undefined for a path whose chain is broken', async () => {
+            await repo.resolveContainerWithBucket('photo/2024', true);
+            expect(await repo.resolveContainerStrict('photo/gone')).toBeUndefined();
+            expect(await repo.resolveContainerStrict('nosuchbucket')).toBeUndefined();
+        });
+
+        it('does NOT trust the container cache: a cached-but-deleted folder resolves as GONE', async () => {
+            // Walk it once so the cache is warm.
+            await repo.resolveContainerWithBucket('photo/2024', true);
+            expect(await repo.resolveContainerStrict('photo/2024')).toBeTruthy();
+
+            // Now the folder is deleted from the database -- but it is still in the process-local cache.
+            const idx = collection.docs.findIndex(d => d.name === '2024');
+            collection.docs.splice(idx, 1);
+
+            // The ordinary resolver would still say it exists (cache hit). The strict one must not.
+            expect(await repo.resolveContainerStrict('photo/2024')).toBeUndefined();
+        });
+
+        it('refuses to treat a FILE as a container', async () => {
+            const { bucketId } = await repo.resolveContainerWithBucket('photo', true);
+            await repo.createObjectRecord({
+                id: new ObjectId().toHexString(),
+                containerId: bucketId,
+                bucketId,
+                isFile: true,
+                name: 'cat.jpg'
+            } as any);
+
+            expect(await repo.resolveContainerStrict('photo/cat.jpg')).toBeUndefined();
+        });
+    });
+
+    describe('listContainerEntries', () => {
+        it('pages by name and reports whether more remain', async () => {
+            const container = new ObjectId();
+            for (const name of ['a', 'b', 'c', 'd', 'e'])
+                collection.docs.push({ _id: new ObjectId(), containerId: container, name, isFile: true, size: 1 });
+
+            const first = await repo.listContainerEntries(container, { limit: 2 });
+            expect(first.entries.map(e => e.name)).toEqual(['a', 'b']);
+            expect(first.hasMore).toBe(true);
+
+            const next = await repo.listContainerEntries(container, { limit: 2, after: 'b' });
+            expect(next.entries.map(e => e.name)).toEqual(['c', 'd']);
+            expect(next.hasMore).toBe(true);
+
+            const last = await repo.listContainerEntries(container, { limit: 2, after: 'd' });
+            expect(last.entries.map(e => e.name)).toEqual(['e']);
+            expect(last.hasMore).toBe(false);      // the extra-fetch trick, not a second count query
         });
     });
 

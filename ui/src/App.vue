@@ -14,7 +14,6 @@ const creatingVolumes = ref<boolean>(false);
 // Persisted UI preferences (survive reload). Read once on init, written by the
 // watcher below. Kept tolerant of unavailable/throwing localStorage.
 const SORT_BY_KEY = 'strubs.volumes.sortBy';
-const STORAGE_TAB_KEY = 'strubs.storage.tab';
 const VOLUMES_VIEW_KEY = 'strubs.volumes.view';
 
 function loadPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
@@ -32,22 +31,17 @@ const sortBy = ref<'volumeLabel' | 'volumeId' | 'name' | 'path'>(
   loadPref(SORT_BY_KEY, ['volumeLabel', 'volumeId', 'name', 'path'] as const, 'volumeLabel')
 );
 
-// Active tab within the Storage panel
-const storageTab = ref<'overview' | 'volumes'>(
-  loadPref(STORAGE_TAB_KEY, ['overview', 'volumes'] as const, 'overview')
-);
-
 // Which rendering of the volumes list is active: 'table' or 'grid' (the tiles).
 // Both render the same unified row list (sortedStorageRows).
 const volumesView = ref<'table' | 'grid'>(
   loadPref(VOLUMES_VIEW_KEY, ['table', 'grid'] as const, 'table')
 );
 
-// Persist the view/tab/sort preferences whenever they change.
-watch([sortBy, storageTab, volumesView], () => {
+// Persist the view/sort preferences whenever they change. (The active TAB lives in the URL now, not
+// localStorage -- see parseHash/writeHash.)
+watch([sortBy, volumesView], () => {
   try {
     localStorage.setItem(SORT_BY_KEY, sortBy.value);
-    localStorage.setItem(STORAGE_TAB_KEY, storageTab.value);
     localStorage.setItem(VOLUMES_VIEW_KEY, volumesView.value);
   } catch {
     // Ignore persistence failures
@@ -189,10 +183,6 @@ const concurrencyPending = ref<boolean>(false);
 const maintenanceFrozen = ref<boolean | null>(null);
 const freezePending = ref<boolean>(false);
 
-// The maintenance panel (verify + freeze) collapses when everything is nominal — nothing verifying and
-// maintenance enabled (not frozen) — and auto-expands when a verify is running or maintenance is frozen.
-const maintenanceCollapsed = ref<boolean>(true);
-
 // Several kinds of maintenance can be in flight, so the header just says whether ANY is — the detail
 // lives in the panels below (and in the tooltip).
 const maintenanceActivity = computed<string[]>(() => {
@@ -204,10 +194,6 @@ const maintenanceActivity = computed<string[]>(() => {
   return what;
 });
 const maintenanceActive = computed(() => maintenanceActivity.value.length > 0);
-
-const maintenanceNominal = computed(() =>
-  !verifyStatus.value?.running && !rebalanceStatus.value?.running && maintenanceFrozen.value === false);
-watch(maintenanceNominal, nominal => { maintenanceCollapsed.value = nominal; }, { immediate: true });
 
 // Fraction of this run's work already done. bytesToMove shrinks as the job works, so moved/(moved+left)
 // is a true progress figure — and it stays honest across a restart, since bytesToMove is recomputed
@@ -1273,15 +1259,59 @@ async function deleteVolume(): Promise<void> {
   }
 }
 
+// ---- Top-level tabs, each with its own route ----
+//
+// The tab (and, inside Buckets, the browsed path) lives in the URL hash, so a refresh puts you back
+// where you were. The path is never trusted on the way back in: it is re-traversed against the server,
+// so a deep link to a since-deleted folder resolves to "gone" rather than silently landing somewhere
+// else that now occupies part of the chain.
+type MainTab = 'overview' | 'maintenance' | 'volumes' | 'buckets' | 'credentials';
+const MAIN_TABS: MainTab[] = ['overview', 'maintenance', 'volumes', 'buckets', 'credentials'];
+const activeTab = ref<MainTab>('overview');
+
+function parseHash(): { tab: MainTab; path: string } {
+  const raw = window.location.hash.replace(/^#\/?/, '');
+  const [tab = '', ...rest] = raw.split('/');
+  const known = (MAIN_TABS as string[]).includes(tab) ? (tab as MainTab) : 'overview';
+  let path = '';
+  try { path = rest.filter(Boolean).map(decodeURIComponent).join('/'); }
+  catch { path = ''; }   // a malformed %-escape must not wedge the app
+  return { tab: known, path };
+}
+
+function writeHash(tab: MainTab, path = ''): void {
+  const suffix = path ? '/' + path.split('/').map(encodeURIComponent).join('/') : '';
+  const next = `#/${tab}${suffix}`;
+  if (window.location.hash !== next)
+    window.location.hash = next;
+}
+
+function selectTab(tab: MainTab): void {
+  activeTab.value = tab;
+  writeHash(tab, tab === 'buckets' ? browsePath.value : '');
+  if (tab === 'buckets' && !buckets.value.length) void fetchBuckets();
+  if (tab === 'credentials' && !credentials.value.length) void fetchCredentials();
+}
+
 // ---- Buckets & Access (Phase 4 UI over the dark bucket-auth model) ----
 type BucketRow = {
   id: string;
   name: string;
   publicRead: boolean | null;
   publicWrite: boolean | null;
-  objectCount: number;
-  logicalBytes: number;
+  // Null until the (expensive) stats aggregation comes back -- names and policy render immediately.
+  objectCount: number | null;
+  logicalBytes: number | null;
   activity: { anon: number; auth: number };
+};
+
+type BrowseEntry = {
+  id: string;
+  name: string;
+  isContainer: boolean;
+  isFile: boolean;
+  size: number | null;
+  mime: string | null;
 };
 type CredentialGrant = { bucket: string; read: boolean; write: boolean };
 type CredentialRow = {
@@ -1294,11 +1324,13 @@ type CredentialRow = {
   expiresAt: string | null;
 };
 
-const accessCollapsed = ref(true);
 const buckets = ref<BucketRow[]>([]);
 const credentials = ref<CredentialRow[]>([]);
 const authEnforced = ref<boolean | null>(null);
-const accessError = ref<string | null>(null);
+// Separate errors per tab: they render on different tabs, so sharing one ref meant a credentials failure
+// could appear on Buckets, and a successful bucket load could silently clear a credentials error.
+const bucketError = ref<string | null>(null);
+const credentialError = ref<string | null>(null);
 const accessBusy = ref(false);
 let accessPollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -1308,26 +1340,159 @@ const newCredGrants = ref<CredentialGrant[]>([{ bucket: '*', read: true, write: 
 // A freshly-issued secret is shown ONCE; kept here until the operator dismisses it.
 const issuedSecret = ref<{ accessKeyId: string; secret: string } | null>(null);
 
-async function fetchAccess(): Promise<void> {
+// Bucket names + policy + enforcement. Fast: the server deliberately leaves the object counts out of
+// this, because computing them is a $group across every file in the array (~4s) and there is no reason
+// to make the toggles wait on it.
+async function fetchBuckets(): Promise<void> {
   try {
-    const [bRes, cRes, sRes] = await Promise.all([
-      apiFetch(`${apiBaseUrl}/$/buckets`),
-      apiFetch(`${apiBaseUrl}/$/credentials`),
-      apiFetch(`${apiBaseUrl}/$/auth/settings`)
-    ]);
-    if (!bRes.ok || !cRes.ok || !sRes.ok)
-      throw new Error(`Failed to load access settings (HTTP ${[bRes.status, cRes.status, sRes.status].join('/')})`);
-    const data = await bRes.json();
-    buckets.value = data.buckets;
+    const res = await apiFetch(`${apiBaseUrl}/$/buckets`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const statsById = new Map(buckets.value.map(b => [b.id, b]));   // keep counts we already have
+    buckets.value = data.buckets.map((b: BucketRow) => ({
+      ...b,
+      objectCount: statsById.get(b.id)?.objectCount ?? null,
+      logicalBytes: statsById.get(b.id)?.logicalBytes ?? null
+    }));
     authEnforced.value = data.enforced;
-    credentials.value = (await cRes.json()).credentials;
-    authEnforced.value = (await sRes.json()).authEnforced;
-    accessError.value = null;
+    bucketError.value = null;
   }
   catch (err) {
-    // Surface the failure rather than clearing the error and rendering stale state as if healthy.
-    accessError.value = err instanceof Error ? err.message : 'Failed to load access settings';
+    bucketError.value = err instanceof Error ? err.message : 'Failed to load buckets';
   }
+}
+
+// The expensive half, fetched separately and merged in when it lands. Cached server-side.
+const bucketStatsLoading = ref(false);
+async function fetchBucketStats(): Promise<void> {
+  bucketStatsLoading.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/buckets/stats`);
+    if (!res.ok) return;
+    const { stats } = await res.json();
+    const byId = new Map<string, { objectCount: number; logicalBytes: number }>(
+      stats.map((s: { bucketId: string; objectCount: number; logicalBytes: number }) => [s.bucketId, s])
+    );
+    for (const b of buckets.value) {
+      const s = byId.get(b.id);
+      b.objectCount = s?.objectCount ?? 0;
+      b.logicalBytes = s?.logicalBytes ?? 0;
+    }
+  }
+  catch { /* counts are cosmetic; a failure must not blank the bucket list */ }
+  finally { bucketStatsLoading.value = false; }
+}
+
+async function fetchCredentials(): Promise<void> {
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/credentials`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    credentials.value = (await res.json()).credentials;
+    credentialError.value = null;
+  }
+  catch (err) {
+    credentialError.value = err instanceof Error ? err.message : 'Failed to load credentials';
+  }
+}
+
+// ---- Bucket content browser (file explorer) ----
+const BROWSE_PAGE = 500;
+const browsePath = ref('');                       // '' = the bucket list itself
+const browseEntries = ref<BrowseEntry[]>([]);
+const browseHasMore = ref(false);
+const browseLoading = ref(false);
+const browseError = ref<string | null>(null);
+// Monotonic token: only the newest request may write the results. Clicking A then B, where A's response
+// arrives last, would otherwise paint A's contents under B's breadcrumbs.
+let browseRequest = 0;
+
+const breadcrumbs = computed(() => {
+  const parts = browsePath.value ? browsePath.value.split('/') : [];
+  return parts.map((name, i) => ({ name, path: parts.slice(0, i + 1).join('/') }));
+});
+
+async function openPath(path: string): Promise<void> {
+  bucketError.value = null;      // clear a stale "that path no longer exists" once you navigate again
+  browsePath.value = path;
+  writeHash('buckets', path);
+  await loadBrowse();
+}
+
+async function loadBrowse(): Promise<void> {
+  if (!browsePath.value) {                        // at the top: the bucket list is the view
+    browseEntries.value = [];
+    browseHasMore.value = false;
+    return;
+  }
+  const token = ++browseRequest;
+  const requestedPath = browsePath.value;
+  browseLoading.value = true;
+  browseError.value = null;
+  try {
+    const res = await apiFetch(
+      `${apiBaseUrl}/$/browse?path=${encodeURIComponent(requestedPath)}&limit=${BROWSE_PAGE}`
+    );
+    if (token !== browseRequest) return;          // superseded by a newer navigation
+
+    if (res.status === 404) {
+      // The server re-traverses the whole chain from the database, so a 404 means this path genuinely no
+      // longer exists. Fall back to the bucket list rather than showing the contents of whatever else now
+      // sits at that name -- and say so on the LIST view, because the browse view we'd have shown the
+      // message in is the very thing we're leaving.
+      bucketError.value = `That path no longer exists: /${requestedPath}`;
+      browseEntries.value = [];
+      browsePath.value = '';
+      writeHash('buckets', '');
+      return;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    browseEntries.value = data.entries;
+    browseHasMore.value = data.hasMore;
+  }
+  catch (err) {
+    if (token !== browseRequest) return;
+    browseError.value = err instanceof Error ? err.message : 'Failed to browse';
+    browseEntries.value = [];
+  }
+  finally {
+    if (token === browseRequest) browseLoading.value = false;
+  }
+}
+
+// Fetch the next page and append. Paged by the last NAME we hold, which is what the server orders by --
+// so it stays correct (and index-backed) however large the folder is.
+async function loadMoreBrowse(): Promise<void> {
+  if (!browseHasMore.value || browseLoading.value) return;
+  const after = browseEntries.value[browseEntries.value.length - 1]?.name;
+  if (!after) return;
+
+  const token = ++browseRequest;
+  const requestedPath = browsePath.value;
+  browseLoading.value = true;
+  try {
+    const res = await apiFetch(
+      `${apiBaseUrl}/$/browse?path=${encodeURIComponent(requestedPath)}`
+      + `&after=${encodeURIComponent(after)}&limit=${BROWSE_PAGE}`
+    );
+    if (token !== browseRequest || requestedPath !== browsePath.value) return;
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    browseEntries.value = [...browseEntries.value, ...data.entries];
+    browseHasMore.value = data.hasMore;
+  }
+  catch (err) {
+    if (token !== browseRequest) return;
+    browseError.value = err instanceof Error ? err.message : 'Failed to load more';
+  }
+  finally {
+    if (token === browseRequest) browseLoading.value = false;
+  }
+}
+
+// The object's URL on the OBJECT origin (plain HTTP, separate port) -- not the admin origin we're on.
+function objectUrl(entryPath: string): string {
+  return `http://${window.location.hostname}/${entryPath.split('/').map(encodeURIComponent).join('/')}`;
 }
 
 // Checkbox handler for the bucket policy toggles. publicWrite gets an explicit, visible confirmation
@@ -1358,7 +1523,7 @@ async function setBucketPolicy(bucket: BucketRow, field: 'publicRead' | 'publicW
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     bucket[field] = value;
   }
-  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to update bucket policy'; }
+  catch (err) { bucketError.value = err instanceof Error ? err.message : 'Failed to update bucket policy'; }
   finally { accessBusy.value = false; }
 }
 
@@ -1371,7 +1536,7 @@ function removeNewGrant(index: number): void {
 
 async function createCredential(): Promise<void> {
   accessBusy.value = true;
-  accessError.value = null;
+  credentialError.value = null;
   try {
     const res = await apiFetch(`${apiBaseUrl}/$/credentials`, {
       method: 'POST',
@@ -1382,9 +1547,9 @@ async function createCredential(): Promise<void> {
     issuedSecret.value = await res.json();          // shown once
     newCredName.value = '';
     newCredGrants.value = [{ bucket: '*', read: true, write: false }];
-    await fetchAccess();
+    await fetchCredentials();
   }
-  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to create credential'; }
+  catch (err) { credentialError.value = err instanceof Error ? err.message : 'Failed to create credential'; }
   finally { accessBusy.value = false; }
 }
 
@@ -1399,7 +1564,7 @@ async function toggleCredentialEnabled(cred: CredentialRow): Promise<void> {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     cred.enabled = !cred.enabled;
   }
-  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to update credential'; }
+  catch (err) { credentialError.value = err instanceof Error ? err.message : 'Failed to update credential'; }
   finally { accessBusy.value = false; }
 }
 
@@ -1411,7 +1576,7 @@ async function rotateCredential(cred: CredentialRow): Promise<void> {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     issuedSecret.value = await res.json();          // new secret, shown once
   }
-  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to rotate credential'; }
+  catch (err) { credentialError.value = err instanceof Error ? err.message : 'Failed to rotate credential'; }
   finally { accessBusy.value = false; }
 }
 
@@ -1421,9 +1586,9 @@ async function deleteCredential(cred: CredentialRow): Promise<void> {
   try {
     const res = await apiFetch(`${apiBaseUrl}/$/credentials/${encodeURIComponent(cred.accessKeyId)}`, { method: 'DELETE' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    await fetchAccess();
+    await fetchCredentials();
   }
-  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to delete credential'; }
+  catch (err) { credentialError.value = err instanceof Error ? err.message : 'Failed to delete credential'; }
   finally { accessBusy.value = false; }
 }
 
@@ -1442,7 +1607,7 @@ async function setAuthEnforced(value: boolean): Promise<void> {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     authEnforced.value = (await res.json()).authEnforced;
   }
-  catch (err) { accessError.value = err instanceof Error ? err.message : 'Failed to update enforcement'; }
+  catch (err) { bucketError.value = err instanceof Error ? err.message : 'Failed to update enforcement'; }
   finally { accessBusy.value = false; }
 }
 
@@ -1458,14 +1623,29 @@ function startApp(): void {
   fetchStorageStats();
   fetchFreezeStatus();
   fetchRebalanceStatus();
-  fetchAccess();
+
+  // Restore the tab (and browsed path) from the URL, then load what that tab needs.
+  const { tab, path } = parseHash();
+  activeTab.value = tab;
+  browsePath.value = path;
+  void fetchBuckets().then(() => {
+    void fetchBucketStats();          // async: names/policy are already on screen
+    if (browsePath.value) void loadBrowse();   // re-traverses; a dead path resets to the bucket list
+  });
+  void fetchCredentials();
+
   if (verifyPollTimer === null)
     verifyPollTimer = setInterval(() => { fetchVerifyStatus(); fetchFreezeStatus(); fetchRebalanceStatus(); }, 3000);
   if (storageStatsPollTimer === null)
     storageStatsPollTimer = setInterval(fetchStorageStats, 10000);
-  // Slower poll: bucket activity counters and credential/last-used state don't need 3s cadence.
-  if (accessPollTimer === null)
-    accessPollTimer = setInterval(fetchAccess, 15000);
+  // Slower poll: bucket activity counters and credential last-used don't need a 3s cadence, and the
+  // counts are served from a server-side cache so this is cheap.
+  if (accessPollTimer === null) {
+    accessPollTimer = setInterval(() => {
+      if (activeTab.value === 'buckets') { void fetchBuckets(); void fetchBucketStats(); }
+      if (activeTab.value === 'credentials') void fetchCredentials();
+    }, 15000);
+  }
 }
 
 function stopApp(): void {
@@ -1474,8 +1654,19 @@ function stopApp(): void {
   if (accessPollTimer !== null) { clearInterval(accessPollTimer); accessPollTimer = null; }
 }
 
+// Back/forward buttons: follow the URL rather than fighting it.
+function onHashChange(): void {
+  const { tab, path } = parseHash();
+  activeTab.value = tab;
+  if (path !== browsePath.value) {
+    browsePath.value = path;
+    void loadBrowse();
+  }
+}
+
 onMounted(async () => {
   document.addEventListener('click', hideContextMenu);
+  window.addEventListener('hashchange', onHashChange);
   await checkAuth();
   if (authenticated.value)
     startApp();
@@ -1485,6 +1676,7 @@ onUnmounted(() => {
   stopApp();
   if (identifyDrive.value !== null) stopIdentify(); // stop flashing if the view is torn down mid-identify
   document.removeEventListener('click', hideContextMenu);
+  window.removeEventListener('hashchange', onHashChange);
 });
 </script>
 
@@ -1517,20 +1709,106 @@ onUnmounted(() => {
       <button @click="logout" class="logout-btn" title="Sign out">Sign out</button>
     </header>
 
-    <div class="controls">
-      <button @click="refreshDevices" :disabled="loading" class="refresh-btn">
-        {{ loading ? 'Loading...' : 'Refresh' }}
+    <!-- Top-level navigation. Each tab is its own route (#/volumes, #/buckets/photo/2024), so a refresh
+         puts you back where you were. -->
+    <nav class="main-tabs" role="tablist">
+      <button
+        v-for="tab in MAIN_TABS"
+        :key="tab"
+        type="button"
+        class="main-tab"
+        :class="{ active: activeTab === tab }"
+        role="tab"
+        :aria-selected="activeTab === tab"
+        @click="selectTab(tab)"
+      >
+        {{ tab === 'overview' ? 'Overview'
+         : tab === 'maintenance' ? 'Maintenance'
+         : tab === 'volumes' ? 'Volumes'
+         : tab === 'buckets' ? 'Buckets'
+         : 'Credentials' }}
+        <span
+          v-if="tab === 'maintenance' && maintenanceActive"
+          class="tab-dot"
+          title="Maintenance is running"
+        >●</span>
+        <span
+          v-if="tab === 'buckets' && authEnforced === false"
+          class="tab-dot warn"
+          title="The object API is unauthenticated"
+        >●</span>
       </button>
-      <button @click="openModal" :disabled="loading || availableDevices.length === 0" class="add-btn">
-        + Add Volume
-      </button>
-    </div>
+    </nav>
 
-    <!-- Maintenance panel: verify status + freeze control. Collapsible; collapsed when all is nominal. -->
-    <section class="section verify-panel">
-      <div class="verify-header maintenance-summary" @click="maintenanceCollapsed = !maintenanceCollapsed">
+    <!-- ===================== OVERVIEW ===================== -->
+    <!-- Status at a glance: the maintenance BADGES (not its details -- those live on their own tab) and
+         the storage figures. -->
+    <section v-show="activeTab === 'overview'" class="section">
+      <div class="section-header">
+        <h2>Overview</h2>
+        <span v-if="storageStats" class="storage-updated">Updated {{ formatDateTime(String(storageStats.updatedAt)) }}</span>
+      </div>
+
+      <div class="overview-badges">
+        <span
+          class="verify-state"
+          :class="maintenanceActive ? 'running' : 'idle'"
+          :title="maintenanceActivity.length ? maintenanceActivity.join(' · ') : 'Nothing running'"
+        >
+          Maintenance: {{ maintenanceActive ? 'Active' : 'Idle' }}
+        </span>
+        <span
+          v-if="maintenanceFrozen !== null"
+          class="freeze-pill"
+          :class="maintenanceFrozen ? 'frozen' : 'active'"
+        >
+          {{ maintenanceFrozen ? '❄ Frozen' : '● Enabled' }}
+        </span>
+        <span v-if="maintenanceActivity.length" class="overview-activity">
+          {{ maintenanceActivity.join(' · ') }}
+        </span>
+        <button type="button" class="access-mini-btn" @click="selectTab('maintenance')">Details →</button>
+      </div>
+
+      <div v-if="systemStats" class="storage-stats">
+        <div class="storage-stat">
+          <span class="storage-stat-label">Files</span>
+          <span class="storage-stat-value">{{ systemStats.objectCount.toLocaleString() }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Logical Data</span>
+          <span class="storage-stat-value">{{ formatBytes(systemStats.logicalBytes) }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Data Slices</span>
+          <span class="storage-stat-value">{{ formatBytes(systemStats.dataBytes) }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Parity Slices</span>
+          <span class="storage-stat-value">{{ formatBytes(systemStats.parityBytes) }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Physical Total</span>
+          <span class="storage-stat-value">{{ formatBytes(systemStats.physicalBytes) }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Total Capacity</span>
+          <span class="storage-stat-value">{{ formatBytes(onlineAssignedCapacity) }}</span>
+        </div>
+        <div class="storage-stat">
+          <span class="storage-stat-label">Unavailable</span>
+          <span class="storage-stat-value" :class="{ 'error-text': systemStats.unavailableObjectCount > 0 }">
+            {{ systemStats.unavailableObjectCount.toLocaleString() }} / {{ formatBytes(systemStats.unavailableLogicalBytes) }}
+          </span>
+        </div>
+      </div>
+      <p v-else class="storage-empty">Storage statistics are not available yet.</p>
+    </section>
+
+    <!-- ===================== MAINTENANCE ===================== -->
+    <section v-show="activeTab === 'maintenance'" class="section verify-panel">
+      <div class="verify-header maintenance-summary">
         <div class="verify-title">
-          <span class="collapse-chevron">{{ maintenanceCollapsed ? '▸' : '▾' }}</span>
           <h2>Maintenance</h2>
           <span
             class="verify-state"
@@ -1548,7 +1826,7 @@ onUnmounted(() => {
             {{ maintenanceFrozen ? '❄ Frozen' : '● Enabled' }}
           </span>
         </div>
-        <div class="verify-actions" @click.stop>
+        <div class="verify-actions">
           <button
             v-if="maintenanceFrozen !== null"
             @click="toggleFreeze"
@@ -1562,7 +1840,7 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <template v-if="!maintenanceCollapsed">
+      <template v-if="true">
       <div v-if="maintenanceFrozen === true" class="freeze-banner">
         Maintenance is <strong>frozen</strong> — verify, repair, drain, and rebalance are paused.
       </div>
@@ -1736,68 +2014,20 @@ onUnmounted(() => {
       </template>
     </section>
 
-    <section
-      v-if="storageStats || volumes.length > 0 || blockDevices.length > 0"
-      class="section storage-panel"
-    >
+    <!-- ===================== VOLUMES ===================== -->
+    <section v-show="activeTab === 'volumes'" class="section storage-panel">
       <div class="section-header">
-        <h2>Storage</h2>
-        <span v-if="storageStats" class="storage-updated">Updated {{ formatDateTime(String(storageStats.updatedAt)) }}</span>
-      </div>
-      <div class="storage-tabs" role="tablist">
-        <button
-          type="button"
-          class="storage-tab"
-          :class="{ active: storageTab === 'overview' }"
-          @click="storageTab = 'overview'"
-        >
-          Overview
-        </button>
-        <button
-          type="button"
-          class="storage-tab"
-          :class="{ active: storageTab === 'volumes' }"
-          @click="storageTab = 'volumes'"
-        >
-          Volumes
-        </button>
-      </div>
-      <div v-show="storageTab === 'overview'">
-        <div v-if="systemStats" class="storage-stats">
-          <div class="storage-stat">
-            <span class="storage-stat-label">Files</span>
-            <span class="storage-stat-value">{{ systemStats.objectCount.toLocaleString() }}</span>
-          </div>
-          <div class="storage-stat">
-            <span class="storage-stat-label">Logical Data</span>
-            <span class="storage-stat-value">{{ formatBytes(systemStats.logicalBytes) }}</span>
-          </div>
-          <div class="storage-stat">
-            <span class="storage-stat-label">Data Slices</span>
-            <span class="storage-stat-value">{{ formatBytes(systemStats.dataBytes) }}</span>
-          </div>
-          <div class="storage-stat">
-            <span class="storage-stat-label">Parity Slices</span>
-            <span class="storage-stat-value">{{ formatBytes(systemStats.parityBytes) }}</span>
-          </div>
-          <div class="storage-stat">
-            <span class="storage-stat-label">Physical Total</span>
-            <span class="storage-stat-value">{{ formatBytes(systemStats.physicalBytes) }}</span>
-          </div>
-          <div class="storage-stat">
-            <span class="storage-stat-label">Total Capacity</span>
-            <span class="storage-stat-value">{{ formatBytes(onlineAssignedCapacity) }}</span>
-          </div>
-          <div class="storage-stat">
-            <span class="storage-stat-label">Unavailable</span>
-            <span class="storage-stat-value" :class="{ 'error-text': systemStats.unavailableObjectCount > 0 }">
-              {{ systemStats.unavailableObjectCount.toLocaleString() }} / {{ formatBytes(systemStats.unavailableLogicalBytes) }}
-            </span>
-          </div>
+        <h2>Volumes</h2>
+        <div class="controls">
+          <button @click="refreshDevices" :disabled="loading" class="refresh-btn">
+            {{ loading ? 'Loading...' : 'Refresh' }}
+          </button>
+          <button @click="openModal" :disabled="loading || availableDevices.length === 0" class="add-btn">
+            + Add Volume
+          </button>
         </div>
-        <p v-else class="storage-empty">Storage statistics are not available yet.</p>
       </div>
-      <div v-show="storageTab === 'volumes'" class="volumes-view">
+      <div class="volumes-view">
         <div class="volumes-toolbar">
           <div class="view-toggle" role="group" aria-label="Volumes view">
             <button
@@ -1940,27 +2170,31 @@ onUnmounted(() => {
             :style="{ opacity: entry.unassigned ? 0.6 : 1 }"
             @contextmenu="entry.id !== null ? showContextMenu($event, entry.id) : null"
           >
+            <!-- Title and badges stack on the LEFT (badges under the name, so they never wrap around it);
+                 the action button sits alone on the RIGHT, after them. -->
             <div class="device-header" :style="{ backgroundColor: entry.color }">
-              <div class="device-name">
-                <span v-if="entry.groupLabel" class="label-prefix">{{ entry.groupLabel }}</span>
-                {{ entry.unassigned ? (entry.device ?? 'Drive') : ('Volume ' + entry.id) }}
+              <div class="device-head-main">
+                <div class="device-name">
+                  <span v-if="entry.groupLabel" class="label-prefix">{{ entry.groupLabel }}</span>
+                  {{ entry.unassigned ? (entry.device ?? 'Drive') : ('Volume ' + entry.id) }}
+                </div>
+                <div class="device-badges">
+                  <div v-if="entry.busGroup !== null" class="badge">Bus {{ entry.busGroup }}</div>
+                  <div class="badge">{{ formatBytes(entry.bytesTotal) }}</div>
+                  <div v-if="entry.volume?.isReadOnly" class="badge ro-badge">READ-ONLY</div>
+                  <div v-if="entry.volume?.isDraining" class="badge draining-badge">DRAINING</div>
+                  <div v-if="entry.volume && !entry.volume.isEnabled" class="badge offline-badge">DISABLED</div>
+                  <div v-else-if="entry.volume && !entry.blockDevice" class="badge offline-badge">OFFLINE</div>
+                  <div v-if="entry.unassigned" class="badge offline-badge">UNASSIGNED</div>
+                </div>
               </div>
-              <div class="header-badges">
-                <button
-                  v-if="entry.id !== null"
-                  type="button"
-                  class="tile-action-btn"
-                  title="Volume actions"
-                  @click.stop="openRowMenu($event, entry.id)"
-                >⋮</button>
-                <div v-if="entry.busGroup !== null" class="badge">Bus {{ entry.busGroup }}</div>
-                <div class="badge">{{ formatBytes(entry.bytesTotal) }}</div>
-                <div v-if="entry.volume?.isReadOnly" class="badge ro-badge">READ-ONLY</div>
-                <div v-if="entry.volume?.isDraining" class="badge draining-badge">DRAINING</div>
-                <div v-if="entry.volume && !entry.volume.isEnabled" class="badge offline-badge">DISABLED</div>
-                <div v-else-if="entry.volume && !entry.blockDevice" class="badge offline-badge">OFFLINE</div>
-                <div v-if="entry.unassigned" class="badge offline-badge">UNASSIGNED</div>
-              </div>
+              <button
+                v-if="entry.id !== null"
+                type="button"
+                class="tile-action-btn"
+                title="Volume actions"
+                @click.stop="openRowMenu($event, entry.id)"
+              >⋮</button>
             </div>
             <div class="device-body">
               <div class="device-info">
@@ -2013,28 +2247,101 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <!-- Buckets & Access: bucket sizes/policy, credentials, and the auth-enforcement switch. -->
-    <section class="section access-panel">
-      <div class="verify-header" @click="accessCollapsed = !accessCollapsed">
+    <!-- ===================== BUCKETS ===================== -->
+    <section v-show="activeTab === 'buckets'" class="section access-panel">
+      <div class="verify-header">
         <div class="verify-title">
-          <span class="collapse-chevron">{{ accessCollapsed ? '▸' : '▾' }}</span>
-          <h2>Buckets &amp; Access</h2>
+          <h2>Buckets</h2>
           <span class="verify-state" :class="authEnforced ? 'running' : 'idle'">
             {{ authEnforced === null ? '—' : (authEnforced ? 'Enforced' : 'Open') }}
           </span>
         </div>
       </div>
 
-      <!-- Loud banner while the object API is unauthenticated. Rendered OUTSIDE the collapsible body so it
-           is visible even when the panel is collapsed (which it is by default). -->
       <div v-if="authEnforced === false" class="access-banner warn banner-standalone">
         <strong>The object API is unauthenticated.</strong>
         Every bucket is publicly readable and writable regardless of the policy toggles below —
         they take effect only once enforcement is enabled.
       </div>
 
-      <div v-if="!accessCollapsed" class="access-body">
-        <div v-if="accessError" class="access-banner error">{{ accessError }}</div>
+      <!-- ---------- Bucket CONTENTS (file explorer) ---------- -->
+      <div v-if="browsePath" class="access-body">
+        <div class="browse-bar">
+          <nav class="breadcrumbs" aria-label="Breadcrumb">
+            <button type="button" class="crumb" @click="openPath('')">Buckets</button>
+            <template v-for="(crumb, i) in breadcrumbs" :key="crumb.path">
+              <span class="crumb-sep">/</span>
+              <button
+                type="button"
+                class="crumb"
+                :class="{ current: i === breadcrumbs.length - 1 }"
+                @click="openPath(crumb.path)"
+              >{{ crumb.name }}</button>
+            </template>
+          </nav>
+          <span v-if="browseLoading" class="browse-status">Loading…</span>
+        </div>
+
+        <div v-if="browseError" class="access-banner error">{{ browseError }}</div>
+
+        <table v-else class="access-table browse-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th class="num">Size</th>
+              <th>Type</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="entry in browseEntries"
+              :key="entry.id"
+              :class="{ clickable: entry.isContainer }"
+              @click="entry.isContainer && openPath(browsePath + '/' + entry.name)"
+            >
+              <td>
+                <span class="entry-icon">{{ entry.isContainer ? '📁' : '📄' }}</span>
+                <span :class="{ 'entry-folder': entry.isContainer }">{{ entry.name }}</span>
+              </td>
+              <td class="num">{{ entry.isFile && entry.size !== null ? formatBytes(entry.size) : '—' }}</td>
+              <td class="entry-mime">{{ entry.isContainer ? 'folder' : (entry.mime || 'unknown') }}</td>
+              <td class="access-actions">
+                <a
+                  v-if="entry.isFile"
+                  class="access-mini-btn"
+                  :href="objectUrl(browsePath + '/' + entry.name)"
+                  target="_blank"
+                  rel="noopener"
+                  @click.stop
+                >Open</a>
+              </td>
+            </tr>
+            <tr v-if="!browseEntries.length && !browseLoading">
+              <td colspan="4" class="access-empty">This folder is empty.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div v-if="browseHasMore" class="browse-more">
+          <button
+            type="button"
+            class="access-mini-btn"
+            :disabled="browseLoading"
+            @click="loadMoreBrowse"
+          >{{ browseLoading ? 'Loading…' : 'Load more' }}</button>
+          <span class="browse-count">{{ browseEntries.length.toLocaleString() }} shown</span>
+        </div>
+        <p v-else-if="browseEntries.length" class="browse-more">
+          <span class="browse-count">{{ browseEntries.length.toLocaleString() }} entries</span>
+        </p>
+      </div>
+
+      <!-- ---------- Bucket LIST ---------- -->
+      <div v-else class="access-body">
+        <!-- Also where a "that path no longer exists" message lands: the browse view it would otherwise
+             have shown in is exactly the view we just left. -->
+        <div v-if="bucketError" class="access-banner error">{{ bucketError }}</div>
 
         <!-- Enforcement switch -->
         <div class="access-subsection">
@@ -2060,7 +2367,10 @@ onUnmounted(() => {
 
         <!-- Buckets -->
         <div class="access-subsection">
-          <div class="access-subtitle">Buckets</div>
+          <div class="access-subtitle">
+            Buckets
+            <span v-if="bucketStatsLoading" class="browse-status">counting…</span>
+          </div>
           <table class="access-table">
             <thead>
               <tr>
@@ -2074,9 +2384,15 @@ onUnmounted(() => {
             </thead>
             <tbody>
               <tr v-for="b in buckets" :key="b.id">
-                <td class="mono">{{ b.name }}</td>
-                <td class="num">{{ b.objectCount.toLocaleString() }}</td>
-                <td class="num">{{ formatBytes(b.logicalBytes) }}</td>
+                <td>
+                  <button type="button" class="bucket-link" @click="openPath(b.name)" title="Browse this bucket">
+                    📁 {{ b.name }}
+                  </button>
+                </td>
+                <!-- Counts arrive separately (a $group over every file); the names and toggles above do
+                     not wait on them. -->
+                <td class="num">{{ b.objectCount === null ? '…' : b.objectCount.toLocaleString() }}</td>
+                <td class="num">{{ b.logicalBytes === null ? '…' : formatBytes(b.logicalBytes) }}</td>
                 <td>
                   <label class="access-switch">
                     <input
@@ -2107,10 +2423,24 @@ onUnmounted(() => {
             </tbody>
           </table>
         </div>
+      </div>
+    </section>
 
-        <!-- Credentials -->
+    <!-- ===================== CREDENTIALS ===================== -->
+    <section v-show="activeTab === 'credentials'" class="section access-panel">
+      <div class="verify-header">
+        <div class="verify-title">
+          <h2>Credentials</h2>
+        </div>
+      </div>
+
+      <div class="access-body">
+        <div v-if="credentialError" class="access-banner error">{{ credentialError }}</div>
+
         <div class="access-subsection">
-          <div class="access-subtitle">Credentials</div>
+          <div class="access-hint">
+            Object-API credentials (HTTP Basic). They take effect only while auth enforcement is on.
+          </div>
 
           <!-- A newly-issued secret, shown once. -->
           <div v-if="issuedSecret" class="access-banner secret">
@@ -2608,13 +2938,24 @@ h2 {
   border-style: dashed;
 }
 
+/* Title + badges stack on the left; the action button sits alone on the right, AFTER them. The badges
+   previously shared a wrapping flex row with the title and the button, so a card with several badges
+   wrapped into a mess. */
 .device-header {
   padding: 15px 20px;
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
+  gap: 12px;
   color: white;
   font-weight: 600;
+}
+
+.device-head-main {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;          /* let a long name ellipsize rather than push the button off */
 }
 
 .device-name {
@@ -2630,6 +2971,13 @@ h2 {
   border-radius: 8px;
   font-size: 14px;
   font-weight: 700;
+}
+
+.device-badges {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
 }
 
 .header-badges {
@@ -3632,6 +3980,58 @@ h2 {
   outline: none;
   border-color: #2196F3;
 }
+
+/* --- Top-level tabs --- */
+.main-tabs {
+  display: flex; gap: 4px; margin: 0 0 16px;
+  border-bottom: 1px solid #e0e0e0; flex-wrap: wrap;
+}
+.main-tab {
+  padding: 10px 18px; border: none; background: none; cursor: pointer;
+  font-size: 14px; font-weight: 500; color: #666;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.main-tab:hover { color: #333; }
+.main-tab.active { color: #2196F3; border-bottom-color: #2196F3; font-weight: 600; }
+.tab-dot { color: #43a047; font-size: 9px; line-height: 1; }
+.tab-dot.warn { color: #f9a825; }
+
+.overview-badges {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 12px 18px; border-bottom: 1px solid #f0f0f0;
+}
+.overview-activity { font-size: 12px; color: #777; }
+
+/* --- Bucket content browser --- */
+.browse-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  flex-wrap: wrap; padding-bottom: 4px;
+}
+.breadcrumbs { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 13px; }
+.crumb {
+  background: none; border: none; padding: 3px 6px; border-radius: 4px;
+  color: #2196F3; cursor: pointer; font-size: 13px; font-family: inherit;
+}
+.crumb:hover { background: #eef3fb; }
+.crumb.current { color: #333; font-weight: 600; cursor: default; }
+.crumb.current:hover { background: none; }
+.crumb-sep { color: #bbb; }
+.browse-status { font-size: 12px; color: #999; font-weight: 400; margin-left: 8px; }
+.browse-more { display: flex; align-items: center; gap: 10px; margin: 6px 0 0; }
+.browse-count { font-size: 12px; color: #999; }
+
+.browse-table tr.clickable { cursor: pointer; }
+.browse-table tr.clickable:hover { background: #f7fbff; }
+.entry-icon { margin-right: 8px; }
+.entry-folder { font-weight: 600; }
+.entry-mime { color: #888; font-size: 12px; }
+
+.bucket-link {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: #2196F3; font-size: 13px; font-weight: 600; font-family: inherit;
+}
+.bucket-link:hover { text-decoration: underline; }
 
 /* --- Buckets & Access panel --- */
 .access-body { padding: 4px 18px 18px; display: flex; flex-direction: column; gap: 20px; }

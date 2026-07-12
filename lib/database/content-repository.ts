@@ -821,6 +821,60 @@ export class ContentRepository {
         return { containersStamped, objectsStamped, skippedContainers };
     }
 
+    // --- browsing (the admin UI's file explorer) ---
+
+    // List one container's immediate children, name-ordered and paginated. Sorted and paged by `name` so
+    // it rides the existing { containerId, name } unique index -- a skip/offset scan would fall over on a
+    // container holding a large slice of 3.5M objects. `after` is the last name of the previous page.
+    async listContainerEntries(
+        containerId: ObjectIdentifier,
+        opts: { limit?: number; after?: string } = {}
+    ): Promise<{ entries: ContentDocument[]; hasMore: boolean }> {
+        const limit = Math.min(Math.max(opts.limit ?? 200, 1), 1000);
+        const query: Filter<ContentDocument> = { containerId: this.toMongoId(containerId) };
+        if (opts.after)
+            (query as Record<string, unknown>).name = { $gt: opts.after };
+
+        // Fetch one extra to know whether another page exists, without a second count query.
+        const docs = await this.collection.find<ContentDocument>(query, {
+            projection: { _id: 1, name: 1, isFile: 1, isContainer: 1, size: 1, mime: 1, bucketId: 1 },
+            sort: { name: 1 },
+            limit: limit + 1
+        }).toArray();
+
+        const hasMore = docs.length > limit;
+        return {
+            entries: docs.slice(0, limit).map(doc => this.normalize(doc)),
+            hasMore
+        };
+    }
+
+    // Resolve a container path STRICTLY: every component is re-read from the database, and a missing or
+    // non-container component yields `undefined` (distinct from `null`, which means "the root").
+    //
+    // It deliberately does NOT use the container cache. The ordinary resolver trusts a cache hit and walks
+    // on without asking Mongo, which is right for the write path but wrong here: the UI deep-links a path
+    // in its URL, and the whole point of re-traversing is to establish that the path STILL EXISTS. A
+    // cached entry for a folder deleted a minute ago would answer "yes" and the browser would then show
+    // the contents of a container that is gone -- exactly the stale-link failure this is meant to prevent.
+    async resolveContainerStrict(path: ContainerPath): Promise<string | null | undefined> {
+        const components = typeof path === 'string'
+            ? path.split('/').filter(component => component.length > 0)
+            : [...path].filter(component => component.length > 0);
+
+        let containerId: ObjectId | null = null;
+        for (const name of components) {
+            const doc = await this.collection.findOne(
+                { containerId, name },
+                { projection: { _id: 1, isContainer: 1 } }
+            );
+            if (!doc || doc.isContainer !== true)
+                return undefined;                    // missing, or a file where a folder should be
+            containerId = doc._id as ObjectId;
+        }
+        return containerId ? containerId.toHexString() : null;
+    }
+
     // --- buckets (a bucket IS a top-level container: containerId null, isContainer true) ---
 
     async getBucketByName(name: string): Promise<ContentDocument | null> {

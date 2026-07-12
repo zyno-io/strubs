@@ -78,6 +78,8 @@ const databaseBucketAuthMock = {
     setRuntimeConfig: vi.fn(async () => undefined),
     listBuckets: vi.fn(async () => [] as any[]),
     computeBucketStats: vi.fn(async () => [] as any[]),
+    listContainerEntries: vi.fn(async () => ({ entries: [] as any[], hasMore: false })),
+    resolveContainerStrict: vi.fn(async () => null as string | null | undefined),
     setBucketPolicy: vi.fn(async () => true),
     getBucketByName: vi.fn(async () => null),
     listCredentials: vi.fn(async () => [] as any[]),
@@ -1212,20 +1214,17 @@ describe('HttpMgmt.handle', () => {
             databaseBucketAuthMock.setCredentialSecretHash.mockResolvedValue(true as any);
         });
 
-        it('GET /$/buckets merges policy, stats, and activity', async () => {
+        it('GET /$/buckets returns policy + activity + enforcement', async () => {
             databaseBucketAuthMock.listBuckets.mockResolvedValue([
                 { id: 'aaaaaaaaaaaaaaaaaaaaaaaa', name: 'photo', publicRead: true },
                 { id: 'bbbbbbbbbbbbbbbbbbbbbbbb', name: 'empty' }
             ] as any);
-            databaseBucketAuthMock.computeBucketStats.mockResolvedValue([
-                { bucketId: 'aaaaaaaaaaaaaaaaaaaaaaaa', objectCount: 5, logicalBytes: 100 }
-            ] as any);
             const res = await HttpMgmt.handle(1, createRequest('GET', '/$/buckets'), nullResponse) as any;
             expect(res.enforced).toBe(false);
             const photo = res.buckets.find((b: any) => b.name === 'photo');
-            expect(photo).toMatchObject({ publicRead: true, publicWrite: null, objectCount: 5, logicalBytes: 100 });
-            const empty = res.buckets.find((b: any) => b.name === 'empty');
-            expect(empty).toMatchObject({ objectCount: 0, logicalBytes: 0 });
+            expect(photo).toMatchObject({ publicRead: true, publicWrite: null });
+            expect(photo.activity).toEqual({ anon: 0, auth: 0 });
+            expect(res.buckets.find((b: any) => b.name === 'empty')).toBeTruthy();
         });
 
         it('PUT /$/buckets/{id}/policy validates and forwards booleans', async () => {
@@ -1282,6 +1281,69 @@ describe('HttpMgmt.handle', () => {
             const res = await HttpMgmt.handle(1, createRequest('DELETE', '/$/credentials/AKIA123'), nullResponse) as any;
             expect(res).toEqual({ removed: true });
             expect(databaseBucketAuthMock.removeCredential).toHaveBeenCalledWith('AKIA123');
+        });
+
+        it('GET /$/buckets does NOT compute object counts (that aggregation is the slow half)', async () => {
+            databaseBucketAuthMock.listBuckets.mockResolvedValue([
+                { id: 'aaaaaaaaaaaaaaaaaaaaaaaa', name: 'photo', publicRead: true }
+            ] as any);
+            const res = await HttpMgmt.handle(1, createRequest('GET', '/$/buckets'), nullResponse) as any;
+            expect(res.buckets[0]).toMatchObject({ name: 'photo', publicRead: true });
+            // The counts come from /$/buckets/stats so the names and toggles render immediately.
+            expect(databaseBucketAuthMock.computeBucketStats).not.toHaveBeenCalled();
+        });
+
+        it('GET /$/buckets/stats caches the aggregation instead of rescanning every poll', async () => {
+            databaseBucketAuthMock.computeBucketStats.mockResolvedValue([
+                { bucketId: 'aaaaaaaaaaaaaaaaaaaaaaaa', objectCount: 5, logicalBytes: 100 }
+            ] as any);
+
+            const a = await HttpMgmt.handle(1, createRequest('GET', '/$/buckets/stats'), nullResponse) as any;
+            const b = await HttpMgmt.handle(2, createRequest('GET', '/$/buckets/stats'), nullResponse) as any;
+
+            expect(a.stats[0]).toMatchObject({ objectCount: 5 });
+            expect(b.stats).toEqual(a.stats);
+            expect(databaseBucketAuthMock.computeBucketStats).toHaveBeenCalledTimes(1);   // second served from cache
+        });
+
+        describe('GET /$/browse', () => {
+            it('lists the root (the buckets) when given no path', async () => {
+                databaseBucketAuthMock.listContainerEntries.mockResolvedValue({
+                    entries: [{ id: 'b1', name: 'photo', isContainer: true }],
+                    hasMore: false
+                } as any);
+
+                const res = await HttpMgmt.handle(1, createRequest('GET', '/$/browse'), nullResponse) as any;
+                expect(res.path).toBe('');
+                expect(res.entries[0]).toMatchObject({ name: 'photo', isContainer: true });
+                expect(databaseBucketAuthMock.resolveContainerStrict).not.toHaveBeenCalled();  // root needs no walk
+            });
+
+            it('re-traverses the path and 404s a path that no longer exists', async () => {
+                // undefined = the walk hit a missing component. It must NOT fall back to some other folder.
+                databaseBucketAuthMock.resolveContainerStrict.mockResolvedValue(undefined);
+
+                const req = createRequest('GET', '/$/browse');
+                req.params.path = 'photo/gone';
+                await expect(HttpMgmt.handle(1, req, nullResponse)).rejects.toThrow(/no such path/);
+                expect(databaseBucketAuthMock.listContainerEntries).not.toHaveBeenCalled();
+            });
+
+            it('lists a resolved container and reports whether more entries remain', async () => {
+                databaseBucketAuthMock.resolveContainerStrict.mockResolvedValue('c1');
+                databaseBucketAuthMock.listContainerEntries.mockResolvedValue({
+                    entries: [{ id: 'o1', name: 'cat.jpg', isFile: true, size: 1234, mime: 'image/jpeg' }],
+                    hasMore: true
+                } as any);
+
+                const req = createRequest('GET', '/$/browse');
+                req.params.path = '/photo/2024/';       // leading/trailing slashes tolerated
+                const res = await HttpMgmt.handle(1, req, nullResponse) as any;
+
+                expect(res.path).toBe('photo/2024');
+                expect(res.hasMore).toBe(true);
+                expect(res.entries[0]).toMatchObject({ name: 'cat.jpg', isFile: true, size: 1234, mime: 'image/jpeg' });
+            });
         });
 
         it('GET and PUT /$/auth/settings read and write the authEnforced flag', async () => {

@@ -224,6 +224,14 @@ export class Database {
         return this.contentRepository.listBuckets();
     }
 
+    async listContainerEntries(containerId: ObjectIdentifier, opts?: { limit?: number; after?: string }): Promise<{ entries: ContentDocument[]; hasMore: boolean }> {
+        return this.contentRepository.listContainerEntries(containerId, opts);
+    }
+
+    async resolveContainerStrict(path: ContainerPath): Promise<string | null | undefined> {
+        return this.contentRepository.resolveContainerStrict(path);
+    }
+
     async setBucketPolicy(id: ObjectIdentifier, policy: { publicRead?: boolean; publicWrite?: boolean }): Promise<boolean> {
         return this.contentRepository.setBucketPolicy(id, policy);
     }
