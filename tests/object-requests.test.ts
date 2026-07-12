@@ -531,8 +531,8 @@ describe('ObjectGetRequest', () => {
         expect(res.headers['Content-Length']).toBe(record.size);
         // Active-content hardening on every object response.
         expect(res.headers['X-Content-Type-Options']).toBe('nosniff');
-        expect(res.headers['Content-Security-Policy']).toBe("default-src 'none'; sandbox");
-        // octet-stream is inline-safe, so no forced download.
+        // octet-stream is inline-safe, so no forced download and no sandbox lockdown.
+        expect(res.headers['Content-Security-Policy']).toBe("default-src 'none'; media-src 'self'; img-src 'self'");
         expect(res.headers['Content-Disposition']).toBeUndefined();
     });
 
@@ -547,6 +547,9 @@ describe('ObjectGetRequest', () => {
             await promise;
             expect(res.headers['Content-Disposition'], mime).toBe('attachment');
             expect(res.headers['X-Content-Type-Options'], mime).toBe('nosniff');
+            // Force-downloaded content gets the FULL lockdown: if a browser renders it anyway, it can
+            // load nothing and run nothing.
+            expect(res.headers['Content-Security-Policy'], mime).toBe("default-src 'none'; sandbox");
         }
     });
 
@@ -560,6 +563,27 @@ describe('ObjectGetRequest', () => {
             flushFileObject('x');
             await promise;
             expect(res.headers['Content-Disposition'], mime).toBeUndefined();
+        }
+    });
+
+    // Regression: a blanket `default-src 'none'; sandbox` was sent on EVERY object response, including
+    // the media we deliberately render inline. Navigating to a video makes the browser wrap it in a viewer
+    // document that the CSP then applies to -- so `default-src 'none'` (no media-src) forbade loading the
+    // very bytes it was opened to show, and `sandbox` blocked the viewer's scripts. Direct playback of
+    // every video and audio object was broken.
+    it('does NOT sandbox or block inert media, so a directly-opened video can actually play', async () => {
+        for (const mime of ['video/mp4', 'audio/mpeg', 'image/png']) {
+            const record = { ...createObjectRecord(), mime };
+            const req = buildRequest();
+            const res = buildResponse();
+            const request = new ObjectGetRequest(1, record, req as any, res as any);
+            const promise = request.process();
+            flushFileObject('x');
+            await promise;
+            const csp = res.headers['Content-Security-Policy'] as string;
+            expect(csp, mime).toBe("default-src 'none'; media-src 'self'; img-src 'self'");
+            expect(csp, mime).not.toContain('sandbox');   // would block the browser's own media viewer
+            expect(res.headers['X-Content-Type-Options'], mime).toBe('nosniff');   // still no MIME sniffing
         }
     });
 

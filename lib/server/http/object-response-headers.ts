@@ -35,14 +35,34 @@ function isInlineSafe(mime: string | null | undefined): boolean {
 // port/scheme) is the real boundary; these headers ensure that even so, uploaded HTML/SVG/JS cannot
 // execute in a browser that opens it directly.
 //   - nosniff: the browser honours our Content-Type instead of guessing an executable one;
-//   - CSP: even if rendered, the content can load/run nothing;
-//   - Content-Disposition: attachment for anything not inline-safe, so it downloads instead of rendering.
+//   - Content-Disposition: attachment for anything not inline-safe, so it downloads instead of rendering;
+//   - CSP: the content can load/run nothing.
 // A caller-supplied disposition (?download_as) already forces a download, so it is left untouched.
+//
+// The CSP is deliberately SPLIT by inline-safety, because one blanket policy cannot serve both cases:
+//
+//   * Active/unknown content is force-downloaded anyway, so it gets the full lockdown -- `sandbox` and
+//     no sources at all. If a browser somehow renders it regardless, it can still do nothing.
+//
+//   * Inert media (image/video/audio) we deliberately render inline. Navigating straight to a video makes
+//     the browser build a small viewer document around it, and the response's CSP applies to THAT
+//     document -- so a blanket `default-src 'none'; sandbox` forbids the viewer from loading the very
+//     bytes it was opened to show (and `sandbox` blocks its own scripts). That broke direct playback of
+//     every video and audio object. These bytes are not a document and cannot execute; `nosniff` stops
+//     the browser reinterpreting them as one. So the policy only has to permit the media itself.
+const CSP_INERT_MEDIA = "default-src 'none'; media-src 'self'; img-src 'self'";
+const CSP_LOCKDOWN = "default-src 'none'; sandbox";
+
 export function applyObjectSecurityHeaders(res: HttpResponse, record: StoredObjectRecord): void {
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
 
-    if (!res.hasHeader('Content-Disposition') && !isInlineSafe(record.mime))
+    if (isInlineSafe(record.mime)) {
+        res.setHeader('Content-Security-Policy', CSP_INERT_MEDIA);
+        return;
+    }
+
+    res.setHeader('Content-Security-Policy', CSP_LOCKDOWN);
+    if (!res.hasHeader('Content-Disposition'))
         res.setHeader('Content-Disposition', 'attachment');
 }
 
