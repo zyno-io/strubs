@@ -9,6 +9,7 @@ import { isMaintenanceFrozen } from '../maintenance';
 import { verifyVolumesJob } from './verify-volumes-job';
 import { domainLoadForObject, domainLoadFor } from '../io/failure-domain';
 import type { Volume } from '../io/volume';
+import { isDocumentedDead } from '../database/types';
 import type { ContentDocument } from '../database/types';
 
 // Persisted progress so a restart resumes an in-flight rebalance.
@@ -33,8 +34,8 @@ const SIZE_TIERS = [256 * 1024 * 1024, 16 * 1024 * 1024, 1024 * 1024, 0];
 const DEFAULT_MAX_MOVES = Number.POSITIVE_INFINITY;
 
 type LoadedObject = { dataSliceVolumeIds: number[]; paritySliceVolumeIds: number[]; dataSliceCount: number; sliceSize: number };
-type RebalanceSummary = { moves: number; reconstructed: number; copied: number; unrecoverable: number; noDest: number; sourceDeleteFailed: number; duplicateRefs: number };
-const emptySummary = (): RebalanceSummary => ({ moves: 0, reconstructed: 0, copied: 0, unrecoverable: 0, noDest: 0, sourceDeleteFailed: 0, duplicateRefs: 0 });
+type RebalanceSummary = { moves: number; reconstructed: number; copied: number; unrecoverable: number; noDest: number; sourceDeleteFailed: number; duplicateRefs: number; skippedDead: number };
+const emptySummary = (): RebalanceSummary => ({ moves: 0, reconstructed: 0, copied: 0, unrecoverable: 0, noDest: 0, sourceDeleteFailed: 0, duplicateRefs: 0, skippedDead: 0 });
 
 export type RebalanceStatus = RebalanceSummary & {
     running: boolean;
@@ -118,6 +119,10 @@ export class RebalanceJob {
     private currentSourceId: number | null = null;
     private currentMinSize: number | null = null;
     private concurrency = DEFAULT_CONCURRENCY;
+    // The tier loop rescans a source up to four times, so the same object can be skipped repeatedly.
+    // Dedupe by id so the reported counts are 'objects affected', not 'attempts'.
+    private skippedDeadIds = new Set<string>();
+    private duplicateRefIds = new Set<string>();
 
     constructor(deps?: Partial<RebalanceJobDeps>) {
         this.deps = { ...defaultDeps, ...deps };
@@ -242,6 +247,8 @@ export class RebalanceJob {
         this.running = true;
         this.cancelled = false;
         this.summary = emptySummary();
+        this.skippedDeadIds.clear();
+        this.duplicateRefIds.clear();
         this.startedAt = Date.now();
         this.bytesMoved = 0;
         const s = this.summary;
@@ -331,6 +338,16 @@ export class RebalanceJob {
     }
 
     private async moveOneSlice(doc: ContentDocument, source: Volume, target: number, s: RebalanceSummary): Promise<void> {
+        // Documented-dead objects (recoveryComment) are accepted loss: their surviving slices are
+        // foreign or below quorum, so a relocation would reconstruct from sources we already know are
+        // bad and write the result over a healthy volume. The repair worker and the drain both refuse
+        // these (repair-worker blocks 'unrecoverable'; drain counts skippedDead) -- rebalance must too.
+        if (isDocumentedDead(doc)) {
+            const id = (doc as { id: string }).id;
+            if (!this.skippedDeadIds.has(id)) { this.skippedDeadIds.add(id); s.skippedDead++; }
+            return;
+        }
+
         const dataVols = (doc as { dataVolumes?: number[] }).dataVolumes ?? [];
         const parityVols = (doc as { parityVolumes?: number[] }).parityVolumes ?? [];
         const all = [...dataVols, ...parityVols];
@@ -342,8 +359,9 @@ export class RebalanceJob {
         // would repoint both refs at the single copy we made and orphan the other -- turning a
         // recoverable slice into a lost one. Refuse to touch it; it needs a human.
         if (all.lastIndexOf(source.id) !== idx) {
-            this.log.error('object %s has multiple slices on volume %d: skipping (unsafe to relocate)', (doc as { id?: string }).id, source.id);
-            s.duplicateRefs++;
+            const id = (doc as { id: string }).id;
+            this.log.error('object %s has multiple slices on volume %d: skipping (unsafe to relocate)', id, source.id);
+            if (!this.duplicateRefIds.has(id)) { this.duplicateRefIds.add(id); s.duplicateRefs++; }
             return;
         }
 
@@ -444,8 +462,8 @@ export class RebalanceJob {
     }
 
     private async finalize(s: RebalanceSummary): Promise<void> {
-        this.log('rebalance complete: %d moves (%d copied, %d reconstructed), %d no-dest, %d unrecoverable, %d source-delete-failed',
-            s.moves, s.copied, s.reconstructed, s.noDest, s.unrecoverable, s.sourceDeleteFailed);
+        this.log('rebalance complete: %d moves (%d copied, %d reconstructed), %d no-dest, %d unrecoverable, %d source-delete-failed, %d dead-skipped, %d duplicate-refs',
+            s.moves, s.copied, s.reconstructed, s.noDest, s.unrecoverable, s.sourceDeleteFailed, s.skippedDead, s.duplicateRefs);
         await this.deps.runtimeConfig.delete(REBALANCE_ACTIVE_KEY);
         await this.deps.runtimeConfig.delete(REBALANCE_CURSOR_KEY);
     }

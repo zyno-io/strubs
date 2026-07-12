@@ -56,3 +56,16 @@ export type ObjectVerificationStateUpdate = {
     sliceErrors?: Record<string, SliceErrorInfo> | null;
     sliceVerificationTimes?: SliceVerificationTimes | null;
 };
+
+// "Documented dead": an operator has recorded this object as accepted loss (its surviving slices are
+// foreign or below quorum, so any reconstruction from them would be self-consistent-but-wrong).
+//
+// This MUST mean the same thing everywhere. Three call sites had drifted to three different tests --
+// `!= null`, `!= null && !== ''`, and a Mongo `$exists` -- which combined into a data-loss path: an
+// object with an EMPTY recoveryComment was skipped by the drain (so its slice stayed on the volume) yet
+// excluded from the volume's live-slice count (so the volume was declared fully drained and its removal
+// unblocked). Pulling that disk would have silently lost the slice. One predicate, used by all of them.
+export function isDocumentedDead(doc: unknown): boolean {
+    const comment = (doc as { recoveryComment?: unknown } | null | undefined)?.recoveryComment;
+    return typeof comment === 'string' && comment.length > 0;
+}

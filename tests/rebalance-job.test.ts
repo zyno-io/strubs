@@ -243,6 +243,22 @@ describe('RebalanceJob', () => {
         expect(vols[2].bytesPending).toBe(0);
     });
 
+    it('refuses to relocate a documented-dead (recoveryComment) object', async () => {
+        // Its surviving slices are foreign or below quorum, so reconstructing from them yields
+        // self-consistent-but-wrong bytes -- and rebalance would write that onto a healthy volume.
+        // The repair worker and the drain both refuse these; rebalance must too.
+        const doc = { ...objectDoc(1, 'data'), recoveryComment: 'drive gone, insufficient slices' };
+        const { job, deps } = makeJob(pool(), doc);
+
+        await run(job);
+
+        expect(deps.tryCopyRelocate).not.toHaveBeenCalled();
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.database.replaceObjectVolumeRef).not.toHaveBeenCalled();
+        expect(deps.deleteSourceSlice).not.toHaveBeenCalled();
+        expect((await (job as any).getStatus()).skippedDead).toBe(1);
+    });
+
     it('refuses to move an object that has two slices on the same source volume', async () => {
         // The positional flip rewrites EVERY ref equal to the source, but only one file is copied --
         // so flipping would orphan the second slice, turning a recoverable slice into a lost one.

@@ -7,6 +7,7 @@ import { remediationService, RemediationService } from './service';
 import type { RepairBlockDetails, SliceFault } from './fault';
 import { isMaintenanceFrozen } from '../maintenance';
 import { isIOAbort } from '../slice-error';
+import { isDocumentedDead } from '../database/types';
 
 type VerifySliceResult = { ok: boolean; volumeId: number | null };
 type VerifyResult = Record<string, VerifySliceResult>;
@@ -360,9 +361,9 @@ export class RepairWorker {
             // foreign/corrupt surviving slices yields self-consistent-but-wrong bytes that pass the
             // per-slice checksum and OVERWRITE good slices (this silently corrupted 33 objects).
             const guarded = record as { recoveryComment?: unknown; dataVolumes?: unknown; parityVolumes?: unknown; sliceErrors?: Record<string, unknown> } | null;
-            if (guarded && guarded.recoveryComment != null && guarded.recoveryComment !== '') {
+            if (isDocumentedDead(guarded)) {
                 this.log('skipping repair of %s slice %d: object marked unrecoverable', fault.objectId, fault.sliceIndex);
-                await this.deps.remediationService.markRepairBlocked(fault.key, 'unrecoverable', { message: `object marked unrecoverable: ${String(guarded.recoveryComment)}` });
+                await this.deps.remediationService.markRepairBlocked(fault.key, 'unrecoverable', { message: `object marked unrecoverable: ${String(guarded?.recoveryComment)}` });
                 return 'processed';
             }
             if (guarded && Array.isArray(guarded.dataVolumes) && Array.isArray(guarded.parityVolumes) && guarded.sliceErrors) {

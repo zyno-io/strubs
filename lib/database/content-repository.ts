@@ -353,8 +353,26 @@ export class ContentRepository {
             isFile: true,
             $or: [{ dataVolumes: volumeId }, { parityVolumes: volumeId }]
         };
-        if (opts?.excludeDead)
-            (query as Record<string, unknown>).recoveryComment = { $exists: false };
+        // This predicate MUST mean exactly what isDocumentedDead() means, or a volume can be reported
+        // fully drained while it still holds a live slice -- and then removed. Dead == recoveryComment
+        // is a NON-EMPTY STRING; everything else (missing, null, empty, or any non-string) is live.
+        //
+        // It has to be $expr. Ordinary field queries apply ARRAY-ELEMENT semantics -- `{$gt: ''}` matches
+        // a document whose recoveryComment is `['x']`, because an *element* is > '' -- so it would call
+        // that dead while isDocumentedDead() (a plain `typeof`) calls it live. Aggregation `$type` has no
+        // such semantics: it reports the type of the whole value ('array'), mirroring `typeof` exactly.
+        // ($exists:false would call an empty comment dead; $in:[null,''] would call a non-string one
+        // dead. Every one of these is the same data-loss shape, approached from a different direction.)
+        if (opts?.excludeDead) {
+            (query as Record<string, unknown>).$expr = {
+                $not: [{
+                    $and: [
+                        { $eq: [{ $type: '$recoveryComment' }, 'string'] },
+                        { $ne: ['$recoveryComment', ''] }
+                    ]
+                }]
+            };
+        }
         return this.collection.countDocuments(query);
     }
 

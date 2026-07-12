@@ -63,6 +63,68 @@ describe('DrainVolumeJob', () => {
         expect(deps.recordRelocated).toHaveBeenCalledWith(5, 21, 4000, 1000, false);
     });
 
+    it('an EMPTY recoveryComment does not mean dead — the object is still relocated', async () => {
+        // The three call sites had drifted to three different tests for "dead". An empty comment was
+        // skipped here (slice left on the volume) yet excluded from countObjectsOnVolume(excludeDead)
+        // (volume reported fully drained) -- so the disk could be pulled and the slice silently lost.
+        // Dead now means exactly: a NON-EMPTY recoveryComment.
+        const doc = objectDoc({ recoveryComment: '' });
+        const { job, deps } = makeJob({
+            database: {
+                findObjectsOnVolume: vi.fn().mockResolvedValueOnce([doc]).mockResolvedValue([]),
+                replaceObjectVolumeRef: vi.fn().mockResolvedValue(true),
+                getObjectById: vi.fn(),
+                countObjectsOnVolume: vi.fn().mockResolvedValue(0)
+            }
+        });
+
+        await runDrain(job, 5);
+
+        expect(deps.repairSlice).toHaveBeenCalledTimes(1);          // relocated, not skipped
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalled();
+    });
+
+    it('skips a documented-dead object (non-empty recoveryComment)', async () => {
+        const doc = objectDoc({ recoveryComment: 'drive gone, insufficient slices' });
+        const { job, deps } = makeJob({
+            database: {
+                findObjectsOnVolume: vi.fn().mockResolvedValueOnce([doc]).mockResolvedValue([]),
+                replaceObjectVolumeRef: vi.fn().mockResolvedValue(true),
+                getObjectById: vi.fn(),
+                countObjectsOnVolume: vi.fn().mockResolvedValue(0)
+            }
+        });
+
+        await runDrain(job, 5);
+
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.database.replaceObjectVolumeRef).not.toHaveBeenCalled();
+    });
+
+    it('refuses to relocate an object holding two slices on the draining volume', async () => {
+        // replaceObjectVolumeRef rewrites EVERY position matching the volume, but a drain relocates one
+        // file. Flipping both refs at the single copy would orphan the other slice -- turning a
+        // recoverable slice into a lost one, while making the volume look safely drained.
+        const doc = objectDoc({ dataVolumes: [5, 5, 11, 12] });
+        const { job, deps } = makeJob({
+            database: {
+                findObjectsOnVolume: vi.fn().mockResolvedValueOnce([doc]).mockResolvedValue([]),
+                replaceObjectVolumeRef: vi.fn().mockResolvedValue(true),
+                getObjectById: vi.fn(),
+                countObjectsOnVolume: vi.fn().mockResolvedValue(1) // still referenced -> not fully drained
+            }
+        });
+
+        await runDrain(job, 5);
+
+        expect(deps.repairSlice).not.toHaveBeenCalled();
+        expect(deps.tryCopyRelocate).not.toHaveBeenCalled();
+        expect(deps.database.replaceObjectVolumeRef).not.toHaveBeenCalled();
+        expect(deps.deleteSlice).not.toHaveBeenCalled();
+        // and the volume must NOT be declared drained while it still holds that slice
+        expect(deps.markDrainComplete).not.toHaveBeenCalled();
+    });
+
     it('uses copy-first when the source is online and the copy validates (no reconstruction)', async () => {
         const { job, deps } = makeJob({ tryCopyRelocate: vi.fn().mockResolvedValue(true) });
         await runDrain(job, 5);

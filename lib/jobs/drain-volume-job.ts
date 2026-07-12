@@ -6,6 +6,7 @@ import { runtimeConfig } from '../runtime-config';
 import { isMaintenanceFrozen } from '../maintenance';
 import type { Volume } from '../io/volume';
 import { domainLoadForObject, domainLoadFor } from '../io/failure-domain';
+import { isDocumentedDead } from '../database/types';
 import type { ContentDocument } from '../database/types';
 
 // Persisted drain progress (so a restart resumes the in-flight drain before routine maintenance).
@@ -14,7 +15,9 @@ const DRAIN_CURSOR_ID_KEY = 'drainCursorId';
 const BATCH_SIZE = 100;
 
 type LoadedObject = { dataSliceVolumeIds: number[]; paritySliceVolumeIds: number[]; dataSliceCount: number; sliceSize: number };
-type DrainSummary = { objects: number; relocated: number; unrecoverable: number; skippedDead: number; noDest: number };
+// skippedDead/duplicateRefs are SETS of object ids, not counters: the pass loop re-scans leftovers,
+// so the same object can be skipped repeatedly. We want 'objects affected', not 'attempts'.
+type DrainSummary = { objects: number; relocated: number; unrecoverable: number; skippedDead: Set<string>; noDest: number; duplicateRefs: Set<string> };
 
 type DrainVolumeJobDeps = {
     database: Pick<typeof database, 'findObjectsOnVolume' | 'replaceObjectVolumeRef' | 'getObjectById' | 'countObjectsOnVolume'>;
@@ -164,7 +167,7 @@ export class DrainVolumeJob {
         this.aborted = false;
         this.activeVolumeId = volumeId;
         this.attemptedVolumeIds.add(volumeId);
-        const s: DrainSummary = { objects: 0, relocated: 0, unrecoverable: 0, skippedDead: 0, noDest: 0 };
+        const s: DrainSummary = { objects: 0, relocated: 0, unrecoverable: 0, skippedDead: new Set(), noDest: 0, duplicateRefs: new Set() };
         this.log('draining volume %d — reconstructing and relocating its slices', volumeId);
         let completed = false;    // the drain loop ran to its natural end (not paused/aborted/frozen)
         let fullyDrained = false; // zero live (non-dead) slices remain — safe to signal the drive removable
@@ -192,7 +195,7 @@ export class DrainVolumeJob {
                     cursor = (batch[batch.length - 1] as { id: string }).id;
                     await this.deps.runtimeConfig.set(DRAIN_CURSOR_ID_KEY, cursor);
                     if (s.objects % 1000 === 0)
-                        this.log('  ...%d objects, %d relocated, %d unrecoverable, %d dead-skipped', s.objects, s.relocated, s.unrecoverable, s.skippedDead);
+                        this.log('  ...%d objects, %d relocated, %d unrecoverable, %d dead-skipped', s.objects, s.relocated, s.unrecoverable, s.skippedDead.size);
                     if (this.deps.delayMs > 0)
                         await new Promise(r => setTimeout(r, this.deps.delayMs));
                 }
@@ -202,7 +205,8 @@ export class DrainVolumeJob {
                 const remaining = await this.deps.database.countObjectsOnVolume(volumeId, { excludeDead: true });
                 if (remaining === 0) { fullyDrained = true; break passLoop; }
                 if (remaining >= prevRemaining) {
-                    this.log.error('drain of volume %d stuck: %d live slice(s) could not be relocated (below quorum / no target) — removal blocked', volumeId, remaining);
+                    this.log.error('drain of volume %d stuck: %d live slice(s) could not be relocated (below quorum / no target / %d object(s) holding duplicate refs on this volume) — removal blocked',
+                        volumeId, remaining, s.duplicateRefs.size);
                     break passLoop;
                 }
                 this.log('drain of volume %d: %d live ref(s) remain after pass (transient failures) — re-scanning', volumeId, remaining);
@@ -261,7 +265,7 @@ export class DrainVolumeJob {
         // Documented-dead objects (recoveryComment) can't be relocated (their surviving slices are
         // foreign/insufficient); treat as accepted loss and leave their ref -- deletion is unblocked
         // separately once the operator accepts that loss.
-        if ((doc as { recoveryComment?: unknown }).recoveryComment != null) { s.skippedDead++; return; }
+        if (isDocumentedDead(doc)) { s.skippedDead.add((doc as { id: string }).id); return; }
 
         const dataVols = (doc as { dataVolumes?: number[] }).dataVolumes ?? [];
         const parityVols = (doc as { parityVolumes?: number[] }).parityVolumes ?? [];
@@ -269,6 +273,16 @@ export class DrainVolumeJob {
         const idx = all.indexOf(volumeId);
         if (idx < 0)
             return; // no longer here (already relocated / concurrent change)
+
+        // replaceObjectVolumeRef rewrites EVERY array position holding volumeId, but we relocate exactly
+        // ONE file (the first match). If an object has two slices on this volume, flipping would repoint
+        // both refs at the single copy and orphan the other -- turning a recoverable slice into a lost
+        // one, while making the volume look safely drained. Refuse; it needs a human.
+        if (all.lastIndexOf(volumeId) !== idx) {
+            this.log.error('object %s has multiple slices on volume %d: skipping (unsafe to relocate)', (doc as { id?: string }).id, volumeId);
+            s.duplicateRefs.add((doc as { id: string }).id);
+            return;
+        }
 
         const objectVols = new Set(all);
         // Keep a legitimately-zero slice size as 0 (a zero-byte object needs ~no space) instead of
@@ -344,8 +358,8 @@ export class DrainVolumeJob {
     }
 
     private async finalize(volumeId: number, s: DrainSummary, fullyDrained: boolean): Promise<void> {
-        this.log('drain of volume %d finished: %d objects, %d relocated, %d unrecoverable, %d dead-skipped, %d no-dest',
-            volumeId, s.objects, s.relocated, s.unrecoverable, s.skippedDead, s.noDest);
+        this.log('drain of volume %d finished: %d objects, %d relocated, %d unrecoverable, %d dead-skipped, %d no-dest, %d duplicate-refs',
+            volumeId, s.objects, s.relocated, s.unrecoverable, s.skippedDead.size, s.noDest, s.duplicateRefs.size);
         // Clear the persisted progress cursor either way: a stuck drain must not tight-loop-resume on
         // every restart, and a done drain has nothing to resume.
         await this.deps.runtimeConfig.delete(DRAIN_VOLUME_ID_KEY);
