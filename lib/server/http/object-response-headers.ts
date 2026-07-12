@@ -16,6 +16,42 @@ export function applyFileMetadataHeaders(res: HttpResponse, record: StoredObject
         res.setHeader('Content-Type', record.mime);
 }
 
+// Content types that a browser may render INLINE without executing anything the uploader controls.
+// Deliberately narrow: `image/svg+xml` is NOT here -- an SVG can carry <script>, so it is treated like
+// any other active content and forced to download. Everything not on this list downloads rather than
+// renders, which is what neutralises "upload evil.html to a public bucket, get an admin to open it".
+const INLINE_SAFE = new Set([
+    'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
+    'image/bmp', 'image/x-icon', 'image/tiff'
+]);
+function isInlineSafe(mime: string | null | undefined): boolean {
+    if (!mime)
+        return false;
+    const type = mime.split(';')[0].trim().toLowerCase();
+    return INLINE_SAFE.has(type) || type.startsWith('video/') || type.startsWith('audio/') || type === 'application/octet-stream';
+}
+
+// Defence in depth against object-hosted active content. The origin split (object API on its own
+// port/scheme) is the real boundary; these headers ensure that even so, uploaded HTML/SVG/JS cannot
+// execute in a browser that opens it directly.
+//   - nosniff: the browser honours our Content-Type instead of guessing an executable one;
+//   - CSP: even if rendered, the content can load/run nothing;
+//   - Content-Disposition: attachment for anything not inline-safe, so it downloads instead of rendering.
+// A caller-supplied disposition (?download_as) already forces a download, so it is left untouched.
+export function applyObjectSecurityHeaders(res: HttpResponse, record: StoredObjectRecord): void {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+
+    if (!res.hasHeader('Content-Disposition') && !isInlineSafe(record.mime))
+        res.setHeader('Content-Disposition', 'attachment');
+}
+
+// A filename for Content-Disposition, with quotes/backslashes/control chars stripped so a hostile
+// ?download_as value cannot inject additional header directives or break out of the quoted string.
+export function sanitizeDispositionFilename(name: string): string {
+    return name.replace(/[\r\n"\\]/g, '').replace(/[\x00-\x1f]/g, '').slice(0, 255);
+}
+
 export function applySliceHeaders(res: HttpResponse, record: StoredObjectRecord): void {
     res.setHeader('X-Data-Slice-Count', record.dataVolumes.length);
     res.setHeader('X-Data-Slice-Volumes', record.dataVolumes.join(','));

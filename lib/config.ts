@@ -57,6 +57,19 @@ export class Config {
     identity: string | null = null;
     identityBuffer: Buffer | null = null;
 
+    // Listeners. The object API and the admin surface (management API + UI) are on SEPARATE ORIGINS,
+    // by port and scheme, so object-hosted content can never script the admin API (a stored-XSS ->
+    // disk-wipe path otherwise). Object API is HTTP on httpPort; admin is HTTPS-only on adminPort.
+    httpPort: number;
+    adminPort: number;
+    // Self-issued TLS for the admin listener. tlsDir holds the generated CA + leaf; tlsCertPath/
+    // tlsKeyPath override with a bring-your-own pair. tlsExtraHosts adds SANs beyond the host's own
+    // names/IPs (a real DNS name, a VIP). See lib/server/tls.ts.
+    tlsDir: string;
+    tlsCertPath: string | null;
+    tlsKeyPath: string | null;
+    tlsExtraHosts: string[];
+
     // Notifications. Slack is optional; when no webhook is set only the log
     // transport is active. Severity/cooldown tune routing and de-duplication.
     slackWebhookUrl: string | null;
@@ -154,6 +167,13 @@ export class Config {
         // Full-mode scrub also validates parity (recompute-and-compare); disable with =false.
         this.verifyParity = process.env.STRUBS_VERIFY_PARITY !== 'false';
         this.fuseEnabled = process.env.STRUBS_FUSE_ENABLED === 'true';
+        this.httpPort = parsePositiveInt(process.env.STRUBS_HTTP_PORT, 80);
+        this.adminPort = parsePositiveInt(process.env.STRUBS_ADMIN_PORT, 443);
+        this.tlsDir = process.env.STRUBS_TLS_DIR || '/var/lib/strubs/tls';
+        this.tlsCertPath = process.env.STRUBS_TLS_CERT || null;
+        this.tlsKeyPath = process.env.STRUBS_TLS_KEY || null;
+        this.tlsExtraHosts = (process.env.STRUBS_TLS_HOSTS || '')
+            .split(',').map(h => h.trim()).filter(Boolean);
         this.drainConcurrency = parsePositiveInt(process.env.STRUBS_DRAIN_CONCURRENCY, DEFAULT_DRAIN_CONCURRENCY);
         this.deviceReconcileIntervalMs = parseNonNegativeInt(
             process.env.STRUBS_DEVICE_RECONCILE_INTERVAL_MS,

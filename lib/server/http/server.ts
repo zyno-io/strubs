@@ -1,4 +1,5 @@
 import http from 'http';
+import https from 'https';
 import querystring from 'querystring';
 
 import { createLogger } from '../../log';
@@ -45,19 +46,34 @@ const defaultDeps: HttpServerDependencies = {
     ObjectDeleteRequest
 };
 
+// The two surfaces live on SEPARATE ORIGINS (see lib/server/tls.ts and the auth design). An 'object'
+// listener serves only the object API and 404s any `/$/` path; an 'admin' listener serves only the
+// management API + UI and 404s everything else. 'all' is the legacy single-origin behaviour, kept for
+// tests. The separation is a security boundary, so a cross-origin path is a hard 404, never a redirect.
+export type HttpServerRole = 'object' | 'admin' | 'all';
+
+export interface HttpServerOptions {
+    role?: HttpServerRole;
+    tls?: { key: Buffer; cert: Buffer };
+}
+
 export class HttpServer {
     public port: number;
+    public readonly role: HttpServerRole;
     private _requestCount = 0;
     private readonly _server: http.Server;
     private readonly _routes: Record<string, RouteHandler>;
     private readonly _managementRoute: RouteHandler;
     private readonly deps: HttpServerDependencies;
 
-    constructor(port = 80, server?: http.Server, deps?: Partial<HttpServerDependencies>) {
+    constructor(port = 80, server?: http.Server, deps?: Partial<HttpServerDependencies>, options?: HttpServerOptions) {
         this.port = port;
+        this.role = options?.role ?? 'all';
         this.deps = { ...defaultDeps, ...deps };
 
-        this._server = server ?? http.createServer();
+        this._server = server ?? (options?.tls
+            ? https.createServer({ key: options.tls.key, cert: options.tls.cert })
+            : http.createServer());
         this._server.on('listening', this._handleHttpListening.bind(this));
         this._server.on('close', this._handleHttpClose.bind(this));
         this._server.on('request', this._handleHttpRequest.bind(this));
@@ -156,11 +172,23 @@ export class HttpServer {
     }
 
     private _resolveRoute(method: string, path: string): RouteHandler | null {
-        if (path.startsWith('/$/'))
+        const isAdminPath = path.startsWith('/$/');
+
+        // Enforce the origin boundary. A path meant for the other surface is Not Found here -- the
+        // separation is what stops object-hosted script from reaching the admin API, so it must be a
+        // hard 404, never served and never redirected.
+        if (this.role === 'object' && isAdminPath)
+            return this._notFoundRoute;
+        if (this.role === 'admin' && !isAdminPath)
+            return this._notFoundRoute;
+
+        if (isAdminPath)
             return this._managementRoute;
 
         return this._routes[method] ?? null;
     }
+
+    private _notFoundRoute: RouteHandler = async (_id, req, res) => this._outputHttpNotFound(req, res);
 
     private async _handleHttpManagementRequest(requestId: number, req: HttpRequest, res: HttpResponse): Promise<void> {
         try {

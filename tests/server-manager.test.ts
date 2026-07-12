@@ -14,6 +14,8 @@ const httpStartMock = vi.fn();
 const httpStopMock = vi.fn();
 const fuseStartMock = vi.fn();
 const fuseStopMock = vi.fn();
+const adminStartMock = vi.fn();
+const adminStopMock = vi.fn();
 
 const HttpServerMock = vi.fn(function () {
     return {
@@ -44,6 +46,8 @@ describe('serverManager', () => {
         httpStopMock.mockClear();
         fuseStartMock.mockClear();
         fuseStopMock.mockClear();
+        adminStartMock.mockClear();
+        adminStopMock.mockClear();
         HttpServerMock.mockClear();
         FuseServerMock.mockClear();
     });
@@ -51,7 +55,8 @@ describe('serverManager', () => {
     it('starts both HTTP and FUSE servers when FUSE is enabled', async () => {
         const { ServerManager } = await import('../lib/server/manager');
         const manager = new ServerManager({
-            createHttpServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createObjectServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
             createFuseServer: () => ({ start: fuseStartMock, stop: fuseStopMock })
         });
 
@@ -64,7 +69,8 @@ describe('serverManager', () => {
     it('awaits an async createFuseServer (the default lazy-imports the native binding)', async () => {
         const { ServerManager } = await import('../lib/server/manager');
         const manager = new ServerManager({
-            createHttpServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createObjectServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
             createFuseServer: async () => ({ start: fuseStartMock, stop: fuseStopMock })
         });
 
@@ -76,7 +82,8 @@ describe('serverManager', () => {
     it('runs HTTP-only when FUSE is disabled (createFuseServer returns null)', async () => {
         const { ServerManager } = await import('../lib/server/manager');
         const manager = new ServerManager({
-            createHttpServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createObjectServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
             createFuseServer: () => null   // STRUBS_FUSE_ENABLED=false
         });
 
@@ -93,7 +100,8 @@ describe('serverManager', () => {
     it('stops all managed servers', async () => {
         const { ServerManager } = await import('../lib/server/manager');
         const manager = new ServerManager({
-            createHttpServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createObjectServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
             createFuseServer: () => ({ start: fuseStartMock, stop: fuseStopMock })
         });
 
@@ -106,15 +114,16 @@ describe('serverManager', () => {
 
     it('does not restart servers when start is called twice', async () => {
         const { ServerManager } = await import('../lib/server/manager');
-        const createHttpServer = vi.fn(() => ({ start: httpStartMock, stop: httpStopMock }));
+        const createObjectServer = vi.fn(() => ({ start: httpStartMock, stop: httpStopMock }));
         const manager = new ServerManager({
-            createHttpServer,
+            createObjectServer,
+            createAdminServer: async () => ({ start: adminStartMock, stop: adminStopMock }),
             createFuseServer: () => ({ start: fuseStartMock, stop: fuseStopMock })
         });
 
         await manager.start();
         await manager.start();
 
-        expect(createHttpServer).toHaveBeenCalledTimes(1);
+        expect(createObjectServer).toHaveBeenCalledTimes(1);
     });
 });

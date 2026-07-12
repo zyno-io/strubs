@@ -119,7 +119,7 @@ describe('HttpServer', () => {
         });
     });
 
-    const importServer = async () => {
+    const importServer = async (role?: 'object' | 'admin' | 'all') => {
         const nodeServer = createNodeServer();
         const { HttpServer } = await import('../lib/server/http/server');
         const server = new HttpServer(8080, nodeServer as unknown as http.Server, {
@@ -128,7 +128,7 @@ describe('HttpServer', () => {
             ObjectOptionsRequest: objectOptions.Class as any,
             ObjectPutRequest: objectPut.Class as any,
             ObjectDeleteRequest: objectDelete.Class as any,
-        });
+        }, role ? { role } : undefined);
         return server as unknown as {
             _handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void>;
         };
@@ -166,6 +166,37 @@ describe('HttpServer', () => {
         expect(resData.status).toBe(200);
         expect(resData.headers).toMatchObject({ 'content-type': 'application/json' });
         expect(typeof resData.body).toBe('string');
+    });
+
+    it('ORIGIN SPLIT: an object-role listener 404s any /$/ path (never routes to mgmt)', async () => {
+        const server = await importServer('object');
+        const { req, res, resData } = createReqRes('GET', '/$/volumes');
+
+        await server._handleHttpRequest(req, res);
+
+        expect(mgmtHandle).not.toHaveBeenCalled();   // the management handler is unreachable here
+        expect(resData.status).toBe(404);
+    });
+
+    it('ORIGIN SPLIT: an admin-role listener 404s object paths (never serves object content)', async () => {
+        const server = await importServer('admin');
+        const { req, res, resData } = createReqRes('GET', '/photo/cat.jpg');
+
+        await server._handleHttpRequest(req, res);
+
+        expect(objectGet.ctor).not.toHaveBeenCalled();  // no object request was ever constructed
+        expect(resData.status).toBe(404);
+    });
+
+    it('ORIGIN SPLIT: an admin-role listener still serves /$/ routes', async () => {
+        const server = await importServer('admin');
+        const { req, res, resData } = createReqRes('GET', '/$/volumes');
+        mgmtHandle.mockResolvedValueOnce({ healthy: true });
+
+        await server._handleHttpRequest(req, res);
+
+        expect(mgmtHandle).toHaveBeenCalledTimes(1);
+        expect(resData.status).toBe(200);
     });
 
     it('dispatches GET to ObjectGetRequest when object exists', async () => {

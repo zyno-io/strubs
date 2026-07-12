@@ -1,6 +1,7 @@
 import { HttpServer } from './http/server';
 import { config } from '../config';
 import { createLogger } from '../log';
+import { ensureTlsMaterial } from './tls';
 
 const log = createLogger('server-manager');
 
@@ -11,7 +12,11 @@ type ServerLifecycle = {
 
 type MaybeServer = ServerLifecycle | null;
 type ServerManagerDeps = {
-    createHttpServer: () => ServerLifecycle;
+    // The object API and the admin surface are separate origins (own port + scheme) -- see tls.ts and
+    // the auth design. Object API is HTTP on config.httpPort; admin (management + UI) is HTTPS-only on
+    // config.adminPort, so object-hosted script can never reach the admin cookie.
+    createObjectServer: () => ServerLifecycle;
+    createAdminServer: () => Promise<ServerLifecycle>;
     // Returns null when FUSE is disabled. The import is dynamic so that a disabled FUSE never loads the
     // native fuse-native binding (fuse-native/index.js pulls it in at require-time) -- STRUBS then runs
     // on a host with no /dev/fuse or no binding built. Object access is unaffected.
@@ -19,7 +24,11 @@ type ServerManagerDeps = {
 };
 
 const defaultDeps: ServerManagerDeps = {
-    createHttpServer: () => new HttpServer(),
+    createObjectServer: () => new HttpServer(config.httpPort, undefined, undefined, { role: 'object' }),
+    createAdminServer: async () => {
+        const tls = await ensureTlsMaterial();
+        return new HttpServer(config.adminPort, undefined, undefined, { role: 'admin', tls });
+    },
     createFuseServer: () => {
         if (!config.fuseEnabled)
             return null;
@@ -56,11 +65,14 @@ export class ServerManager {
 
     private async _startServers(): Promise<void> {
         log('starting server manager');
-        const httpServer = this.deps.createHttpServer();
+        const objectServer = this.deps.createObjectServer();
+        const adminServer = await this.deps.createAdminServer();
         const fuseServer = await this.deps.createFuseServer();
         if (!fuseServer)
-            log('FUSE disabled: the HTTP object API is the only access path (set STRUBS_FUSE_ENABLED=true to mount)');
-        this.servers = fuseServer ? [httpServer, fuseServer] : [httpServer];
+            log('FUSE disabled: the HTTP object API is the only local access path (set STRUBS_FUSE_ENABLED=true to mount)');
+        this.servers = fuseServer
+            ? [objectServer, adminServer, fuseServer]
+            : [objectServer, adminServer];
         for (const server of this.servers)
             await Promise.resolve(server.start());
     }

@@ -1,6 +1,6 @@
 import type { StoredObjectRecord } from '../../io/file-object';
 import type { HttpRequest, HttpResponse } from './server';
-import { applyFileMetadataHeaders, applyObjectIdentityHeaders, applySliceHeaders } from './object-response-headers';
+import { applyFileMetadataHeaders, applyObjectIdentityHeaders, applySliceHeaders, applyObjectSecurityHeaders } from './object-response-headers';
 
 export class ObjectHeadRequest {
     private readonly objectRecord: StoredObjectRecord;
@@ -27,6 +27,7 @@ export class ObjectHeadRequest {
             this.response.setHeader('Content-Length', this.objectRecord.size);
             applyFileMetadataHeaders(this.response, this.objectRecord);
             applySliceHeaders(this.response, this.objectRecord);
+            applyObjectSecurityHeaders(this.response, this.objectRecord);
         }
 
         this.response.end();

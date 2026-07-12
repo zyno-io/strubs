@@ -174,6 +174,10 @@ class MockHttpResponse extends Writable {
         this.headers[name] = value;
     }
 
+    hasHeader(name: string): boolean {
+        return Object.prototype.hasOwnProperty.call(this.headers, name);
+    }
+
     writeHead(statusCode: number, statusMessage?: string | Headers, headers?: Headers): this {
         this.statusCode = statusCode;
         if (typeof statusMessage === 'string') {
@@ -523,6 +527,38 @@ describe('ObjectGetRequest', () => {
         expect(res.statusCode).toBe(200);
         expect(res.body.toString()).toBe('payload');
         expect(res.headers['Content-Length']).toBe(record.size);
+        // Active-content hardening on every object response.
+        expect(res.headers['X-Content-Type-Options']).toBe('nosniff');
+        expect(res.headers['Content-Security-Policy']).toBe("default-src 'none'; sandbox");
+        // octet-stream is inline-safe, so no forced download.
+        expect(res.headers['Content-Disposition']).toBeUndefined();
+    });
+
+    it('forces a download for active content types (html, svg) so they cannot execute', async () => {
+        for (const mime of ['text/html', 'image/svg+xml', 'application/json', 'application/xml']) {
+            const record = { ...createObjectRecord(), mime };
+            const req = buildRequest();
+            const res = buildResponse();
+            const request = new ObjectGetRequest(1, record, req as any, res as any);
+            const promise = request.process();
+            flushFileObject('x');
+            await promise;
+            expect(res.headers['Content-Disposition'], mime).toBe('attachment');
+            expect(res.headers['X-Content-Type-Options'], mime).toBe('nosniff');
+        }
+    });
+
+    it('serves genuinely-inert media inline (image/video/audio)', async () => {
+        for (const mime of ['image/jpeg', 'image/png', 'video/mp4', 'audio/mpeg']) {
+            const record = { ...createObjectRecord(), mime };
+            const req = buildRequest();
+            const res = buildResponse();
+            const request = new ObjectGetRequest(1, record, req as any, res as any);
+            const promise = request.process();
+            flushFileObject('x');
+            await promise;
+            expect(res.headers['Content-Disposition'], mime).toBeUndefined();
+        }
     });
 
     it('handles range requests and sets the appropriate headers', async () => {

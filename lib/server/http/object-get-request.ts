@@ -2,7 +2,7 @@ import { type StoredObjectRecord, type FileObject } from '../../io/file-object';
 import { fileObjectService, type FileObjectService } from '../../io/file-object/service';
 import { createLogger } from '../../log';
 import type { HttpRequest, HttpResponse } from './server';
-import { applyFileMetadataHeaders, applyObjectIdentityHeaders, applySliceHeaders } from './object-response-headers';
+import { applyFileMetadataHeaders, applyObjectIdentityHeaders, applySliceHeaders, applyObjectSecurityHeaders, sanitizeDispositionFilename } from './object-response-headers';
 
 // TODO: GET and HEAD should import from the same object (or Get from Head?) and have a shared write headers function
 // TODO: add "returned bytes" count for metrics and logging
@@ -41,7 +41,10 @@ export class ObjectGetRequest {
 
             const downloadAs = this.request.params.download_as;
             if (typeof downloadAs === 'string' && downloadAs.length)
-                this.response.setHeader('Content-Disposition', `attachment; filename="${downloadAs}"`);
+                this.response.setHeader('Content-Disposition', `attachment; filename="${sanitizeDispositionFilename(downloadAs)}"`);
+
+            // After any caller-supplied disposition, before serving the body: neuter active content.
+            applyObjectSecurityHeaders(this.response, this.objectRecord);
 
             const object = await this.deps.fileObjectService.openForRead(this.objectRecord, { requestId: `http-${this.requestId}` });
 
