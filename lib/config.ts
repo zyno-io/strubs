@@ -93,6 +93,12 @@ export class Config {
     verifyReadDelayMs: number;
     verifyParity: boolean;
 
+    // Mount the read-only FUSE filesystem at /run/strubs/data. OPT-IN (off by default): it is a second,
+    // unauthenticated read path to every object and it needs the native fuse-native binding plus
+    // /dev/fuse. Enable with STRUBS_FUSE_ENABLED=true. When off, the binding is never even loaded, so
+    // STRUBS runs on a host without it. The HTTP object API is unaffected either way.
+    fuseEnabled: boolean;
+
     // How many objects a drain relocates concurrently. Higher = faster on drives that can absorb the
     // parallel I/O, but the aging USB-DAS enclosures are seek-bound, so raise it in small steps and
     // measure. Override with STRUBS_DRAIN_CONCURRENCY.
@@ -147,6 +153,7 @@ export class Config {
         );
         // Full-mode scrub also validates parity (recompute-and-compare); disable with =false.
         this.verifyParity = process.env.STRUBS_VERIFY_PARITY !== 'false';
+        this.fuseEnabled = process.env.STRUBS_FUSE_ENABLED === 'true';
         this.drainConcurrency = parsePositiveInt(process.env.STRUBS_DRAIN_CONCURRENCY, DEFAULT_DRAIN_CONCURRENCY);
         this.deviceReconcileIntervalMs = parseNonNegativeInt(
             process.env.STRUBS_DEVICE_RECONCILE_INTERVAL_MS,

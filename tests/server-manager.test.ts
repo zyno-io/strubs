@@ -48,34 +48,73 @@ describe('serverManager', () => {
         FuseServerMock.mockClear();
     });
 
-    it('starts both HTTP and FUSE servers', async () => {
-        const { serverManager } = await import('../lib/server/manager');
+    it('starts both HTTP and FUSE servers when FUSE is enabled', async () => {
+        const { ServerManager } = await import('../lib/server/manager');
+        const manager = new ServerManager({
+            createHttpServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createFuseServer: () => ({ start: fuseStartMock, stop: fuseStopMock })
+        });
 
-        await serverManager.start();
+        await manager.start();
 
-        expect(HttpServerMock).toHaveBeenCalledTimes(1);
-        expect(FuseServerMock).toHaveBeenCalledTimes(1);
         expect(httpStartMock).toHaveBeenCalledTimes(1);
         expect(fuseStartMock).toHaveBeenCalledTimes(1);
     });
 
-    it('stops all managed servers', async () => {
-        const { serverManager } = await import('../lib/server/manager');
+    it('awaits an async createFuseServer (the default lazy-imports the native binding)', async () => {
+        const { ServerManager } = await import('../lib/server/manager');
+        const manager = new ServerManager({
+            createHttpServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createFuseServer: async () => ({ start: fuseStartMock, stop: fuseStopMock })
+        });
 
-        await serverManager.start();
-        await serverManager.stop();
+        await manager.start();
+
+        expect(fuseStartMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('runs HTTP-only when FUSE is disabled (createFuseServer returns null)', async () => {
+        const { ServerManager } = await import('../lib/server/manager');
+        const manager = new ServerManager({
+            createHttpServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createFuseServer: () => null   // STRUBS_FUSE_ENABLED=false
+        });
+
+        await manager.start();
+
+        expect(httpStartMock).toHaveBeenCalledTimes(1);
+        expect(fuseStartMock).not.toHaveBeenCalled();
+
+        // stop() must not choke on the absent FUSE server
+        await manager.stop();
+        expect(httpStopMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops all managed servers', async () => {
+        const { ServerManager } = await import('../lib/server/manager');
+        const manager = new ServerManager({
+            createHttpServer: () => ({ start: httpStartMock, stop: httpStopMock }),
+            createFuseServer: () => ({ start: fuseStartMock, stop: fuseStopMock })
+        });
+
+        await manager.start();
+        await manager.stop();
 
         expect(httpStopMock).toHaveBeenCalledTimes(1);
         expect(fuseStopMock).toHaveBeenCalledTimes(1);
     });
 
     it('does not restart servers when start is called twice', async () => {
-        const { serverManager } = await import('../lib/server/manager');
+        const { ServerManager } = await import('../lib/server/manager');
+        const createHttpServer = vi.fn(() => ({ start: httpStartMock, stop: httpStopMock }));
+        const manager = new ServerManager({
+            createHttpServer,
+            createFuseServer: () => ({ start: fuseStartMock, stop: fuseStopMock })
+        });
 
-        await serverManager.start();
-        await serverManager.start();
+        await manager.start();
+        await manager.start();
 
-        expect(HttpServerMock).toHaveBeenCalledTimes(1);
-        expect(FuseServerMock).toHaveBeenCalledTimes(1);
+        expect(createHttpServer).toHaveBeenCalledTimes(1);
     });
 });

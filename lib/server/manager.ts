@@ -1,5 +1,5 @@
 import { HttpServer } from './http/server';
-import { FuseServer } from './fuse/server';
+import { config } from '../config';
 import { createLogger } from '../log';
 
 const log = createLogger('server-manager');
@@ -9,14 +9,25 @@ type ServerLifecycle = {
     stop?: () => void | Promise<void>;
 };
 
+type MaybeServer = ServerLifecycle | null;
 type ServerManagerDeps = {
     createHttpServer: () => ServerLifecycle;
-    createFuseServer: () => ServerLifecycle;
+    // Returns null when FUSE is disabled. The import is dynamic so that a disabled FUSE never loads the
+    // native fuse-native binding (fuse-native/index.js pulls it in at require-time) -- STRUBS then runs
+    // on a host with no /dev/fuse or no binding built. Object access is unaffected.
+    createFuseServer: () => MaybeServer | Promise<MaybeServer>;
 };
 
 const defaultDeps: ServerManagerDeps = {
     createHttpServer: () => new HttpServer(),
-    createFuseServer: () => new FuseServer()
+    createFuseServer: () => {
+        if (!config.fuseEnabled)
+            return null;
+        // Lazy require (not a top-level import) so the native fuse-native binding is loaded only when
+        // FUSE is actually enabled -- matches the codebase's lazy-load idiom (see repair-worker).
+        const { FuseServer } = require('./fuse/server') as typeof import('./fuse/server');
+        return new FuseServer();
+    }
 };
 
 export class ServerManager {
@@ -46,8 +57,10 @@ export class ServerManager {
     private async _startServers(): Promise<void> {
         log('starting server manager');
         const httpServer = this.deps.createHttpServer();
-        const fuseServer = this.deps.createFuseServer();
-        this.servers = [httpServer, fuseServer];
+        const fuseServer = await this.deps.createFuseServer();
+        if (!fuseServer)
+            log('FUSE disabled: the HTTP object API is the only access path (set STRUBS_FUSE_ENABLED=true to mount)');
+        this.servers = fuseServer ? [httpServer, fuseServer] : [httpServer];
         for (const server of this.servers)
             await Promise.resolve(server.start());
     }
