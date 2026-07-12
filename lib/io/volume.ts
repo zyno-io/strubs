@@ -161,7 +161,11 @@ export class Volume extends EventEmitter {
         this.comment = value;
     }
 
-    async start(): Promise<void> {
+    // `initializeIdentity` is passed ONLY by the provisioning path (a brand-new, just-formatted disk that
+    // legitimately has no identity yet). Every other caller -- fleet start, hotplug remount, the device
+    // reconciler, recovery probing -- leaves it off, so an unrecognised disk is REJECTED rather than
+    // silently stamped as ours.
+    async start(opts: { initializeIdentity?: boolean } = {}): Promise<void> {
         try {
             this.log('starting...');
 
@@ -169,6 +173,9 @@ export class Volume extends EventEmitter {
                 this.log('not mounted.');
                 await this.mount();
             }
+
+            if (opts.initializeIdentity)
+                await this.initializeIdentity();
 
             await this.verify();
             await this.updateFreeBytes();
@@ -302,6 +309,11 @@ export class Volume extends EventEmitter {
         return this.fsType.toLowerCase().startsWith('ext');
     }
 
+    // READ-ONLY. A function called "verify" has no business writing to a disk it was asked to inspect --
+    // and it used to: on ENOENT it stamped our identity onto the volume. That meant the ordinary startup
+    // path, pointed at an unknown disk, would silently claim it. Recovery probing an unrecognised disk
+    // must be incapable of that, so the dangerous capability now lives in initializeIdentity() and is
+    // reachable ONLY from the provisioning path (Volume.start({ initializeIdentity: true })).
     async verify(): Promise<void> {
         this.log('verifying volume...');
 
@@ -320,8 +332,9 @@ export class Volume extends EventEmitter {
             data = await fsp.readFile(this.mountPoint + '/strubs/.identity');
         }
         catch (err: any) {
-            if (err.code !== 'ENOENT') throw new Error('volume identity file could not be read: ' + err);
-            data = await this.createIdentityFile();
+            if (err.code === 'ENOENT')
+                throw new Error('volume has no identity file; it has not been provisioned for this STRUBS instance');
+            throw new Error('volume identity file could not be read: ' + err);
         }
 
         if (data[0] !== 0x1F || data[1] !== 0xFB || data[2] !== 0x01 || data[3] !== 0xFB || data[data.length - 2] !== 0x19 || data[data.length - 1] !== 0xFB)
@@ -342,6 +355,24 @@ export class Volume extends EventEmitter {
 
         this.log('verified volume');
         this.isVerified = true;
+    }
+
+    // Stamp our identity onto a freshly-provisioned volume. EXPLICIT and provisioning-only: it refuses to
+    // overwrite an existing identity file, so it can never re-claim a disk that already belongs to another
+    // instance (that disk must be rejected, not adopted).
+    async initializeIdentity(): Promise<void> {
+        if (!this.mountPoint)
+            throw new Error('mount point is not configured');
+        try {
+            await fsp.access(this.mountPoint + '/strubs/.identity');
+            this.log('identity file already present; leaving it untouched');
+            return;
+        }
+        catch (err: any) {
+            if (err.code !== 'ENOENT')
+                throw err;
+        }
+        await this.createIdentityFile();
     }
 
     async createIdentityFile() {

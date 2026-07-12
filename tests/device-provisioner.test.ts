@@ -16,7 +16,11 @@ const createDeps = () => {
     };
     const spawnHelper = vi.fn().mockResolvedValue({ code: 0, stdout: '' });
     const sleepSecs = vi.fn().mockResolvedValue(undefined);
-    return { listRawBlockDevices, database, ioManager, spawnHelper, sleepSecs };
+    // By default: we have an identity (not in recovery), and the target disk is positively established
+    // to carry no STRUBS identity.
+    const probeDeviceForStrubsIdentity = vi.fn().mockResolvedValue({ status: 'clean' });
+    const hasInstanceIdentity = vi.fn().mockReturnValue(true);
+    return { listRawBlockDevices, database, ioManager, spawnHelper, sleepSecs, probeDeviceForStrubsIdentity, hasInstanceIdentity };
 };
 
 const baseDevice: RawBlockDevice = {
@@ -54,6 +58,86 @@ describe('DeviceProvisioner', () => {
         deps = createDeps();
     });
 
+    // Provisioning FORMATS DISKS. These two gates are the only thing standing between a mistaken or
+    // malicious POST /$/volumes and 130TB of live customer data, in exactly the states where the volumes
+    // collection cannot help: a fleet that never started, or a fresh/wiped Mongo.
+    describe('destructive-provisioning guards', () => {
+        const noDiskWasTouched = () => {
+            const cmds = deps.spawnHelper.mock.calls.map(c => `${c[0]} ${(c[1] as string[]).join(' ')}`);
+            expect(cmds.some(c => c.includes('parted'))).toBe(false);
+            expect(cmds.some(c => c.includes('mkfs'))).toBe(false);
+            expect(cmds.some(c => c.includes('wipefs') || c.includes('dd'))).toBe(false);
+            expect(deps.database.createVolume).not.toHaveBeenCalled();
+        };
+
+        it('REFUSES to wipe a disk that already carries a STRUBS identity', async () => {
+            deps.listRawBlockDevices.mockResolvedValue([deviceWithPartition('PART-UUID')]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({
+                status: 'strubs',
+                identity: { instanceIdentity: 'deadbeef', volumeId: 17 }
+            });
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', wipe: true }))
+                .rejects.toThrow(/carries STRUBS volume 17/);
+            noDiskWasTouched();
+        });
+
+        // The probe must FAIL CLOSED. If the filesystem is there but will not mount -- busy, dirty
+        // journal, failing sectors -- we do not get to call the disk blank and reformat it. An earlier
+        // version returned "nothing found" on a failed mount, which the caller read as "not ours": a
+        // guard whose sole purpose is to fail closed, failing open.
+        it('REFUSES to wipe a disk it could not read (unknown != blank)', async () => {
+            deps.listRawBlockDevices.mockResolvedValue([deviceWithPartition('PART-UUID')]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({
+                status: 'unknown',
+                reason: 'could not read-only mount /dev/sdb1: device is busy'
+            });
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', wipe: true }))
+                .rejects.toThrow(/could not establish whether it belongs to this STRUBS array/);
+            noDiskWasTouched();
+        });
+
+        it('REFUSES to provision at all while in recovery (no instance identity)', async () => {
+            deps.hasInstanceIdentity.mockReturnValue(false);
+            deps.listRawBlockDevices.mockResolvedValue([baseDevice]);
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', wipe: true }))
+                .rejects.toThrow(/disabled during recovery/);
+
+            // Refused BEFORE we even look at the hardware -- the array we are trying to rescue must not
+            // be offered up for reinitialisation.
+            expect(deps.listRawBlockDevices).not.toHaveBeenCalled();
+            expect(deps.spawnHelper).not.toHaveBeenCalled();
+        });
+
+        // The NON-wipe path runs parted + mkfs too, so it is equally destructive. It is only safe because
+        // it refuses a partitioned disk -- but an empty `children` list is not proof of blankness. If
+        // partition enumeration failed or is stale, a live STRUBS disk presents as bare media.
+        it('REFUSES the non-wipe path on a disk that claims a partition table but shows no partitions', async () => {
+            deps.listRawBlockDevices.mockResolvedValue([{ ...baseDevice, pttype: 'gpt', ptuuid: 'PT-1', children: [] }]);
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb' }))
+                .rejects.toThrow(/cannot be established as blank/);
+            noDiskWasTouched();
+        });
+
+        it('still provisions a genuinely blank disk', async () => {
+            deps.listRawBlockDevices
+                .mockResolvedValueOnce([baseDevice])
+                .mockResolvedValueOnce([deviceWithPartition(null)])
+                .mockResolvedValueOnce([deviceWithPartition('PART-UUID')]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({ status: 'clean' });
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb' })).resolves.toMatchObject({ id: 2 });
+        });
+    });
+
     it('partitions and registers a new volume', async () => {
         deps.listRawBlockDevices
             .mockResolvedValueOnce([baseDevice])
@@ -67,7 +151,8 @@ describe('DeviceProvisioner', () => {
         expect(deps.spawnHelper).toHaveBeenCalledWith('parted', ['-s', '/dev/sdb', 'mklabel', 'gpt']);
         expect(deps.spawnHelper).toHaveBeenCalledWith('parted', ['-s', '/dev/sdb', 'mkpart', 'primary', 'ext4', '0%', '100%']);
         expect(deps.database.createVolume).toHaveBeenCalledWith(result);
-        expect(deps.ioManager.registerVolume).toHaveBeenCalledWith(result);
+        // Provisioning is the ONLY path allowed to stamp our identity onto a disk -- it just formatted it.
+        expect(deps.ioManager.registerVolume).toHaveBeenCalledWith(result, { initializeIdentity: true });
     });
 
     it('wipes existing partitions when authorized', async () => {

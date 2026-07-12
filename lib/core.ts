@@ -14,6 +14,7 @@ import { volumeSmartMonitor } from './io/volume-smart-monitor';
 import { systemLogWatcher } from './io/system-log-watcher';
 import { volumeHealthMonitor } from './io/volume-health-monitor';
 import { deviceReconciler } from './io/device-reconciler';
+import { bootstrapManifestWriter } from './io/bootstrap-manifest';
 import { configureNotifications } from './notify/bootstrap';
 import { remediationService } from './remediation/service';
 import { repairWorker } from './remediation/repair-worker';
@@ -65,7 +66,27 @@ export class Core {
             await this.createRunDirectory();
             await database.connect();
             await remediationService.hydrate();
+
+            // No instance identity => this host cannot verify a single disk. Starting the fleet would
+            // reject every volume ("not from this STRUBS instance"), and starting the object API would
+            // expose an array we cannot vouch for. So: bring up the ADMIN surface only, and let an
+            // operator restore the identity from a volume's bootstrap manifest. We never generate one --
+            // a fresh identity permanently orphans every disk in the array.
+            if (!config.identity) {
+                log.error('RECOVERY MODE: no instance identity; NOT starting the fleet or the object API');
+                await adminAuth.bootstrap();
+                await serverManager.start({ recovery: true });
+                this.started = true;
+                log('STRUBS started in RECOVERY mode.');
+                return;
+            }
+
             await ioManager.init();
+            // The fleet is up: refresh the bootstrap manifest on every writable volume. Fire-and-forget --
+            // a manifest write must never delay or fail startup -- plus a periodic backstop so a manifest
+            // can never silently stop refreshing (which you'd only discover during a recovery).
+            void bootstrapManifestWriter.write().catch(err => log.error('initial bootstrap manifest write failed', err));
+            bootstrapManifestWriter.startPeriodic(config.bootstrapManifestIntervalMs);
             await volumeSmartMonitor.start();
             // A rebalance owns the disks while it runs. If one is pending, park the scrub BEFORE we
             // consider resuming it — otherwise it would start here and get killed seconds later when
@@ -132,6 +153,7 @@ export class Core {
             verifyScheduler.stop();
             systemLogWatcher.stop();
             repairWorker.stop();
+            bootstrapManifestWriter.stopPeriodic();
             volumeHealthMonitor.stop();
             deviceReconciler.stop();
 

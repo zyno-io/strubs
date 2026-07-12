@@ -1,9 +1,11 @@
 import { randomUUID } from 'crypto';
 
+import { config } from '../config';
 import { database } from '../database';
 import { ioManager } from './manager';
 import { HttpBadRequestError } from '../server/http/errors';
 import { getDeviceIdentityKey, listRawBlockDevices, type RawBlockDevice, type RawBlockDeviceChild } from './device-discovery';
+import { probeDeviceForStrubsIdentity } from './device-identity-probe';
 import { spawnHelper } from '../helpers/spawn';
 import type { VolumeConfig, PersistedVolumeConfig } from './volume';
 
@@ -13,6 +15,8 @@ type DeviceProvisionerDeps = {
     ioManager: typeof ioManager;
     spawnHelper: typeof spawnHelper;
     sleepSecs: (seconds: number) => Promise<void>;
+    probeDeviceForStrubsIdentity: typeof probeDeviceForStrubsIdentity;
+    hasInstanceIdentity: () => boolean;
 };
 
 const defaultDeps: DeviceProvisionerDeps = {
@@ -20,7 +24,9 @@ const defaultDeps: DeviceProvisionerDeps = {
     database,
     ioManager,
     spawnHelper,
-    sleepSecs: (seconds: number) => new Promise(resolve => setTimeout(resolve, seconds * 1000))
+    sleepSecs: (seconds: number) => new Promise(resolve => setTimeout(resolve, seconds * 1000)),
+    probeDeviceForStrubsIdentity,
+    hasInstanceIdentity: () => config.identity !== null
 };
 
 export type ProvisionOptions = {
@@ -36,6 +42,13 @@ export class DeviceProvisioner {
         const { blockPath, wipe, replace } = options;
         this.validateWipeOption(wipe);
 
+        // HARD GATE 1: no instance identity means we are in RECOVERY. Provisioning FORMATS DISKS, and with
+        // no identity we cannot even tell our own disks from a stranger's -- so the one thing we must not
+        // do is offer to reinitialise the array we are trying to rescue. Refuse in the backend, not just
+        // in the UI: the API is reachable regardless of what the UI renders.
+        if (!this.deps.hasInstanceIdentity())
+            throw new HttpBadRequestError('provisioning is disabled during recovery: restore the instance identity first');
+
         let devices = await this.deps.listRawBlockDevices();
         let targetDevice = this.findDeviceByPath(devices, blockPath);
         if (!targetDevice)
@@ -44,12 +57,38 @@ export class DeviceProvisioner {
         if (wipe === true) {
             if (this.deviceHasMountedPartitions(targetDevice))
                 throw new HttpBadRequestError('block device has mounted partitions');
+
+            // HARD GATE 2: ask the DISK whether it is already ours, and believe it over the database.
+            //
+            // Neither check above can save us here. `deviceHasMountedPartitions` says nothing about a disk
+            // that simply is not mounted, and the registered-volume check consults a `volumes` collection
+            // that, in the exact scenario we fear, is empty -- a fresh or wiped Mongo, or a fleet that
+            // never started. In that state the provisioner sees 4.4TB of live customer data as blank
+            // media. So read the identity off the platter, with a probe that cannot write to what it
+            // inspects. It fails CLOSED: a disk we could not read is refused, not assumed blank.
+            await this.assertDeviceIsNotOurs(blockPath, targetDevice);
+
             await this.wipeDevice(blockPath);
             await this.deps.sleepSecs(1);
             devices = await this.deps.listRawBlockDevices();
             targetDevice = this.findDeviceByPath(devices, blockPath);
             if (!targetDevice)
                 throw new HttpBadRequestError('block device not found after wipe');
+        }
+        else {
+            // The non-wipe path still runs `parted` and `mkfs`, so it is just as destructive -- it is only
+            // safe because it refuses a partitioned disk. But an EMPTY `children` list is not proof that a
+            // disk is blank: if partition enumeration failed or is stale, a live STRUBS disk presents as
+            // bare media and we would happily reformat it. So require POSITIVE evidence of blankness: a
+            // device advertising a partition table while showing no readable partitions is UNKNOWN, and
+            // unknown means refuse. (After a wipe this cannot apply -- `parted mklabel` has just written a
+            // fresh, deliberately empty table.)
+            if (targetDevice.pttype || targetDevice.ptuuid) {
+                throw new HttpBadRequestError(
+                    `refusing to provision ${blockPath}: it advertises a ${targetDevice.pttype ?? 'partition'} table `
+                    + `but no readable partitions, so it cannot be established as blank. Pass wipe to deliberately destroy it.`
+                );
+            }
         }
 
         if (targetDevice.children?.length)
@@ -79,8 +118,32 @@ export class DeviceProvisioner {
 
         const volumeConfig = await this.createVolumeConfig(finalDevice, partition, replacedVolumeId);
         await this.deps.database.createVolume(volumeConfig);
-        await this.deps.ioManager.registerVolume(volumeConfig);
+        // The ONLY caller that may stamp our identity onto a disk: this one just formatted it.
+        await this.deps.ioManager.registerVolume(volumeConfig, { initializeIdentity: true });
         return volumeConfig;
+    }
+
+    // Refuse to destroy a disk that is (or might be) already ours. Fails CLOSED on 'unknown': if the
+    // filesystem is there but will not mount -- busy, dirty journal, failing sectors -- we do NOT get to
+    // call it blank. An operator who is certain can still clear the disk by hand; the API will not do it
+    // for them on a guess.
+    private async assertDeviceIsNotOurs(blockPath: string, device: RawBlockDevice): Promise<void> {
+        const probe = await this.deps.probeDeviceForStrubsIdentity(device.children);
+
+        if (probe.status === 'strubs') {
+            throw new HttpBadRequestError(
+                `refusing to wipe ${blockPath}: it carries STRUBS volume ${probe.identity.volumeId} of instance `
+                + `${probe.identity.instanceIdentity} and may hold live data. If this disk is genuinely being `
+                + `retired, drain and remove that volume first.`
+            );
+        }
+
+        if (probe.status === 'unknown') {
+            throw new HttpBadRequestError(
+                `refusing to wipe ${blockPath}: could not establish whether it belongs to this STRUBS array `
+                + `(${probe.reason}). Refusing rather than assuming it is blank.`
+            );
+        }
     }
 
     private findDeviceByPath(devices: RawBlockDevice[], blockPath: string): RawBlockDevice | undefined {

@@ -5,6 +5,7 @@ import { volumeFleet as defaultVolumeFleet, type VolumeFleet } from './volume-fl
 import type { Volume, VolumeConfig, PersistedVolumeConfig } from './volume';
 import { mountRootManager as defaultMountRootManager, type MountRootManager } from './mount-root-manager';
 import { repairWorker } from '../remediation/repair-worker';
+import { bootstrapManifestWriter } from './bootstrap-manifest';
 
 const log = createLogger('io-manager');
 
@@ -13,13 +14,15 @@ type IOManagerDeps = {
     volumeFleet: VolumeFleet;
     mountRootManager: MountRootManager;
     repairWorker: Pick<typeof repairWorker, 'wake'>;
+    bootstrapManifestWriter: Pick<typeof bootstrapManifestWriter, 'write'>;
 };
 
 const defaultDeps: IOManagerDeps = {
     deviceDiscovery,
     volumeFleet: defaultVolumeFleet,
     mountRootManager: defaultMountRootManager,
-    repairWorker
+    repairWorker,
+    bootstrapManifestWriter
 };
 
 export class IOManager {
@@ -104,16 +107,18 @@ export class IOManager {
         }
     }
 
-    async registerVolume(config: PersistedVolumeConfig): Promise<void> {
+    async registerVolume(config: PersistedVolumeConfig, opts: { initializeIdentity?: boolean } = {}): Promise<void> {
         await this.reloadBlockDevices();
         await this.deps.mountRootManager.ensureExists();
-        await this.deps.volumeFleet.registerVolume(config, this._onlineDevices);
+        await this.deps.volumeFleet.registerVolume(config, this._onlineDevices, opts);
         this.volumeGroupCount = this.deps.volumeFleet.countVolumeGroups();
         this.deps.repairWorker.wake(`volume ${config.id} registered`);
+        this.refreshBootstrapManifest();
     }
 
     async softDeleteVolume(id: number): Promise<void> {
         await this.deps.volumeFleet.softDeleteVolume(id);
+        this.refreshBootstrapManifest();
     }
 
     async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isDraining?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
@@ -121,6 +126,16 @@ export class IOManager {
         await this.deps.volumeFleet.updateVolumeFlags(id, changes, this._onlineDevices);
         if (changes.isEnabled === true || changes.isDeleted === false)
             this.deps.repairWorker.wake(`volume ${id} availability changed`);
+        this.refreshBootstrapManifest();
+    }
+
+    // The bootstrap manifest records the fleet's recovery policy, so it is stale the moment any volume's
+    // state changes. Hooked HERE -- the single boundary every mutation funnels through (operator flags,
+    // drain start/cancel/complete, health degradation, provision, delete) -- rather than at the HTTP
+    // handlers, which miss the ones the system does to itself. Fire-and-forget: a manifest write must
+    // never fail or delay a fleet change, and the periodic backstop makes a dropped write self-healing.
+    private refreshBootstrapManifest(): void {
+        void this.deps.bootstrapManifestWriter.write().catch(() => undefined);
     }
 
     getCachedDevices(): CachedDevice[] {

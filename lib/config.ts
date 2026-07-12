@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import { promises as fs } from 'fs';
+import path from 'path';
 
 import { createLogger } from './log';
 import type { Severity } from './notify/notifier';
@@ -7,6 +8,15 @@ import type { Severity } from './notify/notifier';
 dotenv.config();
 
 const log = createLogger('config');
+
+// 16 bytes that make the whole array recognisable. Every volume's `.identity` is validated against it.
+export const IDENTITY_PATH = '/var/lib/strubs/identity';
+
+// Only the 16 hex bytes are meaningful; the stored text may be hyphenated (ours is a UUID). Every
+// comparison and every buffer derivation goes through this, so representation never changes meaning.
+export function normalizeIdentity(identity: string): string {
+    return identity.trim().replace(/[^0-9a-f]/gi, '').toLowerCase();
+}
 
 const VALID_SEVERITIES: Severity[] = ['info', 'warning', 'critical'];
 // A full whole-object rolling scrub can take weeks on a large array, so run it QUARTERLY -- frequent
@@ -103,6 +113,11 @@ export class Config {
     storageStatsIntervalMs: number;
     storageStatsFlushIntervalMs: number;
 
+    // Backstop re-write of the per-volume bootstrap manifest. Event hooks cover fleet changes; this
+    // catches anything they miss, because a manifest that quietly stopped refreshing is a problem you
+    // only find out about during a recovery. 0 disables.
+    bootstrapManifestIntervalMs: number;
+
     // Cooperative pacing between chunk reads during verification. This trades
     // scrub throughput for lower foreground-read contention.
     verifyReadDelayMs: number;
@@ -162,6 +177,9 @@ export class Config {
             process.env.STRUBS_STORAGE_STATS_FLUSH_INTERVAL_MS,
             DEFAULT_STORAGE_STATS_FLUSH_INTERVAL_MS
         );
+        this.bootstrapManifestIntervalMs = process.env.STRUBS_BOOTSTRAP_MANIFEST_INTERVAL_MS
+            ? parseInt(process.env.STRUBS_BOOTSTRAP_MANIFEST_INTERVAL_MS, 10)
+            : 30 * 60 * 1000;
         this.verifyReadDelayMs = parseNonNegativeInt(
             process.env.STRUBS_VERIFY_READ_DELAY_MS,
             DEFAULT_VERIFY_READ_DELAY_MS
@@ -185,15 +203,60 @@ export class Config {
         this.deviceReconcileUdev = process.env.STRUBS_DISABLE_UDEV !== 'true';
     }
 
+    // The instance identity is 16 bytes that every volume validates itself against. A MISSING file must
+    // not kill startup: on a rebuilt host that would mean the process cannot even reach the UI that would
+    // offer to restore it. So absence leaves `identity = null` and the caller enters recovery mode.
+    //
+    // It must NEVER generate a replacement. A fresh identity is the footgun that permanently orphans every
+    // disk in the array -- each one would then be rejected as "not from this STRUBS instance".
     async loadIdentity(): Promise<void> {
         log('loading identity');
 
-        const data = await fs.readFile('/var/lib/strubs/identity');
+        let data: Buffer;
+        try {
+            data = await fs.readFile(IDENTITY_PATH);
+        }
+        catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+                throw err;
+            this.identity = null;
+            this.identityBuffer = null;
+            log.error('=================================================================');
+            log.error('  NO INSTANCE IDENTITY at %s', IDENTITY_PATH);
+            log.error('  No volume can be verified without it. If this host previously');
+            log.error('  ran STRUBS, RESTORE it from a volume bootstrap manifest --');
+            log.error('  do NOT generate a new one, or every disk becomes unrecognisable.');
+            log.error('=================================================================');
+            return;
+        }
 
         this.identity = data.toString().trim();
-        this.identityBuffer = Buffer.from(this.identity.replace(/[^0-9a-f]/g, ''), 'hex');
+        this.identityBuffer = Buffer.from(normalizeIdentity(this.identity), 'hex');
 
         log('loaded identity:', this.identity);
+    }
+
+    // Adopt an identity recovered from a bootstrap manifest. Writing the file is not enough -- volumes
+    // validate against `identityBuffer` in-process, so it must be populated before the fleet starts.
+    //
+    // The on-disk identity is stored in whatever form it was created in (ours is a hyphenated UUID), and
+    // only its 16 hex BYTES are ever compared -- loadIdentity/verify both strip non-hex before building
+    // the buffer. So the "is this the same identity?" guard must compare the NORMALISED forms; comparing
+    // raw strings would make re-adopting the very same identity look like a different one and throw.
+    async adoptIdentity(identity: string): Promise<void> {
+        const normalized = normalizeIdentity(identity);
+        if (normalized.length !== 32)
+            throw new Error('instance identity must be 16 bytes (32 hex chars)');
+        if (this.identity && normalizeIdentity(this.identity) !== normalized)
+            throw new Error('refusing to overwrite an existing, different instance identity');
+        await fs.mkdir(path.dirname(IDENTITY_PATH), { recursive: true });
+        // Preserve the caller's original text (the manifest carries it verbatim), so the file keeps the
+        // same form it had before the disaster rather than silently changing representation.
+        const body = identity.trim();
+        await fs.writeFile(IDENTITY_PATH, body, { mode: 0o600 });
+        this.identity = body;
+        this.identityBuffer = Buffer.from(normalized, 'hex');
+        log('adopted instance identity %s', body);
     }
 }
 

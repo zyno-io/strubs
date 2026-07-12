@@ -10,9 +10,24 @@ vi.mock('fs', () => ({
 }));
 
 const loadIdentityMock = vi.fn();
+// `identity` present = the normal startup path. A null identity puts core into RECOVERY mode (fleet and
+// object API stay down), which has its own test below.
+const configMock: { loadIdentity: typeof loadIdentityMock; identity: string | null; bootstrapManifestIntervalMs: number } = {
+    loadIdentity: loadIdentityMock,
+    identity: 'a'.repeat(32),
+    bootstrapManifestIntervalMs: 0,
+};
 vi.mock('../lib/config', () => ({
-    config: {
-        loadIdentity: loadIdentityMock,
+    config: configMock,
+}));
+
+const manifestWriteMock = vi.fn().mockResolvedValue(undefined);
+const manifestStartPeriodicMock = vi.fn();
+vi.mock('../lib/io/bootstrap-manifest', () => ({
+    bootstrapManifestWriter: {
+        write: manifestWriteMock,
+        startPeriodic: manifestStartPeriodicMock,
+        stopPeriodic: vi.fn(),
     },
 }));
 
@@ -120,6 +135,9 @@ vi.mock('../lib/log', () => ({
 describe('Core', () => {
     beforeEach(() => {
         vi.resetModules();
+        configMock.identity = 'a'.repeat(32);   // default: identity present -> normal startup
+        manifestWriteMock.mockClear();
+        manifestStartPeriodicMock.mockClear();
         loadIdentityMock.mockReset();
         connectMock.mockReset();
         ioInitMock.mockReset();
@@ -187,6 +205,26 @@ describe('Core', () => {
         expect(serverStartMock).toHaveBeenCalledTimes(1);
         expect(verifyResumeMock).toHaveBeenCalledTimes(1);
         expect(storageStatsStartMock).toHaveBeenCalledTimes(1);
+        // The fleet is up, so the bootstrap manifest is refreshed on every writable disk.
+        expect(manifestWriteMock).toHaveBeenCalled();
+    });
+
+    // A rebuilt host with no /var/lib/strubs/identity must NOT crash (it could never reach the UI that
+    // offers to restore it) and must NOT start the fleet or the object API -- it cannot verify a single
+    // disk, and it must never generate a replacement identity (that orphans every disk permanently).
+    it('enters RECOVERY mode when there is no instance identity: admin surface only, no fleet', async () => {
+        configMock.identity = null;
+
+        const { Core } = await import('../lib/core');
+        const core = new Core();
+
+        await core.start();      // must not throw
+
+        expect(ioInitMock).not.toHaveBeenCalled();          // fleet NOT started
+        expect(smartMonitorStartMock).not.toHaveBeenCalled();
+        expect(storageStatsStartMock).not.toHaveBeenCalled();
+        expect(manifestWriteMock).not.toHaveBeenCalled();   // nothing to write without an identity
+        expect(serverStartMock).toHaveBeenCalledWith({ recovery: true });   // admin-only
     });
 
     it('treats EEXIST as a successful run directory creation', async () => {

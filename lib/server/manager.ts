@@ -54,12 +54,15 @@ export class ServerManager {
         this.deps = { ...defaultDeps, ...deps };
     }
 
-    async start(): Promise<void> {
+    // `recovery` brings up the ADMIN surface only. Used when the host has no instance identity: the fleet
+    // cannot be verified, so the object API and FUSE -- both of which would serve an array we cannot vouch
+    // for -- must stay down until an operator restores the identity from a bootstrap manifest.
+    async start(opts: { recovery?: boolean } = {}): Promise<void> {
         if (this.servers.length)
             return;
         if (this.starting)
             return this.starting;
-        this.starting = this._startServers();
+        this.starting = this._startServers(opts);
         try {
             await this.starting;
         }
@@ -68,15 +71,23 @@ export class ServerManager {
         }
     }
 
-    private async _startServers(): Promise<void> {
+    private async _startServers(opts: { recovery?: boolean }): Promise<void> {
         log('starting server manager');
-        const objectServer = this.deps.createObjectServer();
         const adminServer = await this.deps.createAdminServer();
         const adminSocketServer = this.deps.createAdminSocketServer();
-        const fuseServer = await this.deps.createFuseServer();
-        if (!fuseServer)
-            log('FUSE disabled: the HTTP object API is the only local access path (set STRUBS_FUSE_ENABLED=true to mount)');
-        this.servers = [objectServer, adminServer, adminSocketServer, ...(fuseServer ? [fuseServer] : [])];
+
+        if (opts.recovery) {
+            log.error('RECOVERY MODE: serving the admin surface ONLY -- object API and FUSE are not started');
+            this.servers = [adminServer, adminSocketServer];
+        }
+        else {
+            const objectServer = this.deps.createObjectServer();
+            const fuseServer = await this.deps.createFuseServer();
+            if (!fuseServer)
+                log('FUSE disabled: the HTTP object API is the only local access path (set STRUBS_FUSE_ENABLED=true to mount)');
+            this.servers = [objectServer, adminServer, adminSocketServer, ...(fuseServer ? [fuseServer] : [])];
+        }
+
         for (const server of this.servers)
             await Promise.resolve(server.start());
     }

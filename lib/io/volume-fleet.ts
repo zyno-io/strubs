@@ -235,14 +235,17 @@ export class VolumeFleet {
             this.deps.log.error?.('%d volumes failed to stop', failureCount);
     }
 
-    async registerVolume(config: PersistedVolumeConfig, devices: CachedDevice[]): Promise<Volume> {
+    // `initializeIdentity` is set ONLY by the provisioning path -- a freshly-formatted disk that has no
+    // identity file yet. Leaving it off (every other caller) means an unidentified disk is refused, not
+    // claimed. See Volume.start().
+    async registerVolume(config: PersistedVolumeConfig, devices: CachedDevice[], opts: { initializeIdentity?: boolean } = {}): Promise<Volume> {
         return this.withLock(async () => {
             this._volumeConfig.push(config);
             const volume = this.initVolume(config, devices);
             if (!volume)
                 throw new Error('failed to initialize volume from configuration');
 
-            await volume.start();
+            await volume.start({ initializeIdentity: opts.initializeIdentity });
             this.deps.log('volume%d: registered and started new volume', volume.id);
             return volume;
         });
