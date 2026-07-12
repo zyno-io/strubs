@@ -59,18 +59,84 @@ function scryptVerify(secret: string, stored: string): Promise<boolean> {
         const [, n, r, p, saltB64, hashB64] = parts;
         const salt = Buffer.from(saltB64, 'base64');
         const expected = Buffer.from(hashB64, 'base64');
-        crypto.scrypt(secret, salt, expected.length, { N: Number(n), r: Number(r), p: Number(p) }, (err, key) => {
-            // timingSafeEqual needs equal lengths; a scrypt of the right keylen guarantees it.
-            if (err || key.length !== expected.length) return resolve(false);
-            resolve(crypto.timingSafeEqual(key, expected));
-        });
+        // FAIL CLOSED against a malformed/corrupt stored hash. Pin EVERY field to exactly what we write:
+        //   - empty/short `expected` would make scrypt(keylen=0) + timingSafeEqual(empty,empty) return
+        //     TRUE (any password verifies);
+        //   - N/r/p of 0 are accepted by Node as "use defaults", so a zeroed param field must be rejected
+        //     rather than silently re-deriving under different work factors.
+        if (expected.length !== SCRYPT_KEYLEN || salt.length !== 16
+            || Number(n) !== SCRYPT_N || Number(r) !== SCRYPT_r || Number(p) !== SCRYPT_p) {
+            log.error('refusing to verify against a malformed stored hash');
+            return resolve(false);
+        }
+        try {
+            crypto.scrypt(secret, salt, SCRYPT_KEYLEN, { N: SCRYPT_N, r: SCRYPT_r, p: SCRYPT_p }, (err, key) => {
+                if (err || key.length !== expected.length) return resolve(false);
+                resolve(crypto.timingSafeEqual(key, expected));
+            });
+        }
+        catch {
+            resolve(false);
+        }
     });
 }
 
 type SessionEntry = { createdAt: number; lastSeen: number };
 
+// Login throttle: a single password with no username is a small keyspace, and scrypt-per-attempt is
+// expensive, so cap the rate of failed attempts. Global (one admin) rather than per-IP, since a LAN
+// attacker can rotate source addresses.
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_LOCKOUT_MS = 30 * 1000;
+// Cap password verifications running at once. scrypt is deliberately expensive, and the failure counter
+// only updates AFTER a verify resolves -- so without this a parallel burst slips past isLoginLocked()
+// and schedules many scrypts (threadpool/CPU exhaustion). Bounds concurrent work regardless of timing.
+const LOGIN_MAX_CONCURRENT = 3;
+
 export class AdminAuth {
     private readonly sessions = new Map<string, SessionEntry>();
+    private loginFailures = 0;
+    private loginLockedUntil = 0;
+    private loginInFlight = 0;
+
+    // Reject BEFORE running scrypt when the throttle is engaged or too many verifications are already
+    // in flight. Callers return 429.
+    isLoginLocked(): boolean {
+        return Date.now() < this.loginLockedUntil || this.loginInFlight >= LOGIN_MAX_CONCURRENT;
+    }
+
+    // Verify a login password. This is the ONLY entry point login should use (verifyPassword is for
+    // password-change re-auth). The slot is acquired ATOMICALLY here: the lock/cap test and the
+    // increment run with no `await` between them, so in single-threaded JS a burst that all cleared the
+    // handler's pre-check still cannot schedule more than LOGIN_MAX_CONCURRENT scrypts -- the excess get
+    // 'throttled' at the point of acquisition, before any scrypt runs.
+    async verifyLoginPassword(password: string): Promise<'ok' | 'invalid' | 'throttled'> {
+        if (Date.now() < this.loginLockedUntil || this.loginInFlight >= LOGIN_MAX_CONCURRENT)
+            return 'throttled';
+        this.loginInFlight++;
+        try {
+            const ok = await this.verifyPassword(password);
+            this.recordLoginResult(ok);
+            return ok ? 'ok' : 'invalid';
+        }
+        finally {
+            this.loginInFlight--;
+        }
+    }
+
+    private recordLoginResult(ok: boolean): void {
+        if (ok) {
+            this.loginFailures = 0;
+            this.loginLockedUntil = 0;
+            return;
+        }
+        this.loginFailures++;
+        if (this.loginFailures >= LOGIN_MAX_FAILURES) {
+            this.loginLockedUntil = Date.now() + LOGIN_LOCKOUT_MS;
+            this.loginFailures = 0;
+            log.error('admin login locked for %ds after repeated failures', LOGIN_LOCKOUT_MS / 1000);
+        }
+    }
 
     // --- password ---
 

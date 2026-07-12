@@ -14,7 +14,7 @@ import { ObjectPutRequest } from './object-put-request';
 import { ObjectDeleteRequest } from './object-delete-request';
 import { ObjectOptionsRequest } from './object-options-request';
 import { HttpHelpers } from './helpers';
-import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError } from './errors';
+import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError, HttpTooManyRequestsError } from './errors';
 import { adminAuth, parseCookies, SESSION_COOKIE } from './admin-auth';
 import { config } from '../../config';
 
@@ -103,13 +103,20 @@ export class HttpServer {
     start(): void {
         if (typeof this.port === 'string') {
             // Unix socket: remove a stale socket file from an unclean shutdown, then bind and lock it
-            // down to root-only. chmod after listen -- the file does not exist until then.
+            // down to root-only. This socket serves the admin API with NO credential, so if we cannot
+            // enforce 0600 we FAIL CLOSED -- the process exits rather than expose an unauthenticated
+            // admin API to any local user. chmod after listen (the file does not exist until then).
             try { fs.unlinkSync(this.port); }
             catch { /* not there, fine */ }
             const socketPath = this.port;
             this._server.listen(socketPath, () => {
-                try { fs.chmodSync(socketPath, 0o600); }
-                catch (err) { log.error('failed to chmod admin socket %s: %s', socketPath, err); }
+                try {
+                    fs.chmodSync(socketPath, 0o600);
+                }
+                catch (err) {
+                    log.error('FATAL: cannot secure admin socket %s to 0600: %s -- refusing to run', socketPath, err);
+                    process.exit(1);
+                }
             });
             return;
         }
@@ -155,13 +162,22 @@ export class HttpServer {
         if (!handler)
             return this._outputHttpBadRequest('unsupported method', req, res);
 
-        // Admin authentication. Only management (`/$/`) paths on the admin TCP listener are gated: a
-        // non-admin path here is already Not Found (handled above), and must not get an auth challenge.
-        // The trusted Unix socket is gated by filesystem permissions; login and the static UI are exempt
-        // because they are HOW you authenticate.
-        if (this.role === 'admin' && !this._trusted && request.url.startsWith('/$/')
-            && !this._isAuthExempt(method, request.url)) {
-            if (!await this._authorizeAdmin(request))
+        // Admin authentication for any `/$/` request that isn't on the object-only listener. Gating on
+        // `role !== 'object'` (rather than `=== 'admin'`) is defence in depth: the legacy single-origin
+        // 'all' role must not silently serve the management API unauthenticated. The trusted Unix socket
+        // is gated by filesystem permissions; login and the static UI are exempt (they are HOW you auth).
+        if (this.role !== 'object' && !this._trusted && request.url.startsWith('/$/')) {
+            // CSRF: reject a mutation whose Sec-Fetch-Site says it originated cross-site. Browsers set
+            // this header unforgeably; a same-origin UI request is 'same-origin', a CSRF from another site
+            // is 'cross-site'/'same-site'. Non-browser clients (curl, bearer-token automation) omit it ->
+            // allowed. Applies to ALL mutating /$/ requests -- including the auth-exempt login endpoint,
+            // so a cross-site page cannot drive login attempts (or logout) -- but not GET/HEAD/OPTIONS,
+            // so the static UI and auth-status stay reachable. Belt-and-braces over SameSite=Strict and
+            // the origin split.
+            if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && this._isCrossSite(request))
+                return this._outputHttpForbidden(res, 'cross-site request refused');
+            // Authenticate everything except the login endpoint and the static UI (which are HOW you auth).
+            if (!this._isAuthExempt(method, request.url) && !await this._authorizeAdmin(request))
                 return this._outputHttpUnauthorized(res);
         }
 
@@ -257,6 +273,18 @@ export class HttpServer {
         return false;
     }
 
+    // True only when the browser explicitly says the request came from a different site. Absent header
+    // (non-browser client) or 'same-origin'/'none' (our UI, or a top-level navigation) is not cross-site.
+    private _isCrossSite(req: HttpRequest): boolean {
+        const site = req.headers['sec-fetch-site'];
+        return typeof site === 'string' && site !== 'same-origin' && site !== 'none';
+    }
+
+    private _outputHttpForbidden(res: HttpResponse, message: string): void {
+        res.writeHead(403, 'Forbidden', { 'Content-Type': 'text/plain' });
+        res.end(message);
+    }
+
     private async _authorizeAdmin(req: HttpRequest): Promise<boolean> {
         const auth = req.headers.authorization;
         if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
@@ -283,6 +311,9 @@ export class HttpServer {
                 this._outputHttpBadRequest(err.message, req, res);
             } else if (err instanceof HttpUnauthorizedError) {
                 this._outputHttpUnauthorized(res);
+            } else if (err instanceof HttpTooManyRequestsError) {
+                res.writeHead(429, 'Too Many Requests', { 'Content-Type': 'text/plain', 'Retry-After': '30' });
+                res.end(err.message || '429');
             } else if (err instanceof HttpNotFoundError) {
                 this._outputHttpNotFound(req, res);
             } else {

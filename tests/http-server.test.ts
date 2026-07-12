@@ -155,9 +155,16 @@ describe('HttpServer', () => {
         expect(resData.body).toBe('malformed URL');
     });
 
+    // The 'all' role gates /$/ behind auth (defence in depth), so mgmt-routing tests need a session.
+    const authCookie = async (): Promise<string> => {
+        const { adminAuth, SESSION_COOKIE } = await import('../lib/server/http/admin-auth');
+        return `${SESSION_COOKIE}=${adminAuth.createSession()}`;
+    };
+
     it('routes management requests through HttpMgmt', async () => {
         const server = await importServer();
         const { req, res, resData } = createReqRes('GET', '/$/volumes');
+        req.headers.cookie = await authCookie();
         mgmtHandle.mockResolvedValueOnce({ healthy: true });
 
         await server._handleHttpRequest(req, res);
@@ -213,6 +220,48 @@ describe('HttpServer', () => {
 
         expect(objectGet.ctor).not.toHaveBeenCalled();  // no object request was ever constructed
         expect(resData.status).toBe(404);
+    });
+
+    it('DEFENCE IN DEPTH: the legacy "all" role also gates /$/ behind auth', async () => {
+        const server = await importServer('all');   // no session
+        const { req, res, resData } = createReqRes('GET', '/$/volumes');
+
+        await server._handleHttpRequest(req, res);
+
+        expect(mgmtHandle).not.toHaveBeenCalled();
+        expect(resData.status).toBe(401);
+    });
+
+    it('CSRF: a cross-site mutation is refused with 403 (before auth)', async () => {
+        const server = await importServer('admin');
+        const { req, res, resData } = createReqRes('POST', '/$/rebalance');
+        req.headers['sec-fetch-site'] = 'cross-site';
+        // no session even -- cross-site is rejected before auth, so a probe learns nothing
+        await server._handleHttpRequest(req, res);
+
+        expect(mgmtHandle).not.toHaveBeenCalled();
+        expect(resData.status).toBe(403);
+    });
+
+    it('CSRF: a bodyless same-origin POST is allowed (does not break the UI)', async () => {
+        const server = await importServer('admin');
+        const { req, res } = createReqRes('POST', '/$/rebalance');   // no body, no content-type
+        req.headers.cookie = await authCookie();
+        req.headers['sec-fetch-site'] = 'same-origin';
+        mgmtHandle.mockResolvedValueOnce({ ok: true });
+        await server._handleHttpRequest(req, res);
+
+        expect(mgmtHandle).toHaveBeenCalledTimes(1);
+    });
+
+    it('CSRF: a non-browser client (no Sec-Fetch-Site) with a valid session is allowed', async () => {
+        const server = await importServer('admin');
+        const { req, res } = createReqRes('POST', '/$/rebalance');   // curl-style: no sec-fetch header
+        req.headers.cookie = await authCookie();
+        mgmtHandle.mockResolvedValueOnce({ ok: true });
+        await server._handleHttpRequest(req, res);
+
+        expect(mgmtHandle).toHaveBeenCalledTimes(1);
     });
 
     it('AUTH GATE: an admin /$/ route without a session is 401 (never reaches mgmt)', async () => {
@@ -340,6 +389,7 @@ describe('HttpServer', () => {
     it('translates HttpMgmt bad requests into 400s', async () => {
         const server = await importServer();
         const { req, res, resData } = createReqRes('GET', '/$/volumes');
+        req.headers.cookie = await authCookie();
         const { HttpBadRequestError } = await import('../lib/server/http/errors');
         mgmtHandle.mockRejectedValueOnce(new HttpBadRequestError('boom'));
 
@@ -352,6 +402,7 @@ describe('HttpServer', () => {
     it('translates HttpMgmt not found into 404s', async () => {
         const server = await importServer();
         const { req, res, resData } = createReqRes('GET', '/$/volumes');
+        req.headers.cookie = await authCookie();
         const { HttpNotFoundError } = await import('../lib/server/http/errors');
         mgmtHandle.mockRejectedValueOnce(new HttpNotFoundError('nope'));
 
@@ -364,6 +415,7 @@ describe('HttpServer', () => {
     it('falls back to 500 for unexpected HttpMgmt errors', async () => {
         const server = await importServer();
         const { req, res, resData } = createReqRes('GET', '/$/volumes');
+        req.headers.cookie = await authCookie();
         mgmtHandle.mockRejectedValueOnce(new Error('kaboom'));
 
         await server._handleHttpRequest(req, res);

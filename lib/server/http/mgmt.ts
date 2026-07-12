@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { HttpHelpers } from './helpers';
-import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError } from './errors';
+import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError, HttpTooManyRequestsError } from './errors';
 import { adminAuth, parseCookies, sessionSetCookie, sessionClearCookie, SESSION_COOKIE } from './admin-auth';
 import { ioManager } from '../../io/manager';
 import { deviceProvisioner } from '../../io/device-provisioner';
@@ -337,10 +337,17 @@ export class HttpMgmt {
 
     // Auth-exempt. Verifies the password and mints a session cookie. A failed attempt is a 401.
     private static async handleSessionCreateRequest(req: HttpRequest, _params: unknown, res: HttpResponse): Promise<{ ok: true }> {
+        // Fast reject before even reading the body when clearly throttled; verifyLoginPassword re-checks
+        // atomically (the authoritative bound) after the body is parsed.
+        if (adminAuth.isLoginLocked())
+            throw new HttpTooManyRequestsError('too many failed login attempts; try again shortly');
         const payload = await this.parseJsonBody<{ password?: unknown }>(req);
         if (typeof payload.password !== 'string' || !payload.password)
             throw new HttpBadRequestError('password is required');
-        if (!await adminAuth.verifyPassword(payload.password))
+        const result = await adminAuth.verifyLoginPassword(payload.password);
+        if (result === 'throttled')
+            throw new HttpTooManyRequestsError('too many concurrent login attempts; try again shortly');
+        if (result === 'invalid')
             throw new HttpUnauthorizedError('invalid password');
         res.setHeader('Set-Cookie', sessionSetCookie(adminAuth.createSession()));
         return { ok: true };
@@ -385,6 +392,13 @@ export class HttpMgmt {
 
     private static async handleAdminTokenDeleteRequest(_req: HttpRequest, params: { selector: string }): Promise<{ removed: boolean }> {
         return { removed: await database.removeAdminToken(params.selector) };
+    }
+
+    // Panic button: revoke every bearer token at once. Password change deliberately does NOT do this
+    // (tokens are independent automation credentials, like SSH keys -- a password rotation should not
+    // silently break CI); this is the explicit "lock everyone out" action for a suspected compromise.
+    private static async handleAdminTokensPurgeRequest(): Promise<{ removed: number }> {
+        return { removed: await database.removeAllAdminTokens() };
     }
 
     private static async bearerAuthorized(req: HttpRequest): Promise<boolean> {
@@ -1025,6 +1039,11 @@ export class HttpMgmt {
             },
             {
                 method: 'DELETE',
+                match: url => url === '/$/admin/tokens' ? {} : null,
+                handler: async () => this.handleAdminTokensPurgeRequest()
+            },
+            {
+                method: 'DELETE',
                 match: url => this.matchAdminTokenRoute(url),
                 handler: async (req, params) => this.handleAdminTokenDeleteRequest(req, params as { selector: string })
             },
@@ -1233,11 +1252,22 @@ export class HttpMgmt {
         }
     }
 
+    // Management request bodies are small JSON documents. Cap the buffer so an unauthenticated caller
+    // (login is auth-exempt) cannot exhaust memory by streaming an unbounded body.
+    private static readonly MAX_BODY_BYTES = 64 * 1024;
+
     private static readRequestBody(req: HttpRequest): Promise<Buffer> {
         return new Promise((resolve, reject) => {
             const chunks: Buffer[] = [];
+            let total = 0;
             req.on('data', chunk => {
-                chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+                const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+                total += buf.length;
+                if (total > this.MAX_BODY_BYTES) {
+                    req.destroy();
+                    return reject(new HttpBadRequestError('request body too large'));
+                }
+                chunks.push(buf);
             });
             req.on('end', () => resolve(Buffer.concat(chunks)));
             req.on('error', reject);

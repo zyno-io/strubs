@@ -163,6 +163,10 @@ export class Database {
         return this.adminTokenRepository.remove(selector);
     }
 
+    async removeAllAdminTokens(): Promise<number> {
+        return this.adminTokenRepository.removeAll();
+    }
+
     async getObjectById(id: ObjectIdentifier): Promise<ContentDocument> {
         return this.contentRepository.getObjectById(id);
     }

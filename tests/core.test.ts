@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mkdirMock = vi.fn();
+const chmodMock = vi.fn().mockResolvedValue(undefined);
 vi.mock('fs', () => ({
     promises: {
         mkdir: mkdirMock,
+        chmod: chmodMock,
     },
 }));
 
@@ -178,7 +180,7 @@ describe('Core', () => {
         await core.start();
 
         expect(loadIdentityMock).toHaveBeenCalledTimes(1);
-        expect(mkdirMock).toHaveBeenCalledWith('/run/strubs');
+        expect(mkdirMock).toHaveBeenCalledWith('/run/strubs', { mode: 0o700 });
         expect(connectMock).toHaveBeenCalledTimes(1);
         expect(ioInitMock).toHaveBeenCalledTimes(1);
         expect(smartMonitorStartMock).toHaveBeenCalledTimes(1);
@@ -222,7 +224,7 @@ describe('Core', () => {
 
         await expect(core.start()).rejects.toBe(downstreamFailure);
 
-        expect(mkdirMock).toHaveBeenCalledWith('/run/strubs');
+        expect(mkdirMock).toHaveBeenCalledWith('/run/strubs', { mode: 0o700 });
         expect(serverStartMock).not.toHaveBeenCalled();
         expect(verifyResumeMock).not.toHaveBeenCalled();
     });

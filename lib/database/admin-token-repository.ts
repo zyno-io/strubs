@@ -44,4 +44,9 @@ export class AdminTokenRepository {
         const res = await this.collection.deleteOne({ selector });
         return res.deletedCount > 0;
     }
+
+    async removeAll(): Promise<number> {
+        const res = await this.collection.deleteMany({});
+        return res.deletedCount ?? 0;
+    }
 }

@@ -193,12 +193,18 @@ export class Core {
         log('creating runtime directory...');
 
         try {
-            await fs.mkdir('/run/strubs');
+            // 0700: the admin recovery socket lives here and is credentialless, so the directory must
+            // not be traversable by other local users.
+            await fs.mkdir('/run/strubs', { mode: 0o700 });
             log('runtime directory created');
         }
         catch (err) {
             const nodeErr = err as NodeJS.ErrnoException;
             if (nodeErr.code === 'EEXIST') {
+                // Enforce the mode even if the directory already existed. FAIL CLOSED: the credentialless
+                // admin socket lives here, so a directory we cannot lock to 0700 (a writable parent lets a
+                // local user unlink/replace the socket) must abort startup, not continue.
+                await fs.chmod('/run/strubs', 0o700);
                 log('runtime directory exists');
                 return;
             }

@@ -89,4 +89,49 @@ describe('AdminAuth', () => {
             expect(await auth.verifyBearer(token)).toBe(false);
         });
     });
+
+    describe('fail-closed on a malformed hash', () => {
+        it('does NOT verify any password against a corrupt stored hash (empty key)', async () => {
+            // Regression: a 0-length expected key made scrypt(keylen=0) + timingSafeEqual(empty,empty)
+            // return true -- any password would verify. Must be rejected.
+            store.set('adminPasswordHash', 'scrypt$16384$8$1$c2FsdA==$');   // empty hash segment
+            expect(await auth.verifyPassword('anything')).toBe(false);
+            expect(await auth.verifyPassword('')).toBe(false);
+        });
+
+        it('does not verify a bearer token against a corrupt secretHash', async () => {
+            tokens.set('sel', { selector: 'sel', secretHash: 'scrypt$16384$8$1$c2FsdA==$', name: 'x' });
+            expect(await auth.verifyBearer('sel.whatever')).toBe(false);
+        });
+    });
+
+    describe('login throttle', () => {
+        it('locks out after 5 failed verifyLoginPassword calls', async () => {
+            await auth.setPassword('the-real-password');
+            expect(auth.isLoginLocked()).toBe(false);
+            for (let i = 0; i < 5; i++)
+                expect(await auth.verifyLoginPassword('wrong')).toBe('invalid');
+            expect(auth.isLoginLocked()).toBe(true);
+        });
+
+        it('a correct login resets the failure counter', async () => {
+            await auth.setPassword('the-real-password');
+            for (let i = 0; i < 4; i++) await auth.verifyLoginPassword('wrong');   // 4 < 5, not yet locked
+            expect(auth.isLoginLocked()).toBe(false);
+            expect(await auth.verifyLoginPassword('the-real-password')).toBe('ok');
+            // counter reset: it now takes another full burst of 5 to lock
+            for (let i = 0; i < 4; i++) await auth.verifyLoginPassword('wrong');
+            expect(auth.isLoginLocked()).toBe(false);
+        });
+
+        it('throttles a concurrent burst beyond the in-flight cap (bounds scrypt work)', async () => {
+            await auth.setPassword('the-real-password');
+            // Fire more than the cap at once. The excess must be 'throttled' (rejected before scrypt),
+            // never all scheduled -- this is the burst-bypass the review flagged.
+            const results = await Promise.all(
+                Array.from({ length: 10 }, () => auth.verifyLoginPassword('wrong'))
+            );
+            expect(results.filter(r => r === 'throttled').length).toBeGreaterThan(0);
+        });
+    });
 });
