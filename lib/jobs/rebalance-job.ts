@@ -39,6 +39,19 @@ const emptySummary = (): RebalanceSummary => ({ moves: 0, reconstructed: 0, copi
 
 export type RebalanceStatus = RebalanceSummary & {
     running: boolean;
+
+    // STOPPING IS NOT STOPPED, AND THE DIFFERENCE IS WHAT AN OPERATOR IS STARING AT.
+    //
+    // cancel() sets the flag and returns at once, but the run does not die on the spot: up to `concurrency`
+    // slice relocations are already in the air, and each one has to reach a safe boundary. A slice is copied,
+    // fsynced, the database reference is flipped, and only THEN is the source unlinked -- kill it in the middle
+    // and you leave either a duplicate or a record pointing at a slice that is not fully on the platter yet. So
+    // the in-flight moves are drained, deliberately, and on cold USB spindles that can take a while.
+    //
+    // Meanwhile `running` stays true, the UI keeps saying "Rebalancing", the button still says "Cancel", and
+    // the logs keep scrolling -- so the array looks like it flatly ignored the operator. It did not. It is
+    // finishing what it had already started, which is the only safe thing it could do. Say so.
+    stopping: boolean;
     concurrency: number;             // live, retunable via PUT /$/rebalance
     targetFill: number;              // 0..1, capacity-weighted balance point
     deadband: number;
@@ -157,6 +170,9 @@ export class RebalanceJob {
     // Everything the UI needs: where the balance point is, how far off the pool still is, and how fast
     // we're closing the gap. bytesToMove is recomputed from LIVE volume fills, so it falls as the job
     // works and is correct even after a restart mid-rebalance.
+    // Cancelled, but the moves already in the air are still landing.
+    get isStopping(): boolean { return this.running && this.cancelled; }
+
     async getStatus(): Promise<RebalanceStatus> {
         // Read the persisted knob rather than the in-memory copy: when the job is idle the field still
         // holds whatever the last run used, and the UI has to show what the NEXT run will use.
@@ -179,6 +195,7 @@ export class RebalanceJob {
         const bytesPerSec = elapsedSec > 0 ? this.bytesMoved / elapsedSec : 0;
         return {
             running: this.running,
+            stopping: this.isStopping,
             concurrency,
             targetFill,
             deadband: this.deadband,

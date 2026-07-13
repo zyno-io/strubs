@@ -391,4 +391,35 @@ describe('RebalanceJob', () => {
         expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('rebalanceActive');
         expect(deps.runtimeConfig.delete).toHaveBeenCalledWith('rebalanceCursor');
     });
+
+    // STOPPING IS NOT STOPPED, AND THE OPERATOR IS WATCHING.
+    //
+    // cancel() stops the job taking NEW work at once, but up to `concurrency` slice relocations are already in
+    // the air, and each is drained to a safe boundary: a slice is only unlinked from its source after the copy
+    // is fsynced and the database reference flipped. Interrupt that and you leave a duplicate, or a record
+    // pointing at a slice that is not fully on the platter yet.
+    //
+    // So for a while after the click the job IS still running and the logs DO keep scrolling. Reporting
+    // `running: true` with nothing else made the array look like it had flatly ignored the operator. It had
+    // not -- it was finishing what it had already started, which is the only safe thing it could do.
+    describe('cancelling', () => {
+        it('reports STOPPING while the moves already in flight are still landing', async () => {
+            const { job } = makeJob(pool(), objectDoc(1, 'data'));
+
+            (job as any).running = true;
+            expect(job.isStopping).toBe(false);         // running, not cancelled
+
+            await job.cancel();
+            expect(job.isStopping).toBe(true);          // cancelled, but still draining -- SAY SO
+
+            (job as any).running = false;
+            expect(job.isStopping).toBe(false);         // actually stopped now
+        });
+
+        it('is not "stopping" when it was never running', async () => {
+            const { job } = makeJob(pool(), objectDoc(1, 'data'));
+            await job.cancel();
+            expect(job.isStopping).toBe(false);
+        });
+    });
 });

@@ -157,6 +157,8 @@ let verifyPollTimer: ReturnType<typeof setInterval> | null = null;
 // ones. bytesToMove is how far the pool still is from the balance point, so it doubles as progress.
 interface RebalanceStatus {
   running: boolean;
+  // Cancelled, but the slice moves already in the air are still landing. See the note on the button below.
+  stopping: boolean;
   targetFill: number;
   deadband: number;
   bytesToMove: number;
@@ -187,7 +189,8 @@ const freezePending = ref<boolean>(false);
 // lives in the panels below (and in the tooltip).
 const maintenanceActivity = computed<string[]>(() => {
   const what: string[] = [];
-  if (rebalanceStatus.value?.running) what.push('Rebalancing');
+  if (rebalanceStatus.value?.stopping) what.push('Stopping rebalance');
+  else if (rebalanceStatus.value?.running) what.push('Rebalancing');
   if (verifyStatus.value?.running) what.push('Verifying');
   else if (verifyStatus.value?.waiting) what.push('Verify queued');
   if (volumes.value.some(v => v.isDraining)) what.push('Draining');
@@ -1860,14 +1863,29 @@ onUnmounted(() => {
               @change="applyConcurrency($event)"
             />
           </label>
+          <!--
+            STOPPING IS NOT STOPPED, and the operator is watching.
+
+            Cancelling stops the job taking NEW work immediately, but up to `concurrency` slice relocations are
+            already in the air, and each is drained to a safe boundary: a slice is only unlinked from its source
+            after the copy is fsynced and the database reference flipped. Interrupt that and you leave a
+            duplicate, or a record pointing at a slice not yet fully on the platter.
+
+            So for a while after the click the job is still running and the logs still scroll. Saying
+            "Cancel Rebalance" through all of that makes the array look like it ignored you. It did not -- it is
+            finishing what it had already started, which is the only safe thing it can do. Say THAT.
+          -->
           <button
             @click="toggleRebalance"
-            :disabled="rebalancePending || maintenanceFrozen === true"
+            :disabled="rebalancePending || rebalanceStatus?.stopping === true || maintenanceFrozen === true"
             :class="rebalanceStatus?.running ? 'verify-stop-btn' : 'verify-start-btn'"
-            :title="maintenanceFrozen === true ? 'Paused by the maintenance freeze' : ''"
+            :title="rebalanceStatus?.stopping === true
+              ? 'Cancelled. Finishing the slice moves already in flight -- a slice is never left half-moved.'
+              : maintenanceFrozen === true ? 'Paused by the maintenance freeze' : ''"
           >
             {{ rebalancePending
               ? 'Working...'
+              : rebalanceStatus?.stopping ? 'Stopping...'
               : rebalanceStatus?.running ? 'Cancel Rebalance' : 'Start Rebalance' }}
           </button>
         </div>

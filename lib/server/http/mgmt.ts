@@ -1213,9 +1213,17 @@ export class HttpMgmt {
         return { concurrency: await rebalanceJob.setConcurrency(n) };
     }
 
-    private static async handleRebalanceCancelRequest(): Promise<{ rebalancing: boolean }> {
+    private static async handleRebalanceCancelRequest(): Promise<{ rebalancing: boolean; stopping: boolean }> {
         await rebalanceJob.cancel();
-        return { rebalancing: false };
+
+        // "rebalancing: false" was a lie the moment it was written. cancel() stops the job taking NEW work and
+        // returns at once -- but up to `concurrency` slice relocations are already in the air, and each is
+        // drained to a safe boundary (a slice is only unlinked from its source after the copy is fsynced and the
+        // database reference flipped). On cold spindles that takes a while, during which the job is still very
+        // much running and the logs are still scrolling.
+        //
+        // Reporting it as stopped made the array look like it had ignored the operator. Report what is true.
+        return { rebalancing: rebalanceJob.isRunning(), stopping: rebalanceJob.isStopping };
     }
 
     private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
