@@ -176,4 +176,125 @@ describe('bootstrap manifest', () => {
             expect(newestManifest([])).toBeNull();
         });
     });
+
+    // THE ONE WRITE IN THIS SYSTEM THAT CAN DESTROY THE ARRAY'S ABILITY TO RECOVER ITSELF.
+    //
+    // Startup hydrates the snapshot pointer by READING the manifests, then publishes its in-memory state back
+    // to every writable volume. If hydration could not read the disks -- a USB drive off its bus, an EIO --
+    // this process believes there is no snapshot. Publishing that belief overwrites the pointer on every
+    // HEALTHY disk. The snapshot object stays on the platters, 127MB of erasure-coded namespace, and nothing
+    // left alive knows its name.
+    describe('never erasing a snapshot pointer it does not know about', () => {
+        const writerFor = (mounts: Array<{ id: number; mountPoint: string }>) =>
+            new BootstrapManifestWriter({
+                getVolumeConfigs: async () => [volumeConfig(1)],
+                getWritableTargets: () => mounts,
+                getReadableTargets: () => mounts
+            } as never);
+
+        it('KEEPS a snapshot pointer already on the disk when it does not know about one itself', async () => {
+            const mount = path.join(dir, 'vol1');
+            await fsp.mkdir(path.join(mount, 'strubs'), { recursive: true });
+
+            // The disk knows about a snapshot. This process does not (hydration could not read it).
+            const existing = {
+                version: 1,
+                instanceIdentity: 'a'.repeat(32),
+                geometry: { dataSlices: 4, paritySlices: 2 },
+                volumes: [],
+                journalVolumeIds: [],
+                snapshot: {
+                    objectId: '5f5f5f5f5f5f5f5f5f5f5f5f', md5: 'm',
+                    startedAt: 'T', completedAt: '2026-07-01T00:00:00Z', objects: 3545825
+                },
+                previousSnapshot: null,
+                updatedAt: '2026-07-01T00:00:00Z'
+            };
+            await fsp.writeFile(path.join(mount, 'strubs', MANIFEST_FILENAME), JSON.stringify(existing));
+
+            await writerFor([{ id: 1, mountPoint: mount }]).write();
+
+            const after = await readManifest(mount);
+            expect(after?.snapshot?.objectId).toBe('5f5f5f5f5f5f5f5f5f5f5f5f');
+        });
+
+        it('KEEPS a NEWER snapshot pointer even when this process knows about an older one', async () => {
+            // The first version of this rule only fired when we knew of NO snapshot. But a process holding an
+            // OLDER one is just as dangerous: a disk that has been out of the rack comes back carrying the
+            // NEWEST pointer, the periodic refresh rolls over it with our stale one, and the newest snapshot --
+            // 127MB of erasure-coded namespace, sitting right there -- is orphaned.
+            const mount = path.join(dir, 'vol3');
+            await fsp.mkdir(path.join(mount, 'strubs'), { recursive: true });
+
+            const newer = {
+                version: 1,
+                instanceIdentity: 'a'.repeat(32),
+                geometry: { dataSlices: 4, paritySlices: 2 },
+                volumes: [],
+                journalVolumeIds: [],
+                snapshot: { objectId: '5f5f5f5f5f5f5f5f5f5f5f5f', md5: 'm', startedAt: 'T',
+                    completedAt: '2026-07-12T00:00:00Z', objects: 3545825 },
+                previousSnapshot: null,
+                updatedAt: '2026-07-12T00:00:00Z'
+            };
+            await fsp.writeFile(path.join(mount, 'strubs', MANIFEST_FILENAME), JSON.stringify(newer));
+
+            // This process knows only about an OLDER snapshot.
+            const writer = writerFor([{ id: 3, mountPoint: mount }]);
+            writer.setSnapshots({ objectId: '4e4e4e4e4e4e4e4e4e4e4e4e', md5: 'm', startedAt: 'T',
+                completedAt: '2026-07-01T00:00:00Z', objects: 3000000 } as never, null);
+
+            await writer.write();
+
+            const after = await readManifest(mount);
+            expect(after?.snapshot?.objectId).toBe('5f5f5f5f5f5f5f5f5f5f5f5f');   // theirs, because it is newer
+        });
+
+        // WHERE THE JOURNAL IS, AND WHEN THE SNAPSHOT WAS, ARE DIFFERENT QUESTIONS.
+        it('takes the JOURNAL LIST from the most recently WRITTEN manifest, not the one with the newest snapshot', async () => {
+            // Every disk names the same snapshot, so snapshot.completedAt cannot break the tie -- and the disk
+            // that happens to win it is carrying a journal list from before the journal MOVED. A recovery would
+            // then read the journal from the volumes it moved off. Old journal dirs are never deleted, so that
+            // stale replica looks like a perfectly valid, contiguous, gap-free history: the gap check passes,
+            // and every name written since the move is silently dropped by a restore that reports success.
+            const snap = { objectId: '5f5f5f5f5f5f5f5f5f5f5f5f', md5: 'm', startedAt: 'T',
+                completedAt: '2026-07-01T00:00:00Z', objects: 10 };
+            const base = {
+                version: 1, instanceIdentity: 'a'.repeat(32),
+                geometry: { dataSlices: 4, paritySlices: 2 }, volumes: [], previousSnapshot: null, snapshot: snap
+            };
+
+            const stale = path.join(dir, 'volS');
+            const fresh = path.join(dir, 'volF');
+            await fsp.mkdir(path.join(stale, 'strubs'), { recursive: true });
+            await fsp.mkdir(path.join(fresh, 'strubs'), { recursive: true });
+
+            // Same snapshot on both. The JOURNAL moved from [1,2,3] to [7,8,9], and only the freshly-written
+            // manifest knows it.
+            await fsp.writeFile(path.join(stale, 'strubs', MANIFEST_FILENAME),
+                JSON.stringify({ ...base, journalVolumeIds: [1, 2, 3], updatedAt: '2026-07-01T00:00:00Z' }));
+            await fsp.writeFile(path.join(fresh, 'strubs', MANIFEST_FILENAME),
+                JSON.stringify({ ...base, journalVolumeIds: [7, 8, 9], updatedAt: '2026-07-13T00:00:00Z' }));
+
+            const writer = writerFor([{ id: 1, mountPoint: stale }, { id: 2, mountPoint: fresh }]);
+            await writer.hydrateFromDisk();
+
+            expect(writer.getJournalVolumeIds()).toEqual([7, 8, 9]);   // where the journal IS, not where it was
+            expect(writer.getSnapshot()?.objectId).toBe('5f5f5f5f5f5f5f5f5f5f5f5f');
+        });
+
+        it('writes normally to a disk that has no manifest at all', async () => {
+            // ENOENT is an EMPTY SLOT, not a hazard: a fresh disk, a new array. There is nothing to destroy,
+            // and refusing here would mean a brand-new array never publishes a manifest -- silently disabling
+            // the entire recovery path in the name of protecting it.
+            const mount = path.join(dir, 'vol2');
+            await fsp.mkdir(path.join(mount, 'strubs'), { recursive: true });
+
+            await writerFor([{ id: 2, mountPoint: mount }]).write();
+
+            const after = await readManifest(mount);
+            expect(after?.instanceIdentity).toBe('a'.repeat(32));
+            expect(after?.snapshot ?? null).toBeNull();
+        });
+    });
 });

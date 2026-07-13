@@ -33,7 +33,11 @@ const log = createLogger('snapshot');
 // whose container it has not already seen, and never meets a container whose parent it has not already seen.
 // That is not a nicety: it is what lets a restore be a single forward pass with no fixup phase.
 export type SnapshotRecord =
-    | { op: 'container'; id: string; cid: string | null; name: string }
+    // A BUCKET'S ACCESS POLICY IS PART OF THE NAMESPACE, not a detail of it. Restore a bucket without its
+    // publicRead/publicWrite and it comes back PRIVATE -- which is the safe direction, and still wrong: every
+    // anonymous reader of a public bucket breaks, and the restore reports success while they do. Only top-level
+    // containers are buckets, so `pr`/`pw` are absent on everything else.
+    | { op: 'container'; id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean }
     | { op: 'put'; id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number }
     // The last line, and the reason a truncated snapshot cannot be mistaken for a complete one. A gzip
     // stream that was cut off mid-write still decompresses to something that parses perfectly, line after
@@ -51,7 +55,7 @@ export type SnapshotStats = {
 export type SnapshotDeps = {
     // Every container, in any order. Small enough to hold (tens of thousands): they have to be sorted
     // parent-first before they can be written, and you cannot sort a stream you have not seen the end of.
-    listContainers: () => Promise<Array<{ id: string; cid: string | null; name: string }>>;
+    listContainers: () => Promise<Array<{ id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean }>>;
     // Every object, streamed. There are millions, so this must never be materialised.
     streamObjects: () => AsyncIterable<{ id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number }>;
     now: () => Date;
@@ -173,7 +177,11 @@ export class SnapshotBuilder {
         ]);
 
         for (const c of ordered) {
-            const line = serialise({ op: 'container', id: c.id, cid: c.cid, name: c.name });
+            const line = serialise({
+                op: 'container', id: c.id, cid: c.cid, name: c.name,
+                ...(c.pr === undefined ? {} : { pr: c.pr }),
+                ...(c.pw === undefined ? {} : { pw: c.pw })
+            });
             hash.update(line);
             if (!gzip.write(line)) await drain();
         }

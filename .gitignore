@@ -88,3 +88,6 @@ typings/
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# The orphan-quarantine plan: 15MB of generated paths, rebuilt on demand by `orphan-quarantine.ts plan`.
+tools/orphan-quarantine-manifest.json

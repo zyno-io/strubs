@@ -75,10 +75,10 @@ dataLen(k)    = S0    for k = 0
 
 | Offset | Len | Field | Notes |
 |---|---|---|---|
-| 0–3 | 4 | magic `01 FB 02 FB` | |
+| 0–3 | 4 | magic `01 C3 BB 02` | **not** `01 FB 02 FB` — see below |
 | 4 | 1 | version (`1`) | |
 | 5–6 | 2 | header length (48), uint16 LE | |
-| 7–22 | 16 | header MD5 | covers bytes 23–47 |
+| 7–22 | 16 | header MD5 | covers bytes 23–47 — **but only on slices written after ~2015**; see below |
 | **23–34** | **12** | **object id** | raw 12-byte Mongo ObjectId; hex form is the 24-char id |
 | 35–39 | 5 | file size, int LE | so ~512 GiB max per object |
 | 40 | 1 | dataN | |
@@ -89,7 +89,30 @@ dataLen(k)    = S0    for k = 0
 
 On open, STRUBS compares the object id, `dataN`, `parityN`, `sliceIndex` and `chunkSize` against the Mongo record. A mismatch is `EHEADER` — the slice is on the wrong disk, or was mis-stamped at write time. It's a real failure mode, and it's why a "light" verify (header-only) is worth running: it's cheap and catches misfiled slices without reading a byte of data.
 
-> **Known gap:** the magic bytes, version, and the header's own MD5 (7–22) are written but **never verified** when reading a slice — only the identity fields are compared. A corrupt header would be caught by the field comparison, not by its checksum.
+#### The magic bytes are `01 C3 BB 02`, and they are never changing
+
+The writer does `Buffer.write('\x01\xfb\x02\xfb')`, which defaults to **UTF-8** — so `\xfb` (U+00FB) encodes as the two bytes `C3 BB`, and the intended `01 FB 02 FB` lands on disk as `01 C3 BB 02` (truncated to 4 bytes). This is stamped into every slice of all ~3.5M objects on the array.
+
+It is a bug, and it is now the format. Fixing the writer would make every existing slice unreadable by the fixed reader, so **the writer must keep emitting the wrong bytes and every reader must match the disk, not the source.** If you are writing a tool that identifies STRUBS slices, match `01 C3 BB 02`.
+
+#### The header MD5 is ADVISORY — do not reject a slice for failing it
+
+The current writer computes `md5(bytes 23..47)` into bytes 7–22. **The scheme was not always this one.** Sampling 1,932 real slices off the live platters, by object year:
+
+| Object year | Checksum passes | Checksum fails |
+|---|---|---|
+| 2014 | 0 | 6 |
+| 2015 | 171 | 303 |
+| 2019 | 1,446 | 0 |
+| 2026 | 6 | 0 |
+
+The scheme changed part-way through 2015. Every one of those "failures" is a **perfectly healthy slice** whose header was stamped by older code — the data reads back fine, the geometry is correct, the object is intact.
+
+So: **a matching checksum is strong evidence the header is sound; a mismatch proves nothing at all.** Any tool that treats this checksum as a verdict will condemn a large fraction of the oldest data on the array as unrecoverable while it sits there, intact, on six disks. A recovery tool that condemns healthy data is worse than no recovery tool, because it will be believed.
+
+What a reader can trust instead, on a slice of any age, is the **structure**: the magic, the id matching the filename, a geometry that can actually be true (`dataN > 0`, `sliceIndex < dataN + parityN`, sane `chunkSize`). `readSliceHeader()` in `lib/recovery/recovery.ts` gates on exactly that, logs the checksum mismatch, and accepts the slice.
+
+> **Known gap (live read path):** on a normal read, the magic bytes, the version, and the header MD5 are written but **never verified** — only the identity fields are compared against Mongo. A corrupt header is caught by the field comparison, not by its checksum. Given the above, tightening this to *reject* on checksum is not a safe change.
 
 ### Chunk header — 16 bytes
 

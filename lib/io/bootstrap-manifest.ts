@@ -114,6 +114,23 @@ export class BootstrapManifestWriter {
     private previousSnapshot: ManifestSnapshotRef | null = null;
     private journalVolumeIds: number[] = [];
 
+    // TRUE once the running journal has told us where its replicas actually are. Before that, our list is
+    // hearsay from a manifest, and hearsay does not get to overwrite a disk that knows more recently.
+    private journalVolumeIdsAreLive = false;
+
+    // WHEN the manifest we took our hearsay journal list FROM was written. This is the clock to compare a
+    // disk against -- NOT `manifest.updatedAt`, which build() sets to NOW on every single write, so nothing on
+    // a platter is ever "newer" than it and the comparison silently never fires. That mistake made the
+    // round-15 fix a no-op: it preserved the newer snapshot and overwrote its journal location regardless.
+    private journalVolumeIdsFrom = '';
+
+    // Some manifests could not be READ during the scan that chose our journal list -- so the disk that knows
+    // where the journal actually lives may be one of the ones that would not answer. We do not know where the
+    // journal is. Anything about to read it needs to hear that.
+    private journalListIncomplete = false;
+
+    journalListWasIncomplete(): boolean { return this.journalListIncomplete; }
+
     constructor(deps: Partial<BootstrapManifestDeps> = {}) {
         this.deps = { ...defaultDeps, ...deps };
     }
@@ -136,6 +153,28 @@ export class BootstrapManifestWriter {
     }
 
     setJournalVolumeIds(ids: number[]): void {
+        // AN EMPTY LIST IS NOT AN ANSWER, AND THE GUARD LIVES HERE BECAUSE THERE ARE THREE CALLERS.
+        //
+        // A journal that fail-closed -- that could not read its own history and came up with ZERO replicas --
+        // knows nothing. Publishing its silence as `journalVolumeIds: []` tells all thirty manifests that the
+        // journal is NOWHERE, and a future recovery would then replay no journal at all and silently drop every
+        // name written since the last snapshot. The one thing worse than not knowing where the journal is, is
+        // confidently telling the whole array it does not exist.
+        //
+        // This was first guarded in core.ts, which was the wrong place: io/manager.ts and device-reconciler.ts
+        // call this too, on every fleet change and every device reconcile, and neither had the guard. A rule
+        // enforced at one of three call sites is not a rule. It goes at the sink.
+        if (!ids.length) {
+            log.error('the journal reports NO replicas -- it could not read its own history. NOT publishing an '
+                + 'empty journal location: a recovery that believed it would replay nothing and silently drop '
+                + 'every name written since the last snapshot. The manifests keep saying what they said.');
+            return;
+        }
+
+        // THE JOURNAL ITSELF HAS SPOKEN, and it outranks every manifest on every platter: it is where the
+        // journal IS, not where some disk remembers it being. Until this is called, our list is hearsay.
+        this.journalVolumeIdsAreLive = true;
+        this.journalListIncomplete = false;
         this.journalVolumeIds = [...ids];
     }
 
@@ -150,6 +189,10 @@ export class BootstrapManifestWriter {
 
     getPreviousSnapshot(): ManifestSnapshotRef | null {
         return this.previousSnapshot;
+    }
+
+    getJournalVolumeIds(): number[] {
+        return [...this.journalVolumeIds];
     }
 
     // Read the snapshot pointer back off the platters at startup.
@@ -176,8 +219,78 @@ export class BootstrapManifestWriter {
         const newest = await this.newestManifestOnDisk({ withSnapshot: true });
 
         if (!newest?.snapshot) {
-            log('no snapshot pointer found on any volume');
+            // "NO SNAPSHOT FOUND" AND "COULD NOT LOOK" ARE DIFFERENT, and confusing them here is destructive
+            // rather than merely wrong. The very next thing startup does is publish this in-memory state to
+            // EVERY writable volume -- so concluding "there is no snapshot" because a few disks were throwing
+            // EIO would overwrite the good manifests, on the healthy disks, with a null pointer. The snapshot
+            // object would still be on the platters, and nothing on the array would know its name.
+            //
+            // So if we could not read manifests we were supposed to be able to read, we do not get to conclude
+            // anything, and we certainly do not get to write our ignorance to the disks that still work.
+            if (this.unreadableOnLastScan) {
+                // "I COULD NOT READ THE MANIFESTS" IS NOT "THERE IS NO SNAPSHOT", and this is the fifth place
+                // that distinction has had to be nailed down.
+                //
+                // The restore asks this class for the snapshot pointer, gets null, and tells the operator
+                // "there is nothing to restore FROM: the objects are still on the platters, but their names are
+                // not." That sentence would stop somebody's heart, and it is not true -- the names are fine,
+                // the snapshot is fine, and a few disks are simply refusing to hand over a JSON file. Remember
+                // that we could not look, so the restore can say what actually happened.
+                this.hydrationIncomplete = true;
+                log.error('%d manifest(s) could not be read, and no snapshot pointer was found on the ones that '
+                    + 'could. This process does NOT know whether a snapshot exists -- it knows only that it could '
+                    + 'not find out. Fix the disks.', this.unreadableOnLastScan);
+            }
+            else {
+                log('no snapshot pointer found on any volume');
+            }
+
             return;
+        }
+
+        // The JOURNAL REPLICAS, too -- but ONLY as a starting belief, never as an override.
+        //
+        // A recovery reads the journal solely from the volumes the manifest names, because a disk that
+        // carried the journal in a previous life still has its old segments and a stale copy would otherwise
+        // win. So on a bare host this list is essential. But on a LIVE host the running journal knows
+        // perfectly well where it is, and the manifest's list is only a memory of where it was when that
+        // manifest was written. Overwriting the live answer with the remembered one would have every manifest
+        // in the array start advertising replicas that had moved -- and a future recovery would then look for
+        // the journal in the wrong place.
+        //
+        // So: adopt it only if we do not already know. Core calls this BEFORE setJournalVolumeIds(), so the
+        // live journal always gets the last word.
+        //
+        // AND IT COMES FROM A DIFFERENT MANIFEST THAN THE SNAPSHOT DOES. `newest` was chosen by
+        // snapshot.completedAt, which is exactly right for the snapshot pointer and exactly wrong for this.
+        // If every disk names the same snapshot but only some carry the current journal replica set, a stale
+        // manifest can win that tie -- and then a recovery reads the journal from volumes it MOVED OFF.
+        //
+        // Old journal directories are never deleted, so the stale replica looks like a perfectly valid,
+        // contiguous, gap-free history. The gap check passes. And every namespace change made since the journal
+        // moved is silently dropped, from a restore that reports success.
+        //
+        // Where the journal IS is a question about the fleet, not about the snapshot, so it is answered by the
+        // most recently WRITTEN manifest.
+        const byUpdatedAt = await this.newestManifestOnDisk();
+
+        // ...AND IF WE COULD NOT READ EVERY MANIFEST, WE DO NOT KNOW WHERE THE JOURNAL IS.
+        //
+        // The disk holding the current journal list may be one of the ones that would not answer. Taking the
+        // newest list we could READ and calling it the truth is the same sin as all the others: a failure to
+        // look, promoted to a fact. And this fact is load-bearing -- restore reads the journal from these
+        // volumes and NOWHERE else, old journal directories are never deleted, so a stale replica looks like a
+        // contiguous history, the gap check passes, and every name written since the journal moved is dropped
+        // by a restore that reports success.
+        if (this.unreadableOnLastScan) {
+            this.journalListIncomplete = true;
+            log.error('%d manifest(s) could not be read while working out where the namespace journal lives. The '
+                + 'disk that knows may be one of the ones that would not answer.', this.unreadableOnLastScan);
+        }
+
+        if (!this.journalVolumeIds.length && Array.isArray(byUpdatedAt?.journalVolumeIds)) {
+            this.journalVolumeIds = [...byUpdatedAt!.journalVolumeIds];
+            this.journalVolumeIdsFrom = byUpdatedAt!.updatedAt;
         }
 
         this.snapshot = newest.snapshot;
@@ -199,17 +312,37 @@ export class BootstrapManifestWriter {
     // hand a recovery an object id that does not exist here. A manifest with an unparseable updatedAt is
     // not "very new", it is broken -- and a plain string comparison would happily let it beat every real
     // one. Anything we cannot vouch for does not get a vote.
+    // How many manifests were on disks that would not answer, on the most recent scan. Not a diagnostic: it
+    // is the difference between "the array has no snapshot" and "we could not find out".
+    private unreadableOnLastScan = 0;
+
+    // Set when hydration found NO snapshot pointer AND could not read every manifest. The two together mean the
+    // absence of a pointer proves nothing, and anybody about to act on that absence needs to know.
+    private hydrationIncomplete = false;
+
+    hydrationWasIncomplete(): boolean { return this.hydrationIncomplete; }
+
     async newestManifestOnDisk(opts: { withSnapshot?: boolean } = {}): Promise<BootstrapManifest | null> {
         let newest: BootstrapManifest | null = null;
         let newestAt = -Infinity;
+        this.unreadableOnLastScan = 0;
 
         for (const target of this.deps.getReadableTargets()) {
             let manifest: BootstrapManifest;
             try {
                 manifest = JSON.parse(await fsp.readFile(`${target.mountPoint}/strubs/${MANIFEST_FILENAME}`, 'utf8'));
             }
-            catch {
-                continue;                   // absent, unreadable or unparseable: the next disk may be better
+            catch (err) {
+                // ABSENT is a fact. UNREADABLE is not, and it matters enormously here: this scan is what tells
+                // the process whether a snapshot exists, and what it concludes gets written back to every disk
+                // in the array within the minute. A disk that would not answer, silently treated as a disk with
+                // nothing on it, is how a live snapshot pointer gets erased from all 29 copies of the manifest.
+                if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                    this.unreadableOnLastScan++;
+                    log.error('volume %d: its bootstrap manifest could not be read (%s). This scan cannot be '
+                        + 'trusted to say what the array knows.', target.id, (err as NodeJS.ErrnoException).code);
+                }
+                continue;                   // the next disk may be better
             }
 
             if (config.identity && manifest.instanceIdentity !== config.identity) {
@@ -274,6 +407,7 @@ export class BootstrapManifestWriter {
     // awaiting it means "the manifest now reflects my change". Returning the in-flight promise instead
     // would be a lie: that pass may have read the fleet state before the caller's mutation landed. The
     // snapshot rotation (D) flips the manifest's snapshot pointer and must not proceed on that lie.
+
     async write(): Promise<void> {
         if (this.pending) {
             this.queued = true;
@@ -326,9 +460,96 @@ export class BootstrapManifestWriter {
 
         const body = Buffer.from(JSON.stringify(manifest, null, 2) + '\n', 'utf8');
         let written = 0;
+        let preserved = 0;
+
         for (const target of targets) {
             try {
-                await writeManifestAtomically(target.mountPoint, body);
+                // NEVER OVERWRITE A MANIFEST THAT KNOWS MORE THAN WE DO.
+                //
+                // This is the one write in the whole system that can destroy the array's ability to recover
+                // itself. If hydration could not read the disks -- a USB drive that dropped off its bus, an EIO
+                // -- then this process may believe there is no snapshot when there is one, and publishing that
+                // belief overwrites the snapshot POINTER on every healthy disk. The snapshot object stays on
+                // the platters, 127MB of erasure-coded namespace, and nothing left alive knows its name.
+                //
+                // An earlier version of this refused to write ANY manifest whenever hydration was incomplete,
+                // which is worse than the disease: a brand-new array with one dud disk has no snapshot and an
+                // unreadable manifest, so it would never publish a manifest again -- silently disabling the
+                // entire disaster-recovery path in the name of protecting it.
+                //
+                // So the rule is local, and it cannot get stuck: before overwriting a manifest, look at what is
+                // already there. If it names a snapshot and we do not, keep theirs. We are allowed to be
+                // ignorant. We are not allowed to make the array ignorant.
+                let out = body;
+
+                // NEVER REGRESS THE POINTER. Not "never erase it" -- that was the first version of this rule,
+                // and it only fired when THIS process knew of no snapshot at all. But a process that knows of an
+                // OLDER one is just as dangerous: a disk that has been out of the rack comes back carrying the
+                // NEWEST snapshot pointer, the periodic refresh rolls over it with our stale one, and the newest
+                // snapshot -- 127MB of erasure-coded namespace, sitting right there on the platters -- is
+                // orphaned. Nothing alive knows its name any more.
+                //
+                // So compare. Whatever is already on the disk wins if it is NEWER than what we hold, whether we
+                // hold nothing or merely something older.
+                const existing = await readExistingManifest(target.mountPoint);
+
+                if (existing === 'unreadable') {
+                    log.error('volume%d: its existing manifest could not be read, so we cannot prove we are not '
+                        + 'about to overwrite something newer than what we have. SKIPPING it.', target.id);
+                    continue;
+                }
+
+                const theirs = existing?.snapshot;
+                const ours = manifest.snapshot;
+
+                // TWO INDEPENDENT QUESTIONS, AND THEY MUST BE ASKED SEPARATELY.
+                //
+                // "Does this disk know a newer SNAPSHOT than I do?" and "does it know where the JOURNAL is more
+                // recently than I do?" have nothing to do with one another. Nesting the second inside the first
+                // -- which is what this did -- means a disk with the SAME snapshot but a NEWER journal location
+                // gets its journal list overwritten with our stale one. And then a recovery finds the right
+                // snapshot, looks for the journal on the volumes it moved off, reads an old-but-contiguous
+                // history, passes every check, and silently drops every name written since the move.
+                //
+                // That is the same bug I already fixed once, hiding inside the fix.
+                const keepSnapshot = isUsableSnapshotRef(theirs) && isNewer(theirs!, ours);
+
+                // Ours is only HEARSAY until the running journal has told us where it actually lives. Compared
+                // against the manifest our hearsay CAME from -- not `manifest.updatedAt`, which build() stamps
+                // with NOW, so no platter would ever be newer and the branch would never fire.
+                const hearsayAt = Date.parse(this.journalVolumeIdsFrom);
+                const keepJournal = !this.journalVolumeIdsAreLive
+                    && Array.isArray(existing?.journalVolumeIds)
+                    && existing!.journalVolumeIds.length > 0
+                    && Number.isFinite(Date.parse(existing!.updatedAt))
+                    && (!Number.isFinite(hearsayAt) || Date.parse(existing!.updatedAt) > hearsayAt);
+
+                if (keepSnapshot)
+                    log.error('volume%d: its manifest names snapshot %s (completed %s), which is NEWER than the one '
+                        + 'this process knows about (%s). KEEPING the pointer that is already there -- overwriting '
+                        + 'it would orphan the namespace it points at.',
+                        target.id, theirs!.objectId, theirs!.completedAt, ours?.objectId ?? 'none');
+
+                if (keepJournal)
+                    log.error('volume%d: its manifest was written more recently than the one we took our journal '
+                        + 'location from, and we have not heard from the live journal. KEEPING its journal list '
+                        + '[%s]: a recovery reads the journal ONLY from the volumes the manifest names, and an old '
+                        + 'list means an old, contiguous, entirely convincing history with the recent names gone.',
+                        target.id, existing!.journalVolumeIds.join(', '));
+
+                if (keepSnapshot || keepJournal) {
+                    out = Buffer.from(JSON.stringify({
+                        ...manifest,
+                        ...(keepSnapshot ? {
+                            snapshot: theirs,
+                            previousSnapshot: existing?.previousSnapshot ?? manifest.previousSnapshot ?? null
+                        } : {}),
+                        ...(keepJournal ? { journalVolumeIds: existing!.journalVolumeIds } : {})
+                    }, null, 2) + '\n', 'utf8');
+                    preserved++;
+                }
+
+                await writeManifestAtomically(target.mountPoint, out);
                 written++;
             }
             catch (err) {
@@ -336,6 +557,10 @@ export class BootstrapManifestWriter {
                 log.error('volume%d: failed to write bootstrap manifest: %s', target.id, err);
             }
         }
+
+        if (preserved)
+            log.error('%d manifest(s) kept a snapshot pointer this process did not know about. That is the safe '
+                + 'outcome, and it means hydration did not see the whole array: fix the disks.', preserved);
         log('wrote bootstrap manifest to %d/%d writable volumes', written, targets.length);
     }
 
@@ -466,6 +691,36 @@ export function newestManifest(manifests: BootstrapManifest[]): BootstrapManifes
         if (rank > 0) best = m;
     }
     return best;
+}
+
+// Is `a` a strictly newer snapshot than `b`? An unusable or absent `b` loses to any usable `a`.
+function isNewer(a: NonNullable<BootstrapManifest['snapshot']>, b: BootstrapManifest['snapshot']): boolean {
+    if (!isUsableSnapshotRef(b)) return true;
+    const ta = Date.parse(a.completedAt);
+    const tb = Date.parse(b!.completedAt);
+    if (!Number.isFinite(ta)) return false;          // we cannot claim newer on the strength of a bad date
+    if (!Number.isFinite(tb)) return true;           // ...but theirs being unreadable loses to ours being sound
+    return ta > tb;
+}
+
+// 'unreadable' is NOT the same as absent. ENOENT is an empty slot on a fresh disk -- there is nothing there to
+// destroy, so write away. A manifest we cannot READ is the dangerous one: we cannot prove we are not about to
+// overwrite a pointer newer than our own.
+async function readExistingManifest(mountPoint: string): Promise<BootstrapManifest | null | 'unreadable'> {
+    try {
+        return JSON.parse(await fsp.readFile(`${mountPoint}/strubs/${MANIFEST_FILENAME}`, 'utf8')) as BootstrapManifest;
+    }
+    catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return null;          // a fresh disk: nothing there to destroy. Write away.
+
+        // EVERYTHING ELSE IS "I COULD NOT SEE IT" -- including a manifest too mangled to parse. That used to
+        // return null, which meant "nothing worth keeping", which meant we overwrote it. But a manifest whose
+        // JSON is corrupt may still be the only one naming the current snapshot; we simply cannot READ it to
+        // find out. Overwriting on the strength of not being able to read something is the same mistake this
+        // file has now made in five different places.
+        return 'unreadable';
+    }
 }
 
 export const bootstrapManifestWriter = new BootstrapManifestWriter();

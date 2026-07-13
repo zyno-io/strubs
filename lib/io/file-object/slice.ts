@@ -1,7 +1,7 @@
 import type { FileHandle } from 'fs/promises';
 
 import { hash } from '../../async-bridges/crypto-async';
-import { constants } from '../../constants';
+import { constants, SLICE_MAGIC } from '../../constants';
 import { createLogger } from '../../log';
 import { ioManager } from '../manager';
 import type { FileObject } from '../file-object';
@@ -98,7 +98,11 @@ export class Slice {
                 ioShutdown.throwIfAborted();
             }
 
-            /* 00-03 */ writeBuf.write('\x01\xfb\x02\xfb', 0); // magic header
+            // The bytes that are actually on every platter in this array -- see SLICE_MAGIC. This used to be
+            // spelled `writeBuf.write('\x01\xfb\x02\xfb', 0)`, which, through a UTF-8 encoding quirk, wrote
+            // these exact four bytes while appearing to write four different ones. Same bytes, same file, same
+            // format: the code just no longer says the opposite of what it does.
+            /* 00-03 */ SLICE_MAGIC.copy(writeBuf, 0); // magic header
             /* 04-04 */ writeBuf.writeUInt8(1, 4); // version
             /* 05-06 */ writeBuf.writeUInt16LE(constants.FILE_HEADER_SIZE, 5); // header length
             /* 07-22 */ ; // header checksum (will populate after its computed)

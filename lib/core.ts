@@ -22,6 +22,7 @@ import { remediationService } from './remediation/service';
 import { repairWorker } from './remediation/repair-worker';
 import { storageStatsTracker } from './storage/stats-tracker';
 import { isMaintenanceFrozen } from './maintenance';
+import { HttpMgmt } from './server/http/mgmt';
 
 const log = createLogger('core');
 
@@ -74,6 +75,39 @@ export class Core {
             // expose an array we cannot vouch for. So: bring up the ADMIN surface only, and let an
             // operator restore the identity from a volume's bootstrap manifest. We never generate one --
             // a fresh identity permanently orphans every disk in the array.
+            // A HALF-WRITTEN VOLUME TABLE IS THE SAME EMERGENCY, and it is a worse one, because this host has
+            // an identity and would otherwise come up looking entirely healthy.
+            //
+            // A fleet restore that died part-way leaves Mongo holding a volume table that is well-formed,
+            // internally consistent, and describes an array a third of its real size. Starting normally on that
+            // table does three things, in ascending order of horror:
+            //
+            //   - the missing disks are not "unmounted", they are UNKNOWN, so nothing refuses on their behalf;
+            //   - every object living on them reads as data loss, on an array that has lost nothing;
+            //   - and then the periodic manifest write below serialises that partial table and stamps it onto
+            //     EVERY remaining disk -- overwriting the good manifests, which are the only record of the
+            //     disks it forgot. The array would destroy its own map of itself while reporting for duty.
+            //
+            // That last one is a WRITE, to every disk, of provably wrong data. So the marker gates startup,
+            // not just the recovery jobs: admin surface only, no fleet, no journal, no manifest writes, until
+            // an operator finishes the restore.
+            //
+            // NOTE the difference between THIS emergency and the namespace one further down. Here the VOLUME
+            // TABLE is untrustworthy, so the fleet must not come up at all. There, the volume table is fine and
+            // the fleet MUST come up -- because reading the snapshot off the platters is the entire point.
+            const interrupted = await database.fleetRestoreIncomplete();
+            if (interrupted) {
+                log.error('RECOVERY MODE: a fleet restore started %s did not finish, so the volume table may be '
+                    + 'missing disks. NOT starting the fleet, the journal, the object API, or any manifest write: '
+                    + 'a partial table published to the platters would overwrite the only record of the disks it '
+                    + 'does not know about. Re-run the fleet recovery to finish it.', interrupted.startedAt);
+                await adminAuth.bootstrap();
+                await serverManager.start({ recovery: true });
+                this.started = true;
+                log('STRUBS started in RECOVERY mode (incomplete fleet restore).');
+                return;
+            }
+
             if (!config.identity) {
                 log.error('RECOVERY MODE: no instance identity; NOT starting the fleet or the object API');
                 await adminAuth.bootstrap();
@@ -84,17 +118,77 @@ export class Core {
             }
 
             await ioManager.init();
+
+            // Read the manifest back off the disks BEFORE anything writes one. The snapshot pointer lives in
+            // memory, and the periodic refresh writes memory out to every volume -- so a process that came up
+            // not knowing about the snapshot would erase it from all 29 of them within the minute, leaving
+            // 127MB of erasure-coded namespace on the platters that nothing knows the name of.
+            await bootstrapManifestWriter.hydrateFromDisk().catch(err =>
+                log.error('could not read the manifest back off the platters: %s', err));
+
+            // THE FLEET IS BACK. THE NAMES ARE NOT.
+            //
+            // A fleet restore mounts the disks; it does not put a single name back. Start normally on that
+            // still-empty database and the snapshot job wakes up on schedule, snapshots the nothing it can see,
+            // verifies it perfectly, and MOVES THE MANIFEST POINTER TO IT -- on every disk. The real snapshot,
+            // the one holding all 3.5 million names, is still on the platters and nothing alive knows where.
+            // The recovery system would have destroyed the namespace it exists to restore, and it would have
+            // done it in the first five minutes, while the operator was making a cup of tea.
+            //
+            // THE FLEET COMES UP FIRST, AND THAT IS THE WHOLE POINT.
+            //
+            // The first version of this check ran BEFORE ioManager.init() and before the manifest was hydrated,
+            // which bricked the array: the restore that is the ONLY way to clear this marker needs the disks
+            // mounted (to read the snapshot object off the platters) and needs the manifest hydrated (to know
+            // WHICH object). Neither had happened. The marker blocked the only thing that could clear it, and
+            // the array sat in recovery mode forever. A safety net you cannot climb out of is a trap.
+            //
+            // So: the disks mount, the manifest is read, and then we stop. No journal, no object API, no
+            // snapshot job, no manifest WRITES -- everything that could act on, or publish, a namespace that is
+            // not there yet. The admin surface is up, and POST /$/restore has everything it needs.
+            //
+            // AND TO BE HONEST ABOUT WHAT THIS MODE IS NOT: it is not read-only. ioManager.init() mounts the
+            // filesystems read-write, may run `e2fsck -y` on a dirty one, and creates `strubs/.tmp` where it is
+            // missing. Those are writes, to a platter, in "recovery" mode. They are also unavoidable -- you
+            // cannot read a snapshot object off a filesystem you have not mounted -- and they touch filesystem
+            // metadata, never a slice. The invariant that actually matters is narrower and it does hold: nothing
+            // in this mode writes an OBJECT, publishes a MANIFEST, or acts on what the empty database says.
+            const namespaceMissing = await database.namespaceRestoreRequired();
+            if (namespaceMissing) {
+                log.error('RECOVERY MODE: the fleet is up but the NAMESPACE has not been restored (since %s). Mongo '
+                    + 'is empty and the names of every object on this array are still only on the platters. The '
+                    + 'disks are mounted and the manifest is read -- so POST /$/restore can run -- but the object '
+                    + 'API, the journal, the snapshot job and every manifest WRITE are held back: a snapshot taken '
+                    + 'now would point the manifest at an empty namespace and orphan the real one.',
+                    namespaceMissing.since);
+
+                // ...and DISARM the admin API. It is up, because the operator needs it -- and almost every
+                // route on it reads a Mongo we have just declared non-authoritative in order to decide
+                // something. POST /$/snapshot would snapshot the empty namespace and publish the pointer to
+                // every disk; DELETE /$/volumes would ask an empty database how many objects are on a full
+                // 3TB platter, hear "none", and drop it from the fleet. An allowlist, not a blocklist.
+                HttpMgmt.setNamespaceMissing(true);
+
+                await adminAuth.bootstrap();
+                await serverManager.start({ recovery: true });
+                this.started = true;
+                log('STRUBS started in RECOVERY mode (fleet up, namespace not yet restored, admin API disarmed).');
+                return;
+            }
+
             // The journal must be up BEFORE the object API accepts a write: a PUT that lands before the
             // journal is running is a namespace change nobody recorded.
             await journal.start();
+
+            // ...and THEN the live journal has the last word on where it actually lives. The manifest's list
+            // is a memory of where the journal was when that manifest was written; the journal itself is
+            // where it IS. Letting the older answer win would have the manifest advertise replicas that
+            // moved -- and a recovery reads the journal only from the volumes the manifest names.
+            //
+            // An EMPTY replica list is refused by setJournalVolumeIds() itself -- the guard is at the sink,
+            // because io/manager.ts and device-reconciler.ts call it too and a rule enforced at one of three
+            // call sites is not a rule.
             bootstrapManifestWriter.setJournalVolumeIds(journal.replicaVolumeIds);
-            // Read the snapshot pointer back off the disks BEFORE anything writes a manifest. The pointer
-            // lives in memory, and the periodic refresh writes memory out to every volume -- so a process
-            // that came up not knowing about the snapshot would erase it from all 29 of them within the
-            // minute, leaving 127MB of erasure-coded namespace on the platters that nothing knows the name
-            // of.
-            await bootstrapManifestWriter.hydrateFromDisk().catch(err =>
-                log.error('could not read the snapshot pointer back off the platters: %s', err));
             // The fleet is up: refresh the bootstrap manifest on every writable volume. Fire-and-forget --
             // a manifest write must never delay or fail startup -- plus a periodic backstop so a manifest
             // can never silently stop refreshing (which you'd only discover during a recovery).

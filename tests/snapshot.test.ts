@@ -31,12 +31,40 @@ describe('namespace snapshot', () => {
         await fsp.rm(dir, { recursive: true, force: true });
     });
 
-    const builderFor = (containers: Array<{ id: string; cid: string | null; name: string }>, objects: any[]) =>
+    const builderFor = (containers: Array<{ id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean }>, objects: any[]) =>
         new SnapshotBuilder({
             listContainers: async () => containers,
             streamObjects: () => (async function* () { for (const o of objects) yield o; })(),
             now: () => new Date('2026-07-13T00:00:00Z')
         });
+
+    // A BUCKET'S ACCESS POLICY IS PART OF THE NAMESPACE.
+    //
+    // Drop publicRead/publicWrite from the snapshot and every restored bucket comes back PRIVATE. That is the
+    // safe direction to fail in -- nothing leaks -- and it is still a namespace that does not match the one we
+    // lost: every anonymous reader of a public bucket breaks, and the restore reports success while they do.
+    it('carries a bucket\'s public-access policy into the snapshot', async () => {
+        const b = builderFor(
+            [
+                { id: 'c1', cid: null, name: 'public-photos', pr: true, pw: false },
+                { id: 'c2', cid: null, name: 'private-docs' },
+                { id: 'c3', cid: 'c1', name: 'holidays' }        // a FOLDER is not a bucket and has no policy
+            ],
+            []
+        );
+
+        await b.writeTo(file);
+        const lines = await readSnapshot(file);
+        const byName = new Map(lines.map(l => [l.name, l]));
+
+        expect(byName.get('public-photos')).toMatchObject({ pr: true, pw: false });
+
+        // Absent, not `false`: the snapshot says nothing about a bucket nobody ever made public, and a folder
+        // has no policy to say anything about. Writing `false` on all 55,000 folders would be 55,000 lines
+        // asserting something that was never true.
+        expect(byName.get('private-docs')).not.toHaveProperty('pr');
+        expect(byName.get('holidays')).not.toHaveProperty('pr');
+    });
 
     // The whole point: everything Mongo knows, written down where Mongo cannot take it with it.
     it('writes every container and object in the journal\'s own vocabulary', async () => {

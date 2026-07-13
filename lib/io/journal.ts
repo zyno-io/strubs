@@ -10,6 +10,7 @@ const log = createLogger('journal');
 
 export const JOURNAL_DIR = '.journal';
 
+
 // How long stop() waits for an in-flight re-election before closing the segments anyway.
 const STOP_RECONFIGURE_WAIT_MS = 10_000;
 
@@ -55,7 +56,12 @@ const STOP_RECONFIGURE_WAIT_MS = 10_000;
 export type JournalRecord =
     | { op: 'put'; ts: string; id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number; dv?: number[]; pv?: number[] }
     | { op: 'del'; ts: string; id: string }
-    | { op: 'container'; ts: string; id: string; cid: string | null; name: string };
+    | { op: 'container'; ts: string; id: string; cid: string | null; name: string }
+    // A BUCKET'S ACCESS POLICY IS A NAMESPACE CHANGE, and leaving it out of the journal has a direction to it
+    // that matters: the snapshot records the policy as it was when the snapshot ran, so a bucket made PRIVATE
+    // afterwards would be restored PUBLIC. The recovery would quietly re-open a bucket somebody deliberately
+    // closed, and report success. Every other namespace change is journaled; so is this one.
+    | { op: 'policy'; ts: string; id: string; pr?: boolean; pw?: boolean };
 
 type Replica = {
     volumeId: number;
@@ -137,7 +143,6 @@ export class Journal {
     // suspicion, not a fact about the disk, and it must never survive to become a permanent verdict on
     // hardware that is probably fine. We change nothing on them -- we simply stop trusting them as a copy
     // of the namespace, so the doubtful tail cannot be seeded onto anything healthy.
-    private readonly quarantined = new Set<number>();
 
     constructor(deps: Partial<JournalDeps> = {}) {
         this.deps = { ...defaultDeps, ...deps };
@@ -155,6 +160,39 @@ export class Journal {
         return config.journalEnabled;
     }
 
+    // Say, on every disk, where the journal now lives. Called whenever the replica set actually changes -- not
+    // merely when the fleet does. Deliberately fire-and-forget: the bootstrap manifest is a convenience for a
+    // future recovery, and it must never be able to stall or fail a namespace write happening right now.
+    private publishReplicaLocation(): void {
+        const ids = this.replicaVolumeIds;
+        if (!ids.length) return;                     // an empty list is not an answer; the sink refuses it anyway
+
+        // NOTHING IN HERE MAY TAKE THE JOURNAL DOWN WITH IT.
+        //
+        // The bootstrap manifest is a convenience for a future recovery. The journal is the thing standing
+        // between this array and losing names RIGHT NOW. If publishing fails, we log loudly and keep writing --
+        // the first version of this had the publish inside the try that guards segment discovery, so a failure
+        // to update a JSON file would have made the journal drop every replica and refuse every namespace
+        // write. The cure would have been considerably worse than the disease.
+        try {
+            const { bootstrapManifestWriter } = require('./bootstrap-manifest') as
+                typeof import('./bootstrap-manifest');
+
+            bootstrapManifestWriter.setJournalVolumeIds(ids);
+            void bootstrapManifestWriter.write().catch(err =>
+                log.error('the journal moved to volume(s) %s but the manifests could not be updated (%s). A recovery '
+                    + 'would look in the OLD place -- and find an old, contiguous, entirely convincing history with '
+                    + 'every recent name missing from it.', ids.join(', '), err));
+
+            log('the journal now lives on volume(s) %s; the manifests have been told', ids.join(', '));
+        }
+        catch (err) {
+            log.error('could not tell the bootstrap manifests that the journal moved to volume(s) %s: %s. The '
+                + 'journal is still writing -- names are safe right now -- but a RECOVERY would look for them in '
+                + 'the wrong place. This wants fixing before the next disaster, not during it.', ids.join(', '), err);
+        }
+    }
+
     get replicaVolumeIds(): number[] {
         return this.replicas.map(r => r.volumeId);
     }
@@ -166,6 +204,7 @@ export class Journal {
             return;
         }
         this.stopping = false;
+
         await this.reconfigure();
         this.started = true;
     }
@@ -202,7 +241,7 @@ export class Journal {
     // with it. Keeps any currently-elected replica that is still eligible, so a routine fleet change does
     // not churn the set (and force a needless segment copy). Pure: it only chooses, it does not open.
     private chooseReplicas(): Array<{ id: number; mountPoint: string; busGroup: number | null }> {
-        const candidates = this.deps.getWritableVolumes().filter(v => !this.quarantined.has(v.id));
+        const candidates = this.deps.getWritableVolumes();
         const wanted = config.journalReplicas;
 
         const chosen: typeof candidates = [];
@@ -464,6 +503,21 @@ export class Journal {
                 return;
             }
 
+            // THE SEGMENTS ARE OPEN, SO THIS IS WHERE THE JOURNAL NOW LIVES -- AND THE MANIFESTS HAVE TO KNOW.
+            //
+            // A recovery reads the journal from the volumes the bootstrap manifest names, and NOWHERE else. We
+            // re-elect replicas in here, on our own, after a degraded write, with nobody asking -- and if we say
+            // nothing, every name written from this moment lands on volumes a recovery will never look at.
+            //
+            // And it would not even look wrong. The OLD journal directories are never deleted, so a recovery
+            // finds them, reads a history that is contiguous, gap-free and utterly convincing, passes every
+            // check, and hands the operator a namespace missing every name written since the move. Nothing can
+            // detect that afterwards, which is exactly why it has to be impossible beforehand.
+            //
+            // Deliberately AFTER the try above and unable to throw: publishing a JSON file must never be able to
+            // make the journal drop its replicas and refuse namespace writes.
+            this.publishReplicaLocation();
+
             // A re-election that ends UNDER-STRENGTH does not retry itself, and that is deliberate: the
             // reason it came up short is almost always a disk that is failing right now, and hammering it
             // with a fresh segment copy on every subsequent write would be worse than being one copy down.
@@ -535,13 +589,6 @@ export class Journal {
         const unreadable: number[] = [];
         for (const volume of this.deps.getFleetVolumes()) {
             if (volume.isDeleted) continue;
-
-            // A quarantined disk's segment may end in a record for something that never happened. Seeding
-            // from it would copy that record onto every healthy replica -- the one way a doubtful tail gets
-            // laundered into the real history. It is not a source, and it is not a rival lineage either: it
-            // is simply not consulted.
-            if (this.quarantined.has(volume.id)) continue;
-
             // NOT MOUNTED is not the same as EMPTY. The disk may be sitting right there with the whole
             // namespace history on it and a filesystem that would not mount -- and its mountPoint is an
             // empty directory on the root filesystem, which reads back as a confident "nothing here". A
@@ -1002,40 +1049,48 @@ export class Journal {
                 //
                 // So roll every replica back to exactly where it was before we tried. These bytes were
                 // never acknowledged to anyone, and nothing may ever read them as though they were.
+                const stuck: number[] = [];
+
                 for (const [volumeId, { mountPoint, bytes }] of before) {
                     const path = `${mountPoint}/strubs/${JOURNAL_DIR}/${filename}`;
                     try {
                         await truncateSegmentTo(path, bytes);
                     }
                     catch (truncErr) {
-                        // We could not take the bytes back. That platter may now carry a complete record for
-                        // a change that never happened -- and if it is later picked up as a SOURCE, the seed
-                        // would faithfully copy that record onto every healthy replica and spread it.
-                        //
-                        // So the disk is quarantined: not a source, not adoptable, for the life of this
-                        // process. It is only ever a suspicion (the write may never have reached the platter
-                        // at all), which is why nothing is deleted and nothing is rewritten -- but a
-                        // suspicion is enough to stop trusting it as a copy of the namespace.
-                        //
-                        // Even if it did escape, the replay rules at the top of this file would catch it: a
-                        // `put` whose slices are absent is dropped, a `del` whose slices are present is
-                        // ignored. This is the belt; those are the braces.
-                        this.quarantined.add(volumeId);
+                        stuck.push(volumeId);
                         log.error('volume%d: could NOT roll back a REJECTED journal batch (%s). Its segment may now '
-                            + 'contain a record for a change that never happened, so it is QUARANTINED: it will not '
-                            + 'be used as a journal replica or as a seed source until STRUBS is restarted.',
+                            + 'end with a complete, parseable record for a change we were about to call FAILED.',
                             volumeId, truncErr);
-                        void notificationService.notify({
-                            severity: 'critical',
-                            title: 'STRUBS quarantined a volume from the namespace journal',
-                            body: `A journal write to volume ${volumeId} was rejected, and the bytes could not be taken `
-                                + `back off the disk (${truncErr instanceof Error ? truncErr.message : String(truncErr)}). Its journal `
-                                + `segment may now end with a record for an operation that never happened. STRUBS will not use `
-                                + `that volume for the journal again until it is restarted, and has changed nothing on it.`,
-                            dedupeKey: `journal:quarantine:${volumeId}`
-                        }).catch(() => undefined);
                     }
                 }
+
+                // WE MAY NOT KNOW WHETHER THE BYTES ARE GONE, AND NO LOCAL RULE CAN TELL US.
+                //
+                // The truncate can fail AFTER doing its work -- the file is back at the old length and only the
+                // sync() that would prove it failed. Or it can fail before touching anything. From here the two
+                // are indistinguishable, so the record may be on the platter or may not.
+                //
+                // I tried both answers and both are wrong. REJECT, and a record for an operation the caller
+                // abandoned may survive in the history. PROMOTE it to success, and the caller may unlink an
+                // object's slices on the strength of a `del` that is not actually in any journal -- and the
+                // restore then reports a deliberately-deleted object as MISSING DATA.
+                //
+                // So the batch is REJECTED (the caller must not believe a write that reached no replica), and
+                // the ambiguity is dealt with where it can actually be settled: at REPLAY.
+                //
+                //   `put`  -- the platters settle it: no slices, no name. Dropped.
+                //   `del`  -- the platters settle it: slices still there, delete never completed. Ignored.
+                //   `container` -- accepted residue, and always was: a stray empty folder.
+                //   `policy` -- has no physical evidence anywhere, so replay makes it SAFE INSTEAD OF CERTAIN:
+                //               a journalled policy record may CLOSE a bucket, never OPEN one. An escaped record
+                //               can then only ever over-restrict, which an operator notices and fixes in a
+                //               moment. It can never leak.
+                if (stuck.length)
+                    log.error('journal: a rejected batch could not be provably rolled back off volume(s) %s. Its '
+                        + 'records may or may not be on those platters -- there is no way to tell from here. The '
+                        + 'batch is REJECTED (the caller must not believe it), and the replay rules settle the rest: '
+                        + 'a put with no slices is dropped, a del whose slices survive is ignored, and a bucket '
+                        + 'policy may only ever CLOSE a bucket, never open one.', stuck.join(', '));
 
                 const err = new Error('journal write failed on EVERY replica');
                 for (const p of batch) p.reject(err);
@@ -1380,7 +1435,6 @@ async function sameLineage(mountA: string, mountB: string): Promise<boolean> {
         length
     );
 }
-
 
 
 // Two same-named segments have DIVERGED: neither is a prefix of the other, so they carry different

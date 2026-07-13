@@ -50,9 +50,22 @@ vi.mock('../lib/io/journal', () => ({
 }));
 
 const connectMock = vi.fn();
+const fleetRestoreIncompleteMock = vi.fn(async () => null as { expected: number; startedAt: string } | null);
+// The namespace is present: a fleet restored from bare disks has an EMPTY Mongo, and starting normally on
+// that would let the snapshot job overwrite the pointer to the real namespace. Tested separately.
+const namespaceRestoreRequiredMock = vi.fn(async () => null as { since: string } | null);
+
+// The admin API is DISARMED in namespace-recovery mode: it is up (the operator needs it) in front of a Mongo
+// the array has declared non-authoritative, and almost every route reads that Mongo to decide something.
+const setNamespaceMissingMock = vi.fn();
+vi.mock('../lib/server/http/mgmt', () => ({ HttpMgmt: { setNamespaceMissing: setNamespaceMissingMock } }));
 vi.mock('../lib/database', () => ({
     database: {
         connect: connectMock,
+        // No interrupted fleet restore: the volume table is whole, so startup proceeds normally. The case
+        // where it is NOT whole is a RECOVERY-mode start, and is tested separately.
+        fleetRestoreIncomplete: fleetRestoreIncompleteMock,
+        namespaceRestoreRequired: namespaceRestoreRequiredMock,
     },
 }));
 
@@ -359,5 +372,39 @@ describe('Core', () => {
         expect(ioStopMock).not.toHaveBeenCalled();
         expect(verifyStopMock).not.toHaveBeenCalled();
         expect(storageStatsStopMock).not.toHaveBeenCalled();
+    });
+
+    // THE WORST BUG THIS REVIEW LOOP FOUND, and it is the recovery system destroying the thing it exists to
+    // protect.
+    //
+    // A bare-host fleet recovery mounts the disks. It does NOT put a single name back -- Mongo is still empty.
+    // Start normally on that, and the snapshot job wakes up on schedule, snapshots the nothing it can see,
+    // verifies it perfectly, and moves the manifest pointer to it on every disk in the array. The real
+    // snapshot -- 3.5 million names -- is still on the platters, and nothing alive knows where it is.
+    //
+    // AND THE FLEET MUST STILL COME UP. The first version of this guard ran before ioManager.init(), which
+    // bricked the array: the restore that is the ONLY way to clear the marker needs the disks MOUNTED (to read
+    // the snapshot object off the platters) and the manifest HYDRATED (to know which object). The marker
+    // blocked the only thing that could clear it. A safety net you cannot climb out of is a trap.
+    it('brings the FLEET up but nothing else when the namespace has not been restored', async () => {
+        namespaceRestoreRequiredMock.mockResolvedValueOnce({ since: '2026-07-13T00:00:00Z' });
+        const { Core } = await import('../lib/core');
+        const core = new Core();
+
+        await core.start();
+
+        // The disks mount and the manifest is read -- POST /$/restore needs both, and it is the only way out.
+        expect(ioInitMock).toHaveBeenCalled();
+
+        // ...and NOTHING else. No journal, no object API, and above all no snapshot job and no manifest write:
+        // a snapshot taken now would point the manifest at an empty namespace and orphan the real one.
+        expect(serverStartMock).toHaveBeenCalledWith({ recovery: true });
+        expect(journalStartMock).not.toHaveBeenCalled();
+        expect(manifestWriteMock).not.toHaveBeenCalled();
+
+        // ...and the admin API is disarmed. POST /$/snapshot would otherwise snapshot the EMPTY namespace and
+        // publish the pointer to every disk -- the exact catastrophe this mode exists to prevent, reachable by
+        // hand from the surface we deliberately left up.
+        expect(setNamespaceMissingMock).toHaveBeenCalledWith(true);
     });
 });

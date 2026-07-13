@@ -985,14 +985,143 @@ export class ContentRepository {
     // EVERY container, for the namespace snapshot. Tens of thousands, not millions -- they have to be
     // sorted parent-first before they can be written, and you cannot sort a stream you have not seen the
     // end of. The objects, which ARE millions, are streamed instead (below).
-    async listAllContainers(): Promise<Array<{ id: string; cid: string | null; name: string }>> {
+    // UPSERTS, because a restore must be safe to run twice.
+    //
+    // A recovery gets interrupted. The operator runs it again. If these were inserts, the second run would
+    // collide on every id it had already written and the restore would fail in the middle -- which is a
+    // terrible property for the one tool whose entire job is to work when everything else has failed. Keyed
+    // by _id, so re-running lands in exactly the same place.
+    // ANYTHING THE REBUILT NAMESPACE DOES NOT CONTAIN, THE DATABASE MUST NOT CONTAIN EITHER.
+    //
+    // The restore writes with upserts, which is right -- it has to be idempotent so an interrupted run can be
+    // resumed. But upserts only ADD. Run a restore over a database that already holds rows (a forced overwrite,
+    // or the wreckage of an earlier attempt), and every row the new namespace does NOT have simply stays.
+    //
+    // The rows that survive that way are the worst possible ones. An object DELETED before the snapshot is not
+    // in the snapshot -- that is what deleted means -- so nothing overwrites it, and it walks back into the
+    // namespace with its name, in its bucket, readable by whoever can read that bucket. Somebody asked for that
+    // data to be gone. The restore would hand it back to them and report success.
+    //
+    // So the namespace is made to MATCH: whatever is not in the rebuilt set is removed. This only ever runs on
+    // an `apply`, and the restore refuses to apply to a live array unless it is forced or resuming its own
+    // wreckage -- so the only databases this touches are empty ones (no-op), ones we were told to overwrite,
+    // and our own half-finished work.
+    async pruneOutsideNamespace(keep: Set<string>): Promise<number> {
+        const doomed: ObjectId[] = [];
+        let removed = 0;
+
+        const flush = async () => {
+            if (!doomed.length) return;
+            const r = await this.collection.deleteMany({ _id: { $in: doomed.splice(0, doomed.length) } });
+            removed += r.deletedCount ?? 0;
+        };
+
+        const cursor = this.collection.find({}, { projection: { _id: 1 }, batchSize: 5000 });
+        for await (const doc of cursor) {
+            if (keep.has(String(doc._id))) continue;
+            doomed.push(doc._id as ObjectId);
+            if (doomed.length >= 1000) await flush();
+        }
+        await flush();
+
+        return removed;
+    }
+
+    async restoreContainer(r: { id: string; cid: string | null; name: string; bucketId: string | null; pr?: boolean; pw?: boolean }): Promise<void> {
+        const id = new ObjectId(r.id);
+        const containerId = r.cid ? new ObjectId(r.cid) : null;
+
+        const set: Record<string, unknown> = {
+            name: r.name,
+            containerId,
+            isContainer: true,
+            // A top-level container IS its own bucket; everything else carries the root of its chain.
+            bucketId: r.bucketId ? new ObjectId(r.bucketId) : id
+        };
+
+        // ABSENT MEANS ABSENT, WHICH MEANS PRIVATE -- AND IT HAS TO BE TAKEN AWAY, NOT MERELY NOT SET.
+        //
+        // Omitting the field from `$set` only fails to SET it. On a forced or resumed restore, over a row that
+        // already exists, the OLD value simply survives -- so a bucket the rebuilt namespace says is PRIVATE
+        // would stay PUBLIC, and the restore would report success. The restore's job is to make the database
+        // MATCH the namespace, and for an access flag, matching has to include removing it.
+        const unset: Record<string, ''> = {};
+
+        if (r.pr === undefined) unset.publicRead = '';
+        else set.publicRead = !!r.pr;
+
+        if (r.pw === undefined) unset.publicWrite = '';
+        else set.publicWrite = !!r.pw;
+
+        // Mongo rejects an empty `$unset`, so it is only included when it has something to say.
+        await this.collection.updateOne(
+            { _id: id },
+            Object.keys(unset).length ? { $set: set, $unset: unset } : { $set: set },
+            { upsert: true }
+        );
+    }
+
+    async restoreObject(r: Record<string, unknown>): Promise<void> {
+        const id = new ObjectId(r.id as string);
+        const containerId = r.containerId ? new ObjectId(r.containerId as string) : null;
+        const { id: _drop, containerId: _drop2, bucketId, md5, ...rest } = r;
+        await this.collection.updateOne(
+            { _id: id },
+            {
+                $set: {
+                    ...rest,
+                    containerId,
+                    // WITHOUT THIS the array comes back refusing to serve its own data: Phase 3 reads bucketId
+                    // to authorise every object request, and treats its absence as an unknown bucket -- never
+                    // as a wildcard. A restore that omitted it would rebuild 3.5 million names into objects
+                    // nobody is allowed to read.
+                    bucketId: bucketId ? new ObjectId(bucketId as string) : null,
+                    // md5 goes back in as BYTES, the way the rest of the system stores it -- the snapshot
+                    // carries it as hex because a text file cannot carry bytes, and this is where it comes
+                    // home.
+                    ...(typeof md5 === 'string' && md5 ? { md5: Buffer.from(md5, 'hex') } : {}),
+                    isFile: true
+                }
+            },
+            { upsert: true }
+        );
+    }
+
+    // Just the ids. The drift scrub compares 3.5 million of them against the platters and needs nothing else
+    // from the document -- projecting the rest would drag hundreds of megabytes through memory for nothing.
+    // Is there anything in here at all? Asked by the restore before it writes a single record: a recovery
+    // restores into an EMPTY database, and if this is not zero then whatever is running is not a recovery.
+    async countObjects(): Promise<number> {
+        // ANY document, not just files. A database holding buckets and folders but no objects yet is still a
+        // database somebody is using, and restoring an old namespace over it is still an accident.
+        return this.collection.countDocuments({}, { limit: 1 });
+    }
+
+    async *streamAllObjectIds(): AsyncGenerator<string> {
+        const cursor = this.collection
+            .find({ isFile: true }, { projection: { _id: 1 }, batchSize: 5000 })
+            .sort({ _id: 1 });
+        for await (const doc of cursor) yield String(doc._id);
+    }
+
+    async listAllContainers(): Promise<Array<{ id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean }>> {
+        // publicRead/publicWrite come along because a bucket's ACCESS POLICY is part of the namespace. Leave
+        // them behind and every restored bucket comes back private -- the safe direction, and still a namespace
+        // that does not match the one we lost, with the restore reporting success either way.
         const docs = await this.collection
-            .find({ isContainer: true }, { projection: { _id: 1, containerId: 1, name: 1 } })
+            .find({ isContainer: true },
+                { projection: { _id: 1, containerId: 1, name: 1, publicRead: 1, publicWrite: 1 } })
             .toArray();
         return docs.map(doc => ({
             id: String(doc._id),
             cid: doc.containerId ? String(doc.containerId) : null,
-            name: doc.name
+            name: doc.name,
+            // Only a top-level container is a bucket, and only a bucket has a policy. Recording `false` on the
+            // other 55,000 folders would be 55,000 lines of noise asserting something that was never true.
+            ...(doc.containerId ? {} : {
+                ...(doc.publicRead === undefined ? {} : { pr: !!doc.publicRead }),
+                ...(doc.publicWrite === undefined ? {} : { pw: !!doc.publicWrite })
+            })
         }));
     }
 

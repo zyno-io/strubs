@@ -13,6 +13,34 @@ import { AdminTokenRepository, type AdminTokenDocument } from './database/admin-
 import { CredentialRepository, type CredentialDocument, type Grant } from './database/credential-repository';
 import type { ContainerPath, ContentDocument, ObjectIdentifier, ObjectVerificationStateUpdate, SliceErrorInfo } from './database/types';
 import type { StorageStatsDelta, StorageStatsSnapshot } from './storage/stats';
+
+// The bracket around a volume-table restore. Present means the table is half-written and must not be
+// believed; absent means it is whole.
+const FLEET_RESTORE_MARKER = 'fleet-restore-in-progress';
+
+// THE NAMESPACE IS NOT BACK YET, AND NOTHING MAY ACT AS THOUGH IT IS.
+//
+// Recovering the FLEET gets the disks mounted. It does not put a single name back -- Mongo is still empty, and
+// the 3.5M objects on the platters are still anonymous. If STRUBS then starts normally on that empty database,
+// the snapshot job wakes up, snapshots the nothing it can see, and MOVES THE MANIFEST POINTER to it. The real
+// snapshot -- the one holding every name on the array -- is still sitting on the platters, and nothing alive
+// knows where. The recovery system would have destroyed the namespace it exists to restore.
+//
+// So the fleet restore raises this, and only a successful namespace restore lowers it.
+const NAMESPACE_RESTORE_MARKER = 'namespace-restore-required';
+
+// A NAMESPACE RESTORE IN FLIGHT.
+//
+// The restore refuses to apply into a database that already holds objects -- which is right, because doing so
+// would overwrite a live namespace with one rebuilt from a snapshot. But it writes CONTAINERS first and objects
+// second, so a crash after the very first container leaves a database that is no longer empty and a restore
+// that will now refuse to finish what it started. The operator is left with a namespace that is 0.001% restored
+// and a tool that will not touch it.
+//
+// So the restore brackets itself, exactly as the fleet restore does: while this marker is up, a non-empty
+// database is not a live array to be protected, it is this restore's own half-finished work, and re-running is
+// not an overwrite -- it is a RESUME.
+const NAMESPACE_RESTORE_IN_FLIGHT = 'namespace-restore-in-flight';
 export type { ContentDocument, ObjectVerificationStateUpdate, SliceErrorInfo, SliceErrorCategory, SliceVerificationTimes } from './database/types';
 export type { CredentialDocument, Grant } from './database/credential-repository';
 export type { FaultDocument, FaultUpsert } from './database/fault-repository';
@@ -238,8 +266,129 @@ export class Database {
         return this.contentRepository.listAllContainers();
     }
 
+    async restoreContainer(r: { id: string; cid: string | null; name: string; bucketId: string | null; pr?: boolean; pw?: boolean }): Promise<void> {
+        return this.contentRepository.restoreContainer(r);
+    }
+
+    async restoreObject(r: Record<string, unknown>): Promise<void> {
+        return this.contentRepository.restoreObject(r);
+    }
+
     streamAllObjects(): AsyncIterable<{ id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number }> {
         return this.contentRepository.streamAllObjects();
+    }
+
+    streamAllObjectIds(): AsyncIterable<string> {
+        return this.contentRepository.streamAllObjectIds();
+    }
+
+    async countObjects(): Promise<number> {
+        return this.contentRepository.countObjects();
+    }
+
+    async pruneOutsideNamespace(keep: Set<string>): Promise<number> {
+        return this.contentRepository.pruneOutsideNamespace(keep);
+    }
+
+    // Write the volume table back, from a bootstrap manifest, on a bare host. Upserted by id so an
+    // interrupted recovery can simply be run again -- which is a property you want from the one tool whose
+    // entire job is to work when everything else has failed.
+    //
+    // A HALF-WRITTEN VOLUME TABLE IS WORSE THAN NO VOLUME TABLE, and this writes 30 documents one at a time.
+    // Die after 11 of them and Mongo now holds a table that is perfectly well-formed, internally consistent,
+    // and describes an array a third the size of the real one. Start STRUBS on it and the missing 19 disks are
+    // not "unmounted" -- they are UNKNOWN, so nothing refuses on their behalf, the platter scans never look at
+    // them, and every object living on them reads as data loss. The array would report catastrophe while
+    // sitting on 90TB of intact slices.
+    //
+    // So the table is bracketed: say we are writing it, write it, then say it is whole. Anything that finds
+    // the marker still set knows the table cannot be trusted -- and, crucially, knows to say so rather than to
+    // quietly believe a fleet with holes in it.
+    // RAISE THE FLAG BEFORE THE FIRST THING IS TOUCHED, not before the second.
+    //
+    // A fleet restore adopts the instance identity and THEN writes the volume table, and the marker used to go
+    // up between those two. Die in that window and the next boot finds an identity, no marker, and an empty or
+    // stale volume table -- and sails straight past both recovery-mode guards, because one only checks for a
+    // missing identity and the other only checks for a marker. The fleet comes up believing in whatever disks
+    // Mongo happens to list, which after a wiped database is none of them.
+    //
+    // The bracket has to enclose EVERY mutation the restore makes, so it goes up first, before the identity.
+    async beginFleetRestore(expected: number): Promise<void> {
+        await this.setRuntimeConfig(FLEET_RESTORE_MARKER, {
+            state: 'in-progress',
+            expected,
+            startedAt: new Date().toISOString()
+        });
+
+        // The fleet is being rebuilt from the disks, which means Mongo is not the array's index any more --
+        // it is an empty file. The namespace has to be restored before anything is allowed to believe it.
+        await this.setRuntimeConfig(NAMESPACE_RESTORE_MARKER, { since: new Date().toISOString() });
+    }
+
+    async namespaceRestoreRequired(): Promise<{ since: string } | null> {
+        const m = await this.getRuntimeConfig(NAMESPACE_RESTORE_MARKER) as { since?: string } | null;
+        return m ? { since: m.since ?? 'unknown' } : null;
+    }
+
+    async clearNamespaceRestoreRequired(): Promise<void> {
+        await this.deleteRuntimeConfig(NAMESPACE_RESTORE_MARKER);
+    }
+
+    async beginNamespaceRestore(): Promise<void> {
+        await this.setRuntimeConfig(NAMESPACE_RESTORE_IN_FLIGHT, { startedAt: new Date().toISOString() });
+    }
+
+    async namespaceRestoreInFlight(): Promise<{ startedAt: string } | null> {
+        const m = await this.getRuntimeConfig(NAMESPACE_RESTORE_IN_FLIGHT) as { startedAt?: string } | null;
+        return m ? { startedAt: m.startedAt ?? 'unknown' } : null;
+    }
+
+    async endNamespaceRestore(): Promise<void> {
+        await this.deleteRuntimeConfig(NAMESPACE_RESTORE_IN_FLIGHT);
+    }
+
+    async restoreVolumes(configs: Array<Record<string, unknown>>): Promise<void> {
+        // Idempotent: the marker is normally already up (beginFleetRestore, before the identity was adopted).
+        // Setting it again costs nothing and means this is still safe if it is ever called on its own.
+        await this.beginFleetRestore(configs.length);
+
+        for (const config of configs)
+            await this.volumesCollection.updateOne({ id: config.id }, { $set: config }, { upsert: true });
+
+        // CHECK THE IDS, NOT THE COUNT.
+        //
+        // Counting documents was the obvious thing and it is wrong, because it cannot tell one volume from
+        // another. A dirty or forced recovery can leave STALE volume documents behind -- disks from a previous
+        // life of this database -- and thirty stale rows will happily satisfy a check for "at least thirty
+        // rows" while the volume we actually needed is missing from all of them. The marker comes down, the
+        // fleet starts on a hybrid table, and the disk nobody wrote is invisible: every object living only on
+        // it reads as data loss.
+        //
+        // So ask the only question that means anything: is every volume we were told to write ACTUALLY THERE,
+        // by id?
+        const expected = configs.map(cfg => Number(cfg.id));
+        const present = new Set((await this.volumesCollection
+            .find({ id: { $in: expected } }, { projection: { id: 1 } })
+            .toArray()).map(d => Number(d.id)));
+
+        const absent = expected.filter(id => !present.has(id));
+        if (absent.length)
+            throw new Error(`the volume table is incomplete: volume(s) ${absent.join(', ')} were not written `
+                + `(${present.size} of ${expected.length} landed). Leaving the incomplete-restore marker in place: a `
+                + `partial fleet must never be treated as the whole array, because every object living only on the `
+                + `disks missing from it would read as data loss.`);
+
+        await this.deleteRuntimeConfig(FLEET_RESTORE_MARKER);
+    }
+
+    // Is the volume table known to be half-written? Called before the fleet is allowed to come up, and before
+    // any recovery is allowed to draw a conclusion about what is or is not on the platters.
+    async fleetRestoreIncomplete(): Promise<{ expected: number; startedAt: string } | null> {
+        const marker = await this.getRuntimeConfig(FLEET_RESTORE_MARKER) as
+            { state?: string; expected?: number; startedAt?: string } | null;
+
+        if (!marker || marker.state !== 'in-progress') return null;
+        return { expected: marker.expected ?? 0, startedAt: marker.startedAt ?? 'unknown' };
     }
 
 

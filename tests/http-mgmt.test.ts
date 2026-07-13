@@ -1420,3 +1420,53 @@ describe('HttpMgmt.handle', () => {
             expect(databaseBucketAuthMock.setRuntimeConfig).toHaveBeenCalledWith('authEnforced', true);
         });
     });
+
+// THE GUARD WRITTEN TO PREVENT A LOCKOUT WAS THE LOCKOUT.
+//
+// The namespace-recovery allowlist decides what an operator may still call while the array is sitting in
+// recovery mode with an empty database. The first version of it was written FROM MEMORY, and it got the auth
+// routes wrong -- it allowed `/$/login` and `/$/password`, which do not exist in this codebase. The real ones
+// (`POST /$/session`, `PUT /$/admin/password`) were therefore REFUSED, so nobody could log in, so nobody could
+// reach `POST /$/restore`, which is the only way out of that mode. The array would have been bricked by the
+// very code written to keep it recoverable.
+//
+// So the allowlist is checked against the REAL route table. An entry that matches no actual route is not a
+// harmless typo here -- it is a door that is supposed to be open and is not.
+describe('mgmt: the namespace-recovery allowlist is real', () => {
+    it('every allowlisted route ACTUALLY EXISTS in the route table', async () => {
+        const { HttpMgmt } = await import('../lib/server/http/mgmt');
+
+        for (const entry of HttpMgmt.NAMESPACE_RECOVERY_ALLOWLIST) {
+            const url = entry.path === '/$/ui' ? '/$/ui/' : entry.path;
+            const route = HttpMgmt.findRoute(entry.method, url);
+            expect(route, `allowlisted route ${entry.method} ${entry.path} does not exist`).not.toBeNull();
+        }
+    });
+
+    it('allows the way OUT, and refuses the two routes that would destroy the namespace', async () => {
+        const { HttpMgmt } = await import('../lib/server/http/mgmt');
+        const allowed = (m: string, u: string) =>
+            HttpMgmt.NAMESPACE_RECOVERY_ALLOWLIST.some(a =>
+                a.method === m && (a.path === '/$/ui' ? u.startsWith('/$/ui') : u === a.path));
+
+        // The only way out, and the auth needed to get to it.
+        expect(allowed('POST', '/$/restore')).toBe(true);
+        expect(allowed('POST', '/$/recover-fleet')).toBe(true);
+        expect(allowed('POST', '/$/session')).toBe(true);           // log in
+        expect(allowed('GET', '/$/auth/status')).toBe(true);
+
+        // POST /$/snapshot would snapshot the EMPTY namespace and publish the pointer to every disk -- the
+        // exact catastrophe this mode exists to prevent.
+        expect(allowed('POST', '/$/snapshot')).toBe(false);
+
+        // DELETE a volume asks Mongo how many objects are on it. On an empty database, the answer for a live,
+        // full 3TB platter is zero -- and then every future recovery skips that disk.
+        expect(allowed('DELETE', '/$/volumes/1')).toBe(false);
+
+        // An allowlist, not a blocklist: anything not named is refused, so a route added next year is safe by
+        // default rather than dangerous by default.
+        expect(allowed('POST', '/$/rebalance')).toBe(false);
+        expect(allowed('PUT', '/$/maintenance-freeze')).toBe(false);
+    });
+});
+

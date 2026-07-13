@@ -11,6 +11,9 @@ import { adminAuth, parseCookies, sessionSetCookie, sessionClearCookie, SESSION_
 import { ioManager } from '../../io/manager';
 import { journal } from '../../io/journal';
 import { snapshotJob } from '../../jobs/snapshot-job';
+import { namespaceRestore, type RestoreSummary } from '../../recovery/restore';
+import { driftScrubJob, type DriftReport } from '../../jobs/drift-scrub-job';
+import { findManifestsOnDevices, recoverFleetFromDisks, type FleetRecoverySummary } from '../../recovery/bootstrap';
 import { bootstrapManifestWriter, type ManifestSnapshotRef } from '../../io/bootstrap-manifest';
 import { deviceProvisioner } from '../../io/device-provisioner';
 import type { CachedDevice } from '../../io/device-discovery';
@@ -142,6 +145,67 @@ const BUCKET_STATS_TTL_MS = 60_000;
 export class HttpMgmt {
     private static readonly routes: RouteDefinition[] = HttpMgmt.createRoutes();
 
+    // WHILE THE NAMESPACE IS MISSING, ALMOST NOTHING HERE IS SAFE TO CALL.
+    //
+    // Recovery mode brings the FLEET up -- it must, because reading the snapshot off the platters is the whole
+    // point -- and that leaves the admin API sitting there, fully armed, in front of a MongoDB that is empty
+    // and that the array has explicitly declared non-authoritative. Two of these routes are loaded guns:
+    //
+    //   POST /$/snapshot   -- snapshots whatever Mongo currently holds (nothing), stores it, and PUBLISHES THE
+    //                         POINTER to every disk. That is the exact catastrophe the marker exists to
+    //                         prevent, reachable by hand, from the surface we deliberately left up.
+    //
+    //   DELETE /$/volumes  -- refuses to delete a volume that still holds objects, and asks Mongo how many. On
+    //                         an empty database the answer for a live, full 3TB platter is ZERO. The volume is
+    //                         marked deleted, the manifests are refreshed to say so, and every future recovery
+    //                         SKIPS that disk. A disk full of the only copies of somebody's data, dropped
+    //                         because the database we already know is empty said it was empty.
+    //
+    // So this is an ALLOWLIST, not a blocklist. Anything not named here is refused while the namespace is
+    // missing -- which means a route added next year is safe by default rather than dangerous by default, and
+    // that is the only way this stays true.
+    // THESE PATHS ARE CHECKED AGAINST THE REAL ROUTE TABLE BY A TEST, and that test exists because the first
+    // version of this list was WRITTEN FROM MEMORY and got the auth routes wrong -- it allowed `/$/login` and
+    // `/$/password`, which do not exist. The real ones (`POST /$/session`, `PUT /$/admin/password`) were
+    // therefore refused, so an operator could not log in, so they could not reach POST /$/restore, so the array
+    // could not be recovered. The guard written to prevent a lockout WAS the lockout.
+    //
+    // If you add an entry here, it must match a route that actually exists. The test will tell you.
+    static readonly NAMESPACE_RECOVERY_ALLOWLIST: Array<{ method: string; path: string }> = [
+        // THE WAY OUT. Without these the array is bricked, and nothing else on this list matters.
+        { method: 'POST', path: '/$/restore' },
+        { method: 'POST', path: '/$/recover-fleet' },
+
+        // ENOUGH AUTH TO GET IN AND USE THEM. An operator who cannot log in cannot restore.
+        { method: 'GET', path: '/$/auth/status' },
+        { method: 'POST', path: '/$/session' },              // log in
+        { method: 'DELETE', path: '/$/session' },            // log out
+        { method: 'PUT', path: '/$/admin/password' },        // first-boot password set
+        { method: 'GET', path: '/$/auth/settings' },         // the SPA reads this before it renders a login
+
+        // LOOKING IS NOT TOUCHING.
+        { method: 'GET', path: '/$/status' },
+        { method: 'GET', path: '/$/volumes' },
+        { method: 'GET', path: '/$/snapshot' },              // READS the pointer. POST publishes one -- refused.
+        { method: 'GET', path: '/$/debug' },
+        { method: 'GET', path: '/$/blockDevices' },
+        { method: 'GET', path: '/$/faults' },
+        { method: 'GET', path: '/$/ui' }                     // prefix-matched below; the SPA itself
+    ];
+
+    private static allowedDuringNamespaceRecovery(method: string, url: string): boolean {
+        return this.NAMESPACE_RECOVERY_ALLOWLIST.some(a =>
+            a.method === method && (a.path === '/$/ui' ? url.startsWith('/$/ui') : url === a.path));
+    }
+
+    private static namespaceMissing = false;
+
+    // Set by core.ts before the admin surface comes up, and never cleared in-process: a restore that succeeds
+    // is followed by a restart into normal mode.
+    static setNamespaceMissing(missing: boolean): void {
+        this.namespaceMissing = missing;
+    }
+
     static async handle(_requestId: number, req: HttpRequest, res: HttpResponse): Promise<unknown> {
         const method = req.method?.toUpperCase();
         const url = req.url;
@@ -151,6 +215,12 @@ export class HttpMgmt {
         const route = this.findRoute(method, url);
         if (!route)
             throw new HttpNotFoundError();
+
+        if (this.namespaceMissing && !this.allowedDuringNamespaceRecovery(method, url))
+            throw new HttpBadRequestError(`${method} ${url} is refused while the namespace has not been restored. `
+                + `MongoDB is empty and the array has declared it non-authoritative, so anything that reads it to `
+                + `make a decision -- how many objects are on a volume, what to put in a snapshot -- would be `
+                + `acting on the belief that this array is empty. Restore the namespace first (POST /$/restore).`);
 
         // res is passed through so the few handlers that manage cookies (login/logout) can reach it;
         // the vast majority ignore it.
@@ -478,8 +548,33 @@ export class HttpMgmt {
         }
         if (policy.publicRead === undefined && policy.publicWrite === undefined)
             throw new HttpBadRequestError('publicRead and/or publicWrite is required');
+
+        // THE JOURNAL FIRST, then Mongo -- the same order as every other namespace change, and for the same
+        // reason. The snapshot froze this bucket's policy at snapshot time; if a policy change is not recorded
+        // anywhere else, a recovery restores the OLD one. Closing a bucket and then losing the database would
+        // re-open it. Journaling first means the worst case is a policy recorded but not applied, which the
+        // next write or a restore simply re-applies -- rather than one applied but never recorded, which a
+        // restore silently rolls back.
+        await journal.append({
+            op: 'policy',
+            ts: new Date().toISOString(),
+            id: String(params.id),
+            ...(policy.publicRead === undefined ? {} : { pr: policy.publicRead }),
+            ...(policy.publicWrite === undefined ? {} : { pw: policy.publicWrite })
+        });
+
         const updated = await database.setBucketPolicy(params.id, policy);
         if (!updated) throw new HttpNotFoundError('bucket not found');
+
+        // AND IF MONGO HAD FAILED? The journal would then hold a policy record for a change the caller was told
+        // did not happen -- and there is NO compensating record that can honestly undo it, because a `policy` has
+        // no physical evidence for a replay to check it against, and a compensating record could fail in exactly
+        // the same way.
+        //
+        // That is why the restore refuses to let a journalled policy OPEN a bucket (see restore.ts). It closes
+        // the hole from the other end: whatever fails, and however it fails, the worst a stale or escaped policy
+        // record can do is leave a bucket MORE closed than it should be. An operator sees that in a moment --
+        // things stop being publicly readable -- and fixes it with one call. Nothing leaks, ever.
         return { updated };
     }
 
@@ -892,6 +987,81 @@ export class HttpMgmt {
         }
     }
 
+    // STEP ONE OF THE WORST DAY: ask the disks who they are.
+    //
+    // This is the only thing that works on a bare host, because it is the only thing that does not need the
+    // fleet -- and the fleet cannot mount without the volume table, which lived in the database that is gone.
+    // It reads every disk read-only, works out which array this is by MAJORITY (a single disk from somebody
+    // else's array must not be allowed to become us), adopts that identity -- never generates one -- and
+    // writes the volume table back.
+    //
+    // Then STRUBS is restarted, the fleet comes up, and /$/restore can rebuild the namespace. Two steps, and
+    // deliberately so: mounting thirty drives on a host that has just decided who it is deserves a look
+    // before the next thing starts writing to them.
+    private static async handleRecoverFleetRequest(req: HttpRequest): Promise<FleetRecoverySummary> {
+        const body = await this.parseJsonBody<{ force?: boolean }>(req).catch(() => ({} as { force?: boolean }));
+
+        try {
+            return await recoverFleetFromDisks({
+                findManifests: () => findManifestsOnDevices(),
+                adoptIdentity: (identity: string) => config.adoptIdentity(identity),
+                existingVolumes: () => database.getVolumes(),
+                writeVolumes: (configs) => database.restoreVolumes(configs as never),
+                restoreInterrupted: () => database.fleetRestoreIncomplete(),
+                beginRestore: (expected: number) => database.beginFleetRestore(expected)
+            }, { force: body?.force === true });
+        }
+        catch (err) {
+            throw new HttpBadRequestError(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    // REBUILD THE NAMESPACE FROM THE PLATTERS.
+    //
+    // Defaults to a DRY RUN, and that default is the point. This is the operation you reach for on the worst
+    // day you will ever have with this array, and the first thing you want from it is not action -- it is an
+    // honest account of what is actually still there. So it tells you, and changes nothing, until you say
+    // otherwise.
+    private static async handleRestoreRequest(req: HttpRequest): Promise<RestoreSummary & { applied: boolean }> {
+        const body = await this.parseJsonBody<{ apply?: boolean; force?: boolean }>(req)
+            .catch(() => ({} as { apply?: boolean; force?: boolean }));
+        const apply = body?.apply === true;
+
+        try {
+            // A NULL SNAPSHOT POINTER MEANS ONE OF TWO VERY DIFFERENT THINGS, and the restore is about to tell
+            // an operator their namespace is gone. Make sure that is actually what happened.
+            if (!bootstrapManifestWriter.getSnapshot() && bootstrapManifestWriter.hydrationWasIncomplete())
+                throw new HttpBadRequestError('this host could not read the bootstrap manifest off some of its '
+                    + 'disks, and found no snapshot pointer on the ones it could read. That is NOT the same as '
+                    + 'there being no snapshot -- the pointer may be sitting on a disk that would not answer. '
+                    + 'Refusing to tell you your namespace is gone on the strength of a disk that is not talking. '
+                    + 'Fix the disks and restart.');
+
+            // ...and hand it the PREVIOUS snapshot too. We keep one for exactly this moment: if the newest
+            // snapshot object turns out to be below quorum, an intact older copy of every name is right there
+            // on the platters, named in the manifest we have already read. A namespace a few hours stale, with
+            // the journal replayed on top, is not a hard trade against "everything is gone".
+            const summary = await namespaceRestore.run(bootstrapManifestWriter.getSnapshot(),
+                { apply, force: body?.force === true, previous: bootstrapManifestWriter.getPreviousSnapshot() });
+            return { ...summary, applied: apply };
+        }
+        catch (err) {
+            throw new HttpBadRequestError(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    // What the database says, against what is actually on the platters. Read-only: it finds drift, it does
+    // not repair it -- deciding what to do about an orphan or a phantom is not a decision to make behind an
+    // operator's back.
+    private static async handleDriftScrubRequest(): Promise<DriftReport> {
+        try {
+            return await driftScrubJob.run();
+        }
+        catch (err) {
+            throw new HttpBadRequestError(err instanceof Error ? err.message : String(err));
+        }
+    }
+
     private static handleSnapshotStatusRequest(): { running: boolean; current: ManifestSnapshotRef | null } {
         return {
             running: snapshotJob.isRunning(),
@@ -1227,7 +1397,7 @@ export class HttpMgmt {
         return result;
     }
 
-    private static findRoute(method: string, url: string): RouteMatch | null {
+    static findRoute(method: string, url: string): RouteMatch | null {
         for (const route of this.routes) {
             if (route.method !== method)
                 continue;
@@ -1319,6 +1489,21 @@ export class HttpMgmt {
                 method: 'POST',
                 match: url => url === '/$/snapshot' ? {} : null,
                 handler: async () => this.handleSnapshotRequest()
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/recover-fleet' ? {} : null,
+                handler: async req => this.handleRecoverFleetRequest(req)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/restore' ? {} : null,
+                handler: async req => this.handleRestoreRequest(req)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/drift' ? {} : null,
+                handler: async () => this.handleDriftScrubRequest()
             },
             {
                 method: 'GET',
