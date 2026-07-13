@@ -16,6 +16,28 @@ import type { ContentDocument, ContainerPath, ObjectIdentifier, ObjectVerificati
 
 const log = createLogger('content-repository');
 
+// Mongo hands md5 back as a Binary (or, depending on the driver path, a Buffer). Either way it is BYTES,
+// and the only safe way to put bytes in a text record is to encode them.
+const toHex = (value: unknown): string | null => {
+    if (!value) return null;
+
+    // BUFFER FIRST, and the order matters more than it looks. A Node Buffer HAS a `.buffer` property -- the
+    // ArrayBuffer underneath it -- so reaching for `.buffer` before asking whether this IS a Buffer hands you
+    // an ArrayBuffer, fails the isBuffer check on that, and falls through to String(). Which decodes the
+    // bytes as text, which is the exact bug that split an md5 across two lines in the first place.
+    if (Buffer.isBuffer(value)) return value.toString('hex');
+
+    // Mongo's Binary wrapper, whose `.buffer` genuinely is a Buffer.
+    const inner = (value as { buffer?: unknown }).buffer;
+    if (Buffer.isBuffer(inner)) return inner.toString('hex');
+
+    // Anything else: only a plain string is acceptable. Never String()-coerce an unknown -- that is how
+    // bytes get in.
+    if (typeof value === 'string') return value;
+    throw new Error(`md5 is neither a Buffer, a Mongo Binary, nor a string (got ${typeof value}): refusing to `
+        + `guess at how to encode it into a snapshot`);
+};
+
 type NormalizeFn = <T extends ContentDocument>(object: T) => T & { id: string; containerId?: string | null };
 type MongoIdFn = (id: ObjectIdentifier) => ObjectId | null;
 
@@ -958,6 +980,67 @@ export class ContentRepository {
         if (!mongoId) return null;
         const doc = await this.collection.findOne({ _id: mongoId, containerId: null, isContainer: true });
         return doc ? this.normalize(doc) : null;
+    }
+
+    // EVERY container, for the namespace snapshot. Tens of thousands, not millions -- they have to be
+    // sorted parent-first before they can be written, and you cannot sort a stream you have not seen the
+    // end of. The objects, which ARE millions, are streamed instead (below).
+    async listAllContainers(): Promise<Array<{ id: string; cid: string | null; name: string }>> {
+        const docs = await this.collection
+            .find({ isContainer: true }, { projection: { _id: 1, containerId: 1, name: 1 } })
+            .toArray();
+        return docs.map(doc => ({
+            id: String(doc._id),
+            cid: doc.containerId ? String(doc.containerId) : null,
+            name: doc.name
+        }));
+    }
+
+    // EVERY object, streamed. There are 3.5 million of them: this is a cursor, and it must stay one. The
+    // batch size is a compromise between round trips and how much of the namespace sits in memory at once.
+    async *streamAllObjects(): AsyncGenerator<{ id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number }> {
+        const cursor = this.collection
+            .find({ isFile: true }, {
+                projection: { _id: 1, containerId: 1, name: 1, mime: 1, md5: 1, size: 1, chunkSize: 1 },
+                batchSize: 2000
+            })
+            .sort({ _id: 1 });
+
+        for await (const doc of cursor) {
+            // FAIL CLOSED on the geometry. `mime` defaulting to null costs a content type; `size` or
+            // `chunkSize` defaulting to zero produces a record that LOOKS fine, counts fine and hashes fine,
+            // and is simply unusable when someone finally tries to restore from it -- an object the snapshot
+            // swears exists and cannot describe. Better to refuse to take the snapshot at all than to take
+            // one that is quietly missing the only fields that make an object an object.
+            // FINITE and SANE, not merely "a number". NaN and Infinity are numbers, and JSON.stringify turns
+            // both of them into `null` -- so a record carrying them would sail through every count and every
+            // checksum and arrive at the restore describing an object of no particular size. A chunkSize of
+            // zero is worse: it is a perfectly plausible-looking integer that makes the geometry undivisible.
+            const sizeOk = Number.isFinite(doc.size) && (doc.size as number) >= 0;
+            const chunkOk = Number.isInteger(doc.chunkSize) && (doc.chunkSize as number) > 0;
+            if (!sizeOk || !chunkOk)
+                throw new Error(`object ${String(doc._id)} has no usable geometry (size=${doc.size}, `
+                    + `chunkSize=${doc.chunkSize}): refusing to write it into a snapshot that could not restore it`);
+
+            yield {
+                id: String(doc._id),
+                cid: doc.containerId ? String(doc.containerId) : null,
+                name: doc.name,
+                // `mime`, and it is worth saying why that is spelled out rather than guessed: projecting
+                // the wrong field name here does not fail, it just quietly writes null for every object in
+                // the array, and a snapshot that has silently dropped every content type still passes every
+                // count and checksum it has. It is only wrong on the day you restore from it.
+                mime: (doc as { mime?: string | null }).mime ?? null,
+                // HEX, never String(). md5 is stored as BINARY, and coercing a Buffer to a string decodes
+                // its bytes as text -- which is fine right up until one of them happens to be a line
+                // separator, at which point a single object's checksum silently splits its own NDJSON record
+                // in two and the whole snapshot loses its framing from there on. (Not hypothetical: an md5
+                // beginning f3c1e9 e280a8 did exactly this. e2 80 a8 is U+2028.)
+                md5: toHex(doc.md5),
+                size: doc.size as number,
+                cs: doc.chunkSize as number
+            };
+        }
     }
 
     async listBuckets(): Promise<ContentDocument[]> {

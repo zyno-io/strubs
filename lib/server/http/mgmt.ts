@@ -10,6 +10,8 @@ import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError, HttpTooM
 import { adminAuth, parseCookies, sessionSetCookie, sessionClearCookie, SESSION_COOKIE } from './admin-auth';
 import { ioManager } from '../../io/manager';
 import { journal } from '../../io/journal';
+import { snapshotJob } from '../../jobs/snapshot-job';
+import { bootstrapManifestWriter, type ManifestSnapshotRef } from '../../io/bootstrap-manifest';
 import { deviceProvisioner } from '../../io/device-provisioner';
 import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
@@ -873,6 +875,30 @@ export class HttpMgmt {
         };
     }
 
+    // Take a snapshot NOW. Awaited, not fired and forgotten: an operator asking for one before pulling a
+    // disk wants to know it WORKED, and the whole point of the job is that it verifies itself.
+    private static async handleSnapshotRequest(): Promise<{ objectId: string; objects: number; containers: number; bytes: number }> {
+        try {
+            const result = await snapshotJob.run();
+            return {
+                objectId: result.objectId,
+                objects: result.objects,
+                containers: result.containers,
+                bytes: result.bytes
+            };
+        }
+        catch (err) {
+            throw new HttpBadRequestError(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    private static handleSnapshotStatusRequest(): { running: boolean; current: ManifestSnapshotRef | null } {
+        return {
+            running: snapshotJob.isRunning(),
+            current: bootstrapManifestWriter.getSnapshot()
+        };
+    }
+
     private static async handleVolumeDeleteRequest(params: RouteParams): Promise<{ deleted: boolean }> {
         const id = this.parseVolumeId(params);
         await this.assertVolumeRemovable(id);
@@ -1288,6 +1314,16 @@ export class HttpMgmt {
                 method: 'DELETE',
                 match: url => this.matchVolumeIdentifyRoute(url),
                 handler: async (_req, params) => this.handleVolumeIdentifyStopRequest(params)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/snapshot' ? {} : null,
+                handler: async () => this.handleSnapshotRequest()
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/snapshot' ? {} : null,
+                handler: async () => this.handleSnapshotStatusRequest()
             },
             {
                 method: 'POST',

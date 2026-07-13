@@ -16,6 +16,7 @@ import { volumeHealthMonitor } from './io/volume-health-monitor';
 import { deviceReconciler } from './io/device-reconciler';
 import { bootstrapManifestWriter } from './io/bootstrap-manifest';
 import { journal } from './io/journal';
+import { snapshotJob } from './jobs/snapshot-job';
 import { configureNotifications } from './notify/bootstrap';
 import { remediationService } from './remediation/service';
 import { repairWorker } from './remediation/repair-worker';
@@ -87,6 +88,13 @@ export class Core {
             // journal is running is a namespace change nobody recorded.
             await journal.start();
             bootstrapManifestWriter.setJournalVolumeIds(journal.replicaVolumeIds);
+            // Read the snapshot pointer back off the disks BEFORE anything writes a manifest. The pointer
+            // lives in memory, and the periodic refresh writes memory out to every volume -- so a process
+            // that came up not knowing about the snapshot would erase it from all 29 of them within the
+            // minute, leaving 127MB of erasure-coded namespace on the platters that nothing knows the name
+            // of.
+            await bootstrapManifestWriter.hydrateFromDisk().catch(err =>
+                log.error('could not read the snapshot pointer back off the platters: %s', err));
             // The fleet is up: refresh the bootstrap manifest on every writable volume. Fire-and-forget --
             // a manifest write must never delay or fail startup -- plus a periodic backstop so a manifest
             // can never silently stop refreshing (which you'd only discover during a recovery).
@@ -128,6 +136,11 @@ export class Core {
                 await rebalanceJob.resumePendingJob();
             }
             volumeHealthMonitor.start(config.volumeHealthIntervalMs, config.volumeFaultThreshold);
+            // The journal records what changes from now on. The SNAPSHOT is what puts the names of
+            // everything that is ALREADY here onto the platters -- without it, DR-C protects the last
+            // few hundred writes and nothing else.
+            if (config.snapshotEnabled && !frozen)
+                snapshotJob.start(config.snapshotIntervalMs);
             deviceReconciler.start(config.deviceReconcileIntervalMs, { udev: config.deviceReconcileUdev });
             storageStatsTracker.start({
                 reconcileIntervalMs: config.storageStatsIntervalMs,
@@ -180,6 +193,7 @@ export class Core {
 
             verifyScheduler.stop();
             systemLogWatcher.stop();
+            snapshotJob.stop();
             repairWorker.stop();
             bootstrapManifestWriter.stopPeriodic();
             volumeHealthMonitor.stop();

@@ -24,12 +24,16 @@ vi.mock('../lib/config', () => ({
 const manifestWriteMock = vi.fn().mockResolvedValue(undefined);
 const manifestStartPeriodicMock = vi.fn();
 const manifestSetJournalIdsMock = vi.fn();
+const manifestHydrateMock = vi.fn().mockResolvedValue(undefined);
 vi.mock('../lib/io/bootstrap-manifest', () => ({
     bootstrapManifestWriter: {
         write: manifestWriteMock,
         startPeriodic: manifestStartPeriodicMock,
         stopPeriodic: vi.fn(),
         setJournalVolumeIds: manifestSetJournalIdsMock,
+        // Read the snapshot pointer back off the platters at startup. Without it, the periodic refresh
+        // would overwrite every manifest in the array with `snapshot: null` and orphan the snapshot.
+        hydrateFromDisk: manifestHydrateMock,
     },
 }));
 
@@ -153,6 +157,7 @@ describe('Core', () => {
         manifestWriteMock.mockClear();
         manifestStartPeriodicMock.mockClear();
         manifestSetJournalIdsMock.mockClear();
+        manifestHydrateMock.mockClear();
         journalStartMock.mockClear();
         journalStopMock.mockClear();
         journalFlushMock.mockClear();

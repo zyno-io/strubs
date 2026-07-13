@@ -234,6 +234,15 @@ export class Database {
         return this.contentRepository.listBuckets();
     }
 
+    async listAllContainers(): Promise<Array<{ id: string; cid: string | null; name: string }>> {
+        return this.contentRepository.listAllContainers();
+    }
+
+    streamAllObjects(): AsyncIterable<{ id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number }> {
+        return this.contentRepository.streamAllObjects();
+    }
+
+
     async listContainerEntries(containerId: ObjectIdentifier, opts?: { limit?: number; after?: string }): Promise<{ entries: ContentDocument[]; hasMore: boolean }> {
         return this.contentRepository.listContainerEntries(containerId, opts);
     }

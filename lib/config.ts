@@ -122,6 +122,15 @@ export class Config {
     journalMaxBatch: number;
     journalSegmentBytes: number;
 
+    // The namespace SNAPSHOT: a full dump of every container and object, gzipped, stored as a STRUBS object
+    // and pointed at by every volume's bootstrap manifest. The journal records changes from the moment it
+    // started; the snapshot is what puts the names of everything that was ALREADY here onto the platters.
+    snapshotEnabled: boolean;
+    snapshotIntervalMs: number;
+    // Where snapshots are filed as objects. Cosmetic -- a recovery finds them by object id from the manifest
+    // and never needs the path -- but an operator looking at the array should be able to see them.
+    snapshotPath: string;
+
     // Backstop re-write of the per-volume bootstrap manifest. Event hooks cover fleet changes; this
     // catches anything they miss, because a manifest that quietly stopped refreshing is a problem you
     // only find out about during a recovery. 0 disables.
@@ -199,6 +208,12 @@ export class Config {
         this.journalMaxBatch = process.env.STRUBS_JOURNAL_MAX_BATCH
             ? parseInt(process.env.STRUBS_JOURNAL_MAX_BATCH, 10)
             : 256;
+        this.snapshotEnabled = process.env.STRUBS_SNAPSHOT_ENABLED !== 'false';
+        this.snapshotIntervalMs = process.env.STRUBS_SNAPSHOT_INTERVAL_MS
+            ? parseInt(process.env.STRUBS_SNAPSHOT_INTERVAL_MS, 10)
+            : 24 * 60 * 60 * 1000;
+        this.snapshotPath = process.env.STRUBS_SNAPSHOT_PATH || '/$snapshots';
+
         this.journalSegmentBytes = process.env.STRUBS_JOURNAL_SEGMENT_BYTES
             ? parseInt(process.env.STRUBS_JOURNAL_SEGMENT_BYTES, 10)
             : 64 * 1024 * 1024;
