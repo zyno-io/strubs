@@ -1,3 +1,5 @@
+import { promises as fsp } from 'fs';
+
 import { spawnHelper } from '../helpers/spawn';
 import { createLogger } from '../log';
 import { ioManager } from './manager';
@@ -117,7 +119,9 @@ export class SystemLogWatcher {
         ]);
         return [
             ...SystemLogWatcher.parseSmartdPending(smartd),
-            ...SystemLogWatcher.parseKernelErrors(kernel)
+            ...SystemLogWatcher.parseKernelErrors(kernel),
+            ...SystemLogWatcher.parseExt4Errors(kernel),
+            ...SystemLogWatcher.parseJbd2Errors(kernel)
         ];
     }
 
@@ -138,10 +142,20 @@ export class SystemLogWatcher {
     }
 
     private async handleSignal(signal: DeviceSignal): Promise<void> {
-        const volume = this.resolveVolume(signal.device);
+        const volume = await this.resolveVolume(signal.device);
         if (!volume) {
-            // Not a managed volume (yet) — don't arm anything, so we still react if it becomes one later.
-            this.log('ignoring %s on %s (not a managed volume)', signal.kind, signal.device);
+            // A DEVICE WE CANNOT PLACE IS NOT A DEVICE WITH NOTHING WRONG WITH IT.
+            //
+            // Most of the time this really is a disk we do not manage, and saying so quietly is right. But a
+            // kernel filesystem error we could not attribute to a volume is the array losing its ability to
+            // notice a disk dying -- so a name we do not RECOGNISE is said loudly, once, rather than filed
+            // under "not ours" with everything else.
+            if (/^dm-\d+$/.test(signal.device))
+                this.log.error('a kernel error on %s could not be traced back to any volume. Under LUKS the '
+                    + 'filesystem sits on a device-mapper node, and if this cannot be resolved the array will '
+                    + 'stop noticing that an encrypted disk is failing.', signal.device);
+            else
+                this.log('ignoring %s on %s (not a managed volume)', signal.kind, signal.device);
             return;
         }
         const volumeId = volume.id;
@@ -195,14 +209,104 @@ export class SystemLogWatcher {
     // comes up through the filesystem ("Buffer I/O error on dev sdf1"). volume.deviceName is the disk,
     // so a partition-scoped signal has to be mapped back to its parent disk -- otherwise it is dropped
     // as "not a managed volume", which silently killed the kernel-error half of this watcher.
-    private resolveVolume(device: string): Volume | null {
+    private async resolveVolume(device: string): Promise<Volume | null> {
         const exact = this.deps.ioManager.getVolumeByDeviceName(device);
         if (exact)
             return exact;
+
+        // UNDER LUKS, THE KERNEL DOES NOT NAME YOUR DISK. IT NAMES THE MAPPER.
+        //
+        // An encrypted volume's ext4 lives on a device-mapper node, so its filesystem errors arrive as
+        // `EXT4-fs (dm-3): ...` -- and "dm-3" matches nothing in the fleet, matches nothing in
+        // parentDiskName(), and was therefore dropped as "not a managed volume". Every kernel filesystem error
+        // on every encrypted disk in the rack, silently discarded. The array would stop noticing that an
+        // encrypted disk was dying, which is precisely the thing it is there to notice.
+        //
+        // The mapping is in /sys: a dm node's `slaves` directory names the block device underneath it.
+        const leaves = await SystemLogWatcher.mapperLeaves(device);
+
+        const matched = new Map<number, Volume>();
+        for (const leaf of leaves) {
+            const v = this.deps.ioManager.getVolumeByDeviceName(leaf)
+                ?? this.deps.ioManager.getVolumeByDeviceName(SystemLogWatcher.parentDiskName(leaf) ?? leaf);
+            if (v) matched.set(v.id, v);
+        }
+
+        // ONE mapper, ONE volume -- and if that is not true, we do not GUESS which.
+        //
+        // Taking slaves[0] would attribute a failing disk's error to whichever name readdir happened to return
+        // first, which on a stacked or multi-slave mapper is a coin toss. Arming a verify against the WRONG
+        // volume is worse than arming none: it reads a healthy disk and reports it fine, while the one that is
+        // actually dying is never looked at.
+        if (matched.size === 1)
+            return [...matched.values()][0];
+
+        if (matched.size > 1) {
+            this.log.error('a kernel error on %s maps to MORE THAN ONE managed volume (%s). Refusing to guess which '
+                + 'disk it belongs to -- verifying the wrong one would report a healthy disk fine while the failing '
+                + 'one is never looked at. Verify them by hand.',
+                device, [...matched.values()].map(v => v.id).join(', '));
+            return null;
+        }
+
         const parent = SystemLogWatcher.parentDiskName(device);
         if (!parent)
             return null;
         return this.deps.ioManager.getVolumeByDeviceName(parent) ?? null;
+    }
+
+    // "dm-3" -> every real block device underneath it, following /sys/block/<dm>/slaves all the way down.
+    //
+    // Mappers STACK: dm-5 can sit on dm-4 which sits on sdf1, and a single-layer lookup stops at dm-4 and finds
+    // nothing. And a mapper can have SEVERAL slaves. So this walks the whole tree, with a visited set (a cycle
+    // in /sys would be a kernel bug, but a loop that hangs the log watcher would be ours), and returns the
+    // leaves -- the devices that are not themselves mappers.
+    // JBD2 IS THE JOURNAL LAYER, AND IT SPEAKS FOR ITSELF.
+    //
+    //     JBD2: Detected IO errors while flushing file data on dm-3-8
+    //     JBD2: I/O error when updating journal superblock for dm-3-8.
+    //     Aborting journal on device dm-3-8.
+    //     JBD2: Error -5 detected when updating journal superblock for sdf1-8.
+    //
+    // None of those say "EXT4-fs", and none of them say "dev <name>", so neither existing parser saw them --
+    // and an aborted journal is not a hint that a disk MIGHT be failing. It is the filesystem announcing that
+    // it has stopped being able to write, which is the last thing it says before it goes read-only.
+    //
+    // The device name carries a journal suffix (`dm-3-8`, `sdf1-8`) which has to come off before the volume can
+    // be found.
+    static parseJbd2Errors(text: string): DeviceSignal[] {
+        const signals: DeviceSignal[] = [];
+        // `on <dev>` AND `for <dev>` -- jbd2 uses both, and the `for` form is the one it emits when it cannot
+        // update the journal superblock, which is about as close to "this disk is gone" as a filesystem gets.
+        const re = /(?:JBD2:\s*([^\n]*?)\s+(?:on|for)\s+|Aborting journal on device\s+)([a-zA-Z0-9_.-]+)/gi;
+
+        let match: RegExpExecArray | null;
+        while ((match = re.exec(text)) !== null) {
+            const detail = (match[1] ?? 'aborting journal').trim().slice(0, 120);
+
+            // `dm-3-8` -> `dm-3`, `sdf1-8` -> `sdf1`. The trailing `-N` is the journal's minor number, not
+            // part of the device.
+            const device = match[2].replace(/\.$/, '').replace(/-\d+$/, '');
+
+            signals.push({ device, kind: 'ioerror', detail: `jbd2: ${detail}` });
+        }
+
+        return signals;
+    }
+
+    static async mapperLeaves(device: string, seen = new Set<string>()): Promise<string[]> {
+        if (!/^dm-\d+$/.test(device) || seen.has(device)) return [];
+        seen.add(device);
+
+        const slaves = await fsp.readdir(`/sys/block/${device}/slaves`).catch(() => [] as string[]);
+        const out: string[] = [];
+
+        for (const slave of slaves) {
+            if (/^dm-\d+$/.test(slave)) out.push(...await SystemLogWatcher.mapperLeaves(slave, seen));
+            else out.push(slave);
+        }
+
+        return out;
     }
 
     // "sdf1" -> "sdf", "nvme0n1p2" -> "nvme0n1". null when `device` is already a whole disk.
@@ -235,11 +339,94 @@ export class SystemLogWatcher {
     // "critical target error, dev sdn, sector 109348576 ..." / "I/O error, dev sdn,"
     static parseKernelErrors(text: string): DeviceSignal[] {
         const signals: DeviceSignal[] = [];
-        const re = /(critical target error|I\/O error|medium error).*?\bdev\s+([a-zA-Z0-9_.-]+)/gi;
+        // The phrases a failing block device actually uses. Missing one means a dying disk that nobody hears:
+        // `device offline error` and `hardware error` are exactly what a USB enclosure says as it goes.
+        const re = /(critical target error|critical medium error|I\/O error|medium error|hardware error|device offline error|unaligned write command|rejecting I\/O to offline device).*?\bdev\s+([a-zA-Z0-9_.-]+)/gi;
         let match: RegExpExecArray | null;
         while ((match = re.exec(text)) !== null) {
             signals.push({ device: match[2], kind: 'ioerror', detail: match[1].toLowerCase() });
         }
+
+        // ...AND THE FORMS WHERE THE DEVICE COMES FIRST, IN BRACKETS.
+        //
+        //     sd 1:0:0:0: [sdf] rejecting I/O to offline device
+        //     sd 1:0:0:0: [sdg] Unaligned partial completion
+        //
+        // The rule above needs `dev <name>` AFTER the phrase, so every one of these was dropped -- and
+        // "rejecting I/O to offline device" is a USB enclosure that has already gone.
+        const bracketed = /\[([a-zA-Z0-9_.-]+)\][^\n]*?(rejecting I\/O to offline device|device offline|hardware error|medium error|critical target error|unrecovered read error|unaligned partial completion|device not ready)/gi;
+
+        while ((match = bracketed.exec(text)) !== null) {
+            signals.push({ device: match[1], kind: 'ioerror', detail: match[2].toLowerCase() });
+        }
+
+        // One line can match both rules ("[sdg] ... hardware error, dev sdg"). One signal per device is what
+        // the caller wants anyway -- it arms a verify, and a disk cannot be verified twice at once.
+        // Keep the FIRST hit for each device: it is the most specific thing the kernel said before the noise
+        // that follows it ("critical target error" comes before the generic "I/O error" it cascades into).
+        const byDevice = new Map<string, DeviceSignal>();
+        for (const sig of signals) if (!byDevice.has(sig.device)) byDevice.set(sig.device, sig);
+        return [...byDevice.values()];
+    }
+
+    // THE FILESYSTEM'S OWN COMPLAINTS, WHICH NOBODY WAS LISTENING TO.
+    //
+    // The block layer says "I/O error, dev sdf" -- and that is what parseKernelErrors() catches. But ext4 has
+    // its own voice, and it is a different sentence:
+    //
+    //     EXT4-fs error (device sdf1): ext4_find_entry:1455: inode #2: reading directory lblock 0
+    //     EXT4-fs (dm-3): I/O error while writing superblock
+    //     EXT4-fs warning (device dm-3): ext4_end_bio:343: I/O error 10 writing to inode 42
+    //
+    // None of those match "…dev <name>", so none of them were ever parsed -- for ANY disk. That is a gap that
+    // has always been there; the array has simply never heard the filesystem tell it a disk was going.
+    //
+    // It becomes acute under LUKS. The physical I/O errors still name the real disk (`dev sdf`), but the
+    // FILESYSTEM errors name the device-mapper node -- `EXT4-fs (dm-3)` -- and dm-3 is not a name the fleet has
+    // ever heard of. So on an encrypted array, this whole channel goes quiet: the layer closest to the data,
+    // the one that knows a directory would not read, saying nothing at all.
+    //
+    // Fixed before a single volume is encrypted, because turning encryption on with this in place would arm it.
+    static parseExt4Errors(text: string): DeviceSignal[] {
+        const signals: DeviceSignal[] = [];
+
+        // `EXT4-fs error (device X):`, `EXT4-fs warning (device X):`, and the bare `EXT4-fs (X):` that ext4
+        // uses for its most serious ones ("I/O error while writing superblock").
+        const re = /EXT4-fs\s*(?:(error|warning)\s*)?\((?:device\s+)?([a-zA-Z0-9_.-]+)\)\s*:?\s*([^\n]*)/gi;
+
+        let match: RegExpExecArray | null;
+        while ((match = re.exec(text)) !== null) {
+            const detail = (match[3] ?? '').trim().slice(0, 120);
+
+            // NOT EVERY EXT4 LINE IS A DYING DISK, and treating them all as one would drown the real signal.
+            //
+            // ext4 announces itself on every mount ("EXT4-fs (sdb1): mounted filesystem with ordered data
+            // mode") using the same bare form as its most serious complaint ("EXT4-fs (dm-3): I/O error while
+            // writing superblock"). The keyword alone cannot tell them apart, so the CONTENT has to.
+            //
+            // AND THE VOCABULARY MATTERS. The first version of this looked for "I/O error" and friends, which
+            // misses the sentences ext4 uses when it has actually given up:
+            //
+            //     EXT4-fs (dm-3): shut down requested
+            //     EXT4-fs (dm-3): Remounting filesystem read-only
+            //     EXT4-fs error (device sdf1): Journal has aborted
+            //
+            // A filesystem that has aborted its journal or gone read-only is not a warning about a disk. It IS
+            // a disk, dying, in the plainest words the kernel has -- and every one of them would have been
+            // dropped as "not severe enough".
+            const SEVERE = /I\/O error|read error|write error|failed|corrupt|shut down requested|remounting filesystem read-only|aborted journal|journal has aborted|mounting fs with errors|previous I\/O error|inode.*is corrupt|comm .*: reading directory/i;
+
+            const severe = match[1]?.toLowerCase() === 'error' || SEVERE.test(detail);
+
+            if (!severe) continue;
+
+            signals.push({
+                device: match[2],
+                kind: 'ioerror',
+                detail: `ext4: ${detail || (match[1] ?? 'error')}`
+            });
+        }
+
         return signals;
     }
 }

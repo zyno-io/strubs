@@ -54,19 +54,29 @@ export class DeviceProvisioner {
         if (!targetDevice)
             throw new HttpBadRequestError('block device not found');
 
+        // HARD GATE 2: ASK THE DISK WHETHER IT IS ALREADY OURS -- ON EVERY PATH, NOT JUST THE WIPE ONE.
+        //
+        // This used to run only when `wipe` was passed, on the reasoning that the non-wipe path is safe because
+        // it refuses a partitioned disk. It is not. Both paths end in `parted mklabel` and `mkfs`, and the
+        // non-wipe guard below only catches a disk that ADVERTISES A PARTITION TABLE.
+        //
+        // A whole-disk STRUBS volume has no partition table at all -- and neither does a whole-disk LUKS
+        // container, which is what DR-G may well create. No pttype, no ptuuid, no children: it walks through
+        // every check on the non-wipe path and gets repartitioned. That is a live route to destroying a disk
+        // today, before encryption exists.
+        //
+        // Neither the mounted-partitions check nor the registered-volume check can save us either. The first
+        // says nothing about a disk that is simply not mounted, and the second consults a `volumes` collection
+        // that, in the exact scenario we fear, is EMPTY -- a fresh or wiped Mongo, a fleet that never started.
+        // In that state the provisioner sees 4.4TB of live customer data as blank media.
+        //
+        // So read the identity off the platter, with a probe that cannot write to what it inspects, before we
+        // touch anything. It fails CLOSED: a disk we could not read is refused, not assumed blank.
+        await this.assertDeviceIsNotOurs(blockPath, targetDevice);
+
         if (wipe === true) {
             if (this.deviceHasMountedPartitions(targetDevice))
                 throw new HttpBadRequestError('block device has mounted partitions');
-
-            // HARD GATE 2: ask the DISK whether it is already ours, and believe it over the database.
-            //
-            // Neither check above can save us here. `deviceHasMountedPartitions` says nothing about a disk
-            // that simply is not mounted, and the registered-volume check consults a `volumes` collection
-            // that, in the exact scenario we fear, is empty -- a fresh or wiped Mongo, or a fleet that
-            // never started. In that state the provisioner sees 4.4TB of live customer data as blank
-            // media. So read the identity off the platter, with a probe that cannot write to what it
-            // inspects. It fails CLOSED: a disk we could not read is refused, not assumed blank.
-            await this.assertDeviceIsNotOurs(blockPath, targetDevice);
 
             await this.wipeDevice(blockPath);
             await this.deps.sleepSecs(1);
@@ -128,7 +138,7 @@ export class DeviceProvisioner {
     // call it blank. An operator who is certain can still clear the disk by hand; the API will not do it
     // for them on a guess.
     private async assertDeviceIsNotOurs(blockPath: string, device: RawBlockDevice): Promise<void> {
-        const probe = await this.deps.probeDeviceForStrubsIdentity(device.children);
+        const probe = await this.deps.probeDeviceForStrubsIdentity(device);
 
         if (probe.status === 'strubs') {
             throw new HttpBadRequestError(

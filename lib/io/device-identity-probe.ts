@@ -42,13 +42,73 @@ export async function probeStrubsIdentity(partition: RawBlockDeviceChild): Promi
     const fsType = partition.fstype;
     const partitionPath = partition.path ?? `/dev/${partition.name}`;
 
-    // We only ever mkfs ext. A partition with no filesystem, or a foreign one, cannot be one of ours, and
-    // there is nothing to mount -- that is a positive 'clean', not an 'unknown'.
-    // (Under LUKS the partition reports crypto_LUKS and its ext4 lives on a mapper child; encryption will
-    // extend this, and until it does an encrypted disk correctly reports 'clean' only because we never
-    // create one.)
-    if (!fsType || !fsType.toLowerCase().startsWith('ext'))
+    const fs = fsType?.toLowerCase() ?? '';
+
+    // AN ENCRYPTED DISK IS NOT A BLANK ONE. IT IS A DISK WE CANNOT SEE INSIDE.
+    //
+    // Under LUKS the partition reports `crypto_LUKS` and the ext4 lives on a device-mapper child. Every byte of
+    // the array's data can be sitting there and this probe -- which decides whether a disk may be REPARTITIONED
+    // -- would look at the fstype, see something that is not ext, and call it CLEAN.
+    //
+    // Until now that was true by accident: STRUBS never created an encrypted disk, so there were none to
+    // mistake. DR-G changes exactly that, which is why this had to be fixed BEFORE a single volume is ever
+    // encrypted. Shipping the feature with this in place would arm the bug: the first encrypted disk in the
+    // rack becomes a 4TB disk that the wipe guard is happy to destroy.
+    //
+    // We cannot read a LUKS container without the key. So we do not pretend to: 'unknown', which means REFUSE.
+    // (DR-G will extend this to attempt a read-only unlock with the array's own key and probe the mapper child
+    // beneath -- unlocked and ours => 'strubs'; unlocked and empty => 'clean'; will not unlock => still
+    // 'unknown', because a LUKS disk we hold no key for is either somebody else's or ours with a lost key, and
+    // neither is a disk to reformat on a hunch.)
+    if (fs === 'crypto_luks')
+        return {
+            status: 'unknown',
+            reason: `${partitionPath} is a LUKS container. Its contents cannot be read without the key, so this `
+                + `guard cannot establish whether it is blank or holds a STRUBS volume -- and "I could not tell" `
+                + `is not a licence to repartition 4TB. Unlock it, or take it out of the machine.`
+        };
+
+    // NO FSTYPE IS NOT PROOF OF BLANKNESS -- IT IS THE ABSENCE OF PROOF, AND THAT IS THE OTHER FAIL-OPEN.
+    //
+    // `lsblk` reports fstype null for a genuinely blank partition. It ALSO reports it null when it could not
+    // read the superblock -- which is exactly what a dying disk does. So a live STRUBS volume whose ext4
+    // superblock has gone unreadable presents as a blank partition, and this guard, whose whole job is to stop
+    // us wiping a disk with data on it, would happily wave 4TB of somebody's only copy through to be
+    // repartitioned. "I could not tell" is not a licence to destroy.
+    //
+    // So blankness is ESTABLISHED, not assumed. `blkid -p` probes the device itself rather than trusting a
+    // cached fstype: exit 2 with no output is a positive "there is no signature here"; a signature means there
+    // is something; and anything else -- an I/O error, a disk that will not talk -- is UNKNOWN.
+    let effective = fs;
+
+    if (!fs) {
+        const probed = await probeSignature(partitionPath);
+
+        if (probed.kind === 'unreadable')
+            return { status: 'unknown', reason: probed.reason };
+
+        if (probed.kind === 'none')
+            return { status: 'clean' };               // probed, and positively nothing there
+
+        // THERE IS A SIGNATURE AFTER ALL -- lsblk simply had not cached it. And if it is EXT, this is very
+        // possibly one of ours: we must go and READ it, not shrug and call it clean because lsblk was quiet.
+        // Returning 'clean' here on an ext4 partition would be a direct route to repartitioning a STRUBS disk.
+        effective = probed.type;
+
+        if (effective === 'crypto_luks')
+            return {
+                status: 'unknown',
+                reason: `${partitionPath} is a LUKS container (found by probing it directly -- lsblk reported no `
+                    + `filesystem at all). Its contents cannot be read without the key.`
+            };
+    }
+
+    // We only ever mkfs ext. A partition with a FOREIGN filesystem cannot be one of ours -- it positively is
+    // not a STRUBS volume, which is the only question this function is asked.
+    if (!effective.startsWith('ext'))
         return { status: 'clean' };
+
+    const fsForMount = effective;
 
     const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'strubs-probe-'));
     let mounted = false;
@@ -56,7 +116,7 @@ export async function probeStrubsIdentity(partition: RawBlockDeviceChild): Promi
 
     try {
         // noload: never replay the journal -- replaying it would be a WRITE to a disk we are inspecting.
-        const { code, stdout } = await spawnHelper('mount', ['-o', 'ro,noload', '-t', fsType, partitionPath, dir]);
+        const { code, stdout } = await spawnHelper('mount', ['-o', 'ro,noload', '-t', fsForMount, partitionPath, dir]);
         if (code !== 0) {
             const reason = `could not read-only mount ${partitionPath}${stdout ? ': ' + stdout.trim() : ''}`;
             log.error('%s -- treating as UNKNOWN (refusing to assume it is blank)', reason);
@@ -100,6 +160,76 @@ export async function probeStrubsIdentity(partition: RawBlockDeviceChild): Promi
     return result;
 }
 
+// ASK THE DEVICE WHAT IS ON IT -- WITH A TOOL WHOSE "NOTHING" MEANS NOTHING.
+//
+// The first version of this used `blkid -p` and read exit 2 as "positively blank". blkid(8) documents exit 2
+// for BOTH "no signature found" AND "impossible to gather any information about the device". Those are the two
+// things this entire guard exists to distinguish, and I had collapsed them into one -- in the function written
+// to stop exactly that. A failing STRUBS disk that blkid could not read would have come back CLEAN, and been
+// repartitioned.
+//
+// `wipefs -n --json` does not have that ambiguity. It is read-only (-n), and its answers are distinct:
+//
+//   exit 0, "signatures": [ {...} ]   -- there IS something here, and this is what it is
+//   exit 0, "signatures": [ ]         -- it probed the device successfully and there is genuinely NOTHING
+//   non-zero                          -- it could not probe the device at all. We do not know.
+//
+// An empty list is a POSITIVE finding. A failure is a failure. They no longer look alike.
+type Signature =
+    | { kind: 'none' }                    // probed successfully, and there is genuinely nothing there
+    | { kind: 'type'; type: string }      // there IS a signature, and this is it
+    | { kind: 'unreadable'; reason: string };
+
+export async function probeSignature(devicePath: string): Promise<Signature> {
+    try {
+        const { code, stdout } = await spawnHelper('wipefs', ['-n', '--json', devicePath]);
+
+        if (code !== 0)
+            return {
+                kind: 'unreadable',
+                reason: `could not probe ${devicePath} for a filesystem signature (wipefs exit ${code}: `
+                    + `${(stdout ?? '').trim().slice(0, 120)}). A disk whose superblock cannot be READ looks exactly `
+                    + `like a blank one -- and this guard decides whether to repartition it.`
+            };
+
+        // AND AN ANSWER WE DID NOT UNDERSTAND IS NOT AN ANSWER OF "NOTHING".
+        //
+        // `JSON.parse(stdout || '{}')` with a `?? []` fallback quietly turns empty stdout, `{}`, or a malformed
+        // `signatures` field into "no signatures" -- which is to say, into CLEAN. That is the same fail-open one
+        // level further down, in the function written to close it. Only a well-formed answer counts.
+        let sigs: Array<{ type?: string }>;
+        try {
+            const parsed = JSON.parse(stdout) as { signatures?: unknown };
+            if (!Array.isArray(parsed.signatures)) throw new Error('no signatures array');
+            sigs = parsed.signatures as Array<{ type?: string }>;
+        }
+        catch {
+            return {
+                kind: 'unreadable',
+                reason: `wipefs exited 0 for ${devicePath} but did not return a signature list this understands `
+                    + `(${(stdout ?? '').trim().slice(0, 80) || 'empty output'}). An answer we cannot read is not an `
+                    + `answer of "the disk is blank".`
+            };
+        }
+
+        // An EMPTY list here is a positive finding, not an absent one: wipefs probed the device and found no
+        // signature at all. That -- and only that -- is a blank disk.
+        if (!sigs.length)
+            return { kind: 'none' };
+
+        // LUKS anywhere in the list wins: it is the one signature that means "there may be an entire array in
+        // here and you cannot see it".
+        const types = sigs.map(sig => (sig.type ?? '').toLowerCase()).filter(Boolean);
+        if (types.includes('crypto_luks'))
+            return { kind: 'type', type: 'crypto_luks' };
+
+        return { kind: 'type', type: types[0] ?? 'unknown' };
+    }
+    catch (err) {
+        return { kind: 'unreadable', reason: `probing ${devicePath} for a signature failed: ${err}` };
+    }
+}
+
 async function readIdentity(dir: string, partitionPath: string): Promise<ProbeResult> {
     let data: Buffer;
     try {
@@ -129,16 +259,102 @@ async function readIdentity(dir: string, partitionPath: string): Promise<ProbeRe
 
 // Probe every partition on a device. A single 'strubs' or 'unknown' partition condemns the whole device:
 // we only report 'clean' when every partition on it was positively established to be clean.
-export async function probeDeviceForStrubsIdentity(children: RawBlockDeviceChild[] | undefined): Promise<ProbeResult> {
+//
+// AND THE DISK ITSELF HAS TO BE ASKED, not merely its partitions.
+//
+// The loop below inspects `children`. If there are none it inspected NOTHING -- and used to return 'clean' on
+// the strength of having looked at nothing at all. That is fine for a genuinely blank disk, which is the
+// ordinary case for provisioning. It is catastrophic for a WHOLE-DISK LUKS container: `cryptsetup luksFormat
+// /dev/sdf` with no partition table at all puts crypto_LUKS on the DISK, gives it no `part` children, and this
+// function would look straight past it and call the whole 4TB clean.
+//
+// DR-G may well format whole disks. Even if it does not, an operator can. So the disk's own signature is
+// checked, and only a device with no signature AND no partition table AND no partitions is called clean.
+// THE WHOLE DEVICE, NEVER JUST ITS CHILDREN.
+//
+// This used to accept a bare `children` array, and that signature cannot be made safe: with no disk path there
+// is nothing to probe, so a device with no partitions can only ever come back 'clean' -- which is precisely the
+// whole-disk LUKS / whole-disk STRUBS fail-open. A convenience overload that can only fail open is not a
+// convenience. It is the bug, kept warm for the next caller.
+export async function probeDeviceForStrubsIdentity(
+    device: { fstype?: string | null; pttype?: string; path?: string; name?: string;
+              children?: RawBlockDeviceChild[] } | undefined
+): Promise<ProbeResult> {
+    const dev = device ?? {};
+    const children = dev.children ?? [];
+
+    const diskPath = dev.path ?? (dev.name ? `/dev/${dev.name}` : '');
+
     let unknown: ProbeResult | null = null;
-    for (const child of children ?? []) {
+    let inspected = 0;
+
+    for (const child of children) {
         if (child.type !== 'part')
             continue;
+        inspected++;
         const result = await probeStrubsIdentity(child);
         if (result.status === 'strubs')
             return result;                        // decisive: it is ours
         if (result.status === 'unknown')
             unknown = result;                     // remember, but keep looking for a decisive 'strubs'
     }
-    return unknown ?? { status: 'clean' };
+
+    if (unknown) return unknown;
+
+    // A DISK THAT ADVERTISES A PARTITION TABLE AND SHOWS NO PARTITIONS HAS NOT BEEN LOOKED AT.
+    //
+    // Either the table is corrupt, or the enumeration was stale, or the kernel could not read it. Whatever the
+    // reason, we did not inspect a single partition -- and returning 'clean' on the strength of having looked at
+    // nothing is the same fail-open in its purest form.
+    if (dev.pttype && !inspected)
+        return {
+            status: 'unknown',
+            reason: `${diskPath || 'the device'} says it has a ${dev.pttype} partition table, and not one partition `
+                + `could be enumerated on it. Nothing was inspected, so nothing is known -- and this guard decides `
+                + `whether to repartition the disk.`
+        };
+
+    // NOTHING WAS INSPECTED. SO ASK THE DISK ITSELF, DIRECTLY.
+    //
+    // We are about to say a device with no partitions is blank. The first version of this trusted `dev.fstype`
+    // to spot a whole-disk LUKS container -- and device-discovery's sanitizer STRIPS the top-level fstype, so
+    // that field is never even there. The check was reading a field that does not arrive: a real whole-disk
+    // crypto_LUKS device would have sailed through it, looking for all the world like bare media.
+    //
+    // Trusting a cached field is what got us here twice. Probe the block device.
+    // No partition inspected AND no disk path to probe: we have looked at nothing and can look at nothing.
+    // That is 'unknown', not 'clean' -- the whole point of this function.
+    if (!inspected && !diskPath)
+        return {
+            status: 'unknown',
+            reason: 'no partition could be inspected and no device path was given, so nothing about this disk is '
+                + 'known. It will not be repartitioned on the strength of an empty answer.'
+        };
+
+    if (!inspected && diskPath) {
+        const probed = await probeSignature(diskPath);
+
+        if (probed.kind === 'unreadable')
+            return { status: 'unknown', reason: probed.reason };
+
+        if (probed.kind === 'type') {
+            if (probed.type === 'crypto_luks')
+                return {
+                    status: 'unknown',
+                    reason: `${diskPath} is a WHOLE-DISK LUKS container -- no partition table, the encryption is on `
+                        + `the disk itself. Its contents cannot be read without the key, so this guard cannot say `
+                        + `whether it is blank or holds a STRUBS volume. It will not be repartitioned on a guess.`
+                };
+
+            // A whole-disk EXT filesystem with no partition table could well be one of ours. Read it.
+            if (probed.type.startsWith('ext'))
+                return probeStrubsIdentity({
+                    type: 'part', name: dev.name ?? '', path: diskPath, fstype: probed.type
+                } as unknown as RawBlockDeviceChild);
+
+            return { status: 'clean' };               // a foreign whole-disk filesystem is positively not ours
+        }
+    }
+
+    return { status: 'clean' };
 }

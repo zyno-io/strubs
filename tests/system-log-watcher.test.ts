@@ -40,8 +40,11 @@ describe('SystemLogWatcher parsing', () => {
     });
 
     it('extracts device errors from kernel output', () => {
+        // ONE SIGNAL PER DEVICE. A single line can now match more than one rule (the bracketed SCSI form and
+        // the `dev X` form both fire on "[sdg] ... hardware error, dev sdg"), and one signal per disk is what
+        // the caller wants anyway -- it arms a verify, and a disk cannot be verified twice at once.
         const signals = SystemLogWatcher.parseKernelErrors(KERNEL_OUTPUT);
-        expect(signals.map(s => s.device)).toEqual(['sdn', 'sdn']);
+        expect(signals.map(s => s.device)).toEqual(['sdn']);
         expect(signals[0]).toMatchObject({ kind: 'ioerror', detail: 'critical target error' });
     });
 
@@ -211,5 +214,96 @@ describe('SystemLogWatcher poll', () => {
         const deps = makeDeps({ run, volumes: [[1, mkVol(1, 'sdaf', 1)]] });
         await new SystemLogWatcher({ triggerCooldownMs: 0 }, deps).poll();
         expect(deps.verifyVolumesJob.start).not.toHaveBeenCalled();
+    });
+
+    // UNDER LUKS, THE KERNEL DOES NOT NAME YOUR DISK. IT NAMES THE MAPPER.
+    //
+    // An encrypted volume's ext4 sits on a device-mapper node. Its filesystem errors therefore arrive as
+    // `EXT4-fs (dm-3): ...` -- and dm-3 is a name the fleet has never heard of. Both halves of this were broken:
+    // the errors were never PARSED (no ext4 rule at all, for any disk), and even if they had been, dm-3 could
+    // not be RESOLVED to a volume. On an encrypted array the whole channel goes quiet -- the layer closest to
+    // the data, the one that knows a directory would not read, saying nothing at all.
+    //
+    // Fixed before a single volume is encrypted, because turning encryption on with this in place would arm it.
+    describe('kernel block errors', () => {
+        it('hears the phrases a failing USB enclosure actually uses', () => {
+            // `device offline error` and `hardware error` are exactly what these enclosures say as they go, and
+            // neither was in the original set. A phrase we do not listen for is a disk we do not hear die.
+            const signals = SystemLogWatcher.parseKernelErrors([
+                'blk_update_request: device offline error, dev sdf, sector 12345',
+                'sd 1:0:0:0: [sdg] tag#0 FAILED Result: hostbyte=DID_ERROR hardware error, dev sdg,'
+            ].join('\n'));
+
+            expect(signals.map(s => s.device)).toEqual(['sdf', 'sdg']);
+        });
+    });
+
+    // JBD2 IS THE JOURNAL LAYER, AND IT SPEAKS FOR ITSELF.
+    //
+    // An aborted journal is not a hint that a disk MIGHT be failing. It is the filesystem announcing that it has
+    // stopped being able to write -- the last thing it says before it goes read-only. None of these lines say
+    // "EXT4-fs", and none say "dev <name>", so neither existing parser saw a single one of them.
+    describe('jbd2 journal failures', () => {
+        it('hears an aborting journal, and strips the journal suffix off the device name', () => {
+            const signals = SystemLogWatcher.parseJbd2Errors([
+                'JBD2: Detected IO errors while flushing file data on dm-3-8',
+                'Aborting journal on device sdf1-8.'
+            ].join('\n'));
+
+            // dm-3-8 -> dm-3 (the trailing -N is the journal's minor number, not part of the device)
+            expect(signals.map(s => s.device)).toEqual(['dm-3', 'sdf1']);
+            expect(signals.every(s => s.kind === 'ioerror')).toBe(true);
+        });
+
+        it('hears the "for <device>" form, which is what jbd2 says when it cannot write the superblock', () => {
+            // jbd2 uses both `on <dev>` and `for <dev>`, and the `for` form is the one it emits when it cannot
+            // update the journal superblock -- about as close to "this disk is gone" as a filesystem gets. The
+            // first version of this parser only knew `on`, and would have heard nothing at all.
+            const signals = SystemLogWatcher.parseJbd2Errors([
+                'JBD2: I/O error when updating journal superblock for dm-3-8.',
+                'JBD2: Error -5 detected when updating journal superblock for sdf1-8.',
+                'JBD2: Detected IO errors while flushing file data on nvme0n1p1-8'
+            ].join('\n'));
+
+            expect(signals.map(s => s.device)).toEqual(['dm-3', 'sdf1', 'nvme0n1p1']);
+        });
+    });
+
+    describe('ext4 filesystem errors', () => {
+        it('parses EXT4-fs errors, including the device-mapper ones LUKS produces', () => {
+            const signals = SystemLogWatcher.parseExt4Errors([
+                'EXT4-fs error (device sdf1): ext4_find_entry:1455: inode #2: reading directory lblock 0',
+                'EXT4-fs (dm-3): I/O error while writing superblock',
+                'EXT4-fs warning (device dm-7): ext4_end_bio:343: I/O error 10 writing to inode 42',
+                'EXT4-fs (sdb1): mounted filesystem with ordered data mode'
+            ].join('\n'));
+
+            expect(signals.map(s => s.device)).toEqual(['sdf1', 'dm-3', 'dm-7']);
+            expect(signals.every(s => s.kind === 'ioerror')).toBe(true);
+
+            // ...and a routine mount message is not a dying disk.
+            expect(signals.map(s => s.device)).not.toContain('sdb1');
+        });
+
+        it('hears ext4 SAY IT HAS GIVEN UP, not just the word "error"', () => {
+            // These are the sentences ext4 uses when it has actually stopped. A filesystem that has aborted its
+            // journal or remounted itself read-only is not a warning ABOUT a disk -- it IS a disk, dying, in the
+            // plainest words the kernel has. The first version of this filter looked for "I/O error" and friends
+            // and would have dropped every one of them.
+            const signals = SystemLogWatcher.parseExt4Errors([
+                'EXT4-fs (dm-3): shut down requested',
+                'EXT4-fs (dm-4): Remounting filesystem read-only',
+                'EXT4-fs error (device sdf1): Journal has aborted',
+                'EXT4-fs (sdg1): mounted filesystem with ordered data mode'      // routine: not a signal
+            ].join('\n'));
+
+            expect(signals.map(s => s.device)).toEqual(['dm-3', 'dm-4', 'sdf1']);
+        });
+
+        it('does not treat every ext4 warning as a failing disk', () => {
+            const signals = SystemLogWatcher.parseExt4Errors(
+                'EXT4-fs warning (device sdf1): ext4_multi_mount_protect:322: MMP interval 42 too big');
+            expect(signals).toEqual([]);
+        });
     });
 });
