@@ -3,6 +3,8 @@ import { Collection, ObjectId, type AnyBulkWriteOperation, type Filter } from 'm
 import { config } from '../config';
 import { constants } from '../constants';
 import { createError } from '../helpers';
+import { createLogger } from '../log';
+import { notificationService } from '../notify/service';
 import {
     createEmptyStorageCounters,
     createEmptyStorageStatsSnapshot,
@@ -12,15 +14,25 @@ import {
 import { ContainerCache } from './container-cache';
 import type { ContentDocument, ContainerPath, ObjectIdentifier, ObjectVerificationStateUpdate } from './types';
 
+const log = createLogger('content-repository');
+
 type NormalizeFn = <T extends ContentDocument>(object: T) => T & { id: string; containerId?: string | null };
 type MongoIdFn = (id: ObjectIdentifier) => ObjectId | null;
+
+// Journal a newly-created container BEFORE its Mongo insert. Injected rather than imported so the
+// database layer doesn't reach into the io layer (and so tests can observe the ordering).
+export type JournalContainerFn = (record: { id: string; cid: string | null; name: string }) => Promise<void>;
+// Compensating record for a container whose journal entry is durable but whose Mongo insert then failed.
+export type JournalRemoveFn = (id: string) => Promise<void>;
 
 export class ContentRepository {
     constructor(
         private readonly collection: Collection<ContentDocument>,
         private readonly cache: ContainerCache,
         private readonly normalize: NormalizeFn,
-        private readonly toMongoId: MongoIdFn
+        private readonly toMongoId: MongoIdFn,
+        private readonly journalContainer: JournalContainerFn = async () => undefined,
+        private readonly journalRemove: JournalRemoveFn = async () => undefined
     ) {}
 
     async createObjectRecord(object: ContentDocument & { id: string; containerId?: ObjectIdentifier }): Promise<void> {
@@ -681,7 +693,66 @@ export class ContentRepository {
                     isContainer: true,
                     bucketId: bucketMongoId
                 };
-                await this.collection.insertOne(insertDoc);
+
+                // Journal the container BEFORE its Mongo insert, exactly as for objects. A container's
+                // name exists NOWHERE on disk -- the slice headers know nothing about it -- so an
+                // unjournaled container turns every object beneath it into an orphan. One lost row can
+                // cost a whole subtree of the namespace.
+                //
+                // Parent-first ordering is not an extra step: we are walking the path top-down, so a
+                // child's journal record is only ever written after its parent's is already durable. That
+                // is what stops a replay from finding an object whose `cid` names a container it has
+                // never seen.
+                await this.journalContainer({
+                    id: newId.toHexString(),
+                    cid: containerId,
+                    name
+                });
+
+                try {
+                    await this.collection.insertOne(insertDoc);
+                }
+                catch (err) {
+                    // The container record is DURABLE in the journal but never reached Mongo. Left alone,
+                    // a replay would faithfully restore a container that does not exist -- the same
+                    // post-journal/pre-Mongo hole that a half-failed object PUT has. Compensate with a
+                    // `del` for its id (the op is generic over ids, so it needs no new vocabulary), then
+                    // let the original failure propagate.
+                    try {
+                        await this.journalRemove(newId.toHexString());
+                    }
+                    catch (compensationErr) {
+                        // The compensation ITSELF failed, so the journal now carries a container that will
+                        // never exist. A container is the one thing the disks CANNOT disprove: an object's
+                        // `put` is checked against its slices at replay, and one with no slices is dropped --
+                        // but a container has no slices, so nothing contradicts it. A replay will faithfully
+                        // restore an empty folder that was never really there.
+                        //
+                        // The damage is bounded: an EMPTY folder, not lost data, and no object can hide
+                        // behind it (the objects that would have lived there were never created either).
+                        // That is why this is reported rather than made impossible -- two-phase commit
+                        // between Mongo and a file, to prevent a stray directory, is not a trade worth
+                        // making. But it does not get to pass in silence.
+                        log.error(
+                            'JOURNAL INCONSISTENT: container %s is journaled but its Mongo insert failed AND the '
+                            + 'compensating delete could not be written (%s). A replay will restore an empty container '
+                            + 'that never existed.',
+                            newId.toHexString(),
+                            compensationErr
+                        );
+                        void notificationService.notify({
+                            severity: 'warning',
+                            title: 'STRUBS namespace journal is inconsistent',
+                            body: `Container ${newId.toHexString()} ("${name}") was written to the namespace journal, its `
+                                + `Mongo insert then failed, and the compensating delete could not be written either. If the `
+                                + `journal is ever replayed it will recreate this container as an empty folder that never `
+                                + `really existed. No data is at risk; the folder can simply be deleted.`,
+                            dedupeKey: `journal:container:inconsistent:${newId.toHexString()}`
+                        }).catch(() => undefined);
+                    }
+                    throw err;
+                }
+
                 object = insertDoc;
                 object.containerId = containerId;
             }

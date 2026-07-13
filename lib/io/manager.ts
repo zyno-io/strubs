@@ -14,7 +14,7 @@ type IOManagerDeps = {
     volumeFleet: VolumeFleet;
     mountRootManager: MountRootManager;
     repairWorker: Pick<typeof repairWorker, 'wake'>;
-    bootstrapManifestWriter: Pick<typeof bootstrapManifestWriter, 'write'>;
+    bootstrapManifestWriter: Pick<typeof bootstrapManifestWriter, 'write' | 'setJournalVolumeIds'>;
 };
 
 const defaultDeps: IOManagerDeps = {
@@ -134,8 +134,21 @@ export class IOManager {
     // drain start/cancel/complete, health degradation, provision, delete) -- rather than at the HTTP
     // handlers, which miss the ones the system does to itself. Fire-and-forget: a manifest write must
     // never fail or delay a fleet change, and the periodic backstop makes a dropped write self-healing.
+    //
+    // The JOURNAL has to follow the fleet from the same hook. Journal files are not object slices: the
+    // drain job walks `content` and relocates what the records reference, and it knows nothing about
+    // .journal/ -- so draining and pulling a journal volume would silently destroy one of its replicas,
+    // and retiring the wrong three disks over a year could quietly take it to zero.
     private refreshBootstrapManifest(): void {
-        void this.deps.bootstrapManifestWriter.write().catch(() => undefined);
+        void (async () => {
+            try {
+                const { journal } = require('./journal') as typeof import('./journal');
+                await journal.onFleetChange();
+                this.deps.bootstrapManifestWriter.setJournalVolumeIds(journal.replicaVolumeIds);
+            }
+            catch { /* the journal re-election must never fail a fleet change */ }
+            await this.deps.bootstrapManifestWriter.write().catch(() => undefined);
+        })();
     }
 
     getCachedDevices(): CachedDevice[] {

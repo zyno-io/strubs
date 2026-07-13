@@ -7,6 +7,14 @@ const databaseMock = {
     deleteObjectById: vi.fn()
 };
 
+// The journal's whole value is WHERE it sits in the write path, so record the order of everything that
+// touches disk or Mongo and assert on the sequence.
+const callOrder: string[] = [];
+const journalMock = {
+    append: vi.fn(async (record: { op: string }) => { callOrder.push(`journal:${record.op}`); })
+};
+vi.mock('../lib/io/journal', () => ({ journal: journalMock }));
+
 const planMock = {
     generatePlan: vi.fn()
 };
@@ -45,7 +53,8 @@ const createWriterInstance = (): WriterInstance => ({
     write: vi.fn().mockResolvedValue(undefined),
     finish: vi.fn().mockResolvedValue(undefined),
     commit: vi.fn().mockResolvedValue(undefined),
-    abort: vi.fn().mockResolvedValue(undefined),
+    // abort() removes the slices of an in-flight write, so it is an unlink for ordering purposes too.
+    abort: vi.fn(async () => { callOrder.push('disk:unlink'); }),
     md5: Buffer.from('beef', 'hex')
 });
 
@@ -57,7 +66,8 @@ const createReaderInstance = (): ReaderInstance => ({
 });
 
 const createDestroyerInstance = (): DestroyerInstance => ({
-    destroy: vi.fn().mockResolvedValue(undefined)
+    // This is what actually unlinks the slice files, so it takes its place in the recorded order.
+    destroy: vi.fn(async () => { callOrder.push('disk:unlink'); })
 });
 
 vi.mock('stream', () => {
@@ -203,8 +213,12 @@ vi.mock('../lib/log', () => ({
 const { FileObject } = await import('../lib/io/file-object');
 
 const resetState = (): void => {
+    callOrder.length = 0;
+    journalMock.append.mockClear();
     databaseMock.createObjectRecord.mockReset();
     databaseMock.deleteObjectById.mockReset();
+    databaseMock.createObjectRecord.mockImplementation(async () => { callOrder.push('mongo:insert'); });
+    databaseMock.deleteObjectById.mockImplementation(async () => { callOrder.push('mongo:delete'); });
     writerInstances.length = 0;
     readerInstances.length = 0;
     destroyerInstances.length = 0;
@@ -335,6 +349,102 @@ describe('FileObject', () => {
         await object.delete();
         expect(destroyerInstances[0]?.destroy).toHaveBeenCalled();
         expect(databaseMock.deleteObjectById).toHaveBeenCalledWith(record.id);
+    });
+
+    // ---- JOURNAL ORDERING ----
+    //
+    // The journal's entire value is WHERE it sits. These two tests are the phase.
+
+    it('ORDER on create: slices committed -> journal -> Mongo', async () => {
+        const object = new FileObject();
+        await object.createWithSize(4);
+        object.name = 'cat.jpg';
+        object.containerId = 'root';
+        await object.commit();
+
+        // A crash between the journal and Mongo leaves the object on disk AND named in the journal, so a
+        // rebuild finds it whole. The reverse would leave it in Mongo but NOT the journal -- and a
+        // snapshot+journal restore would miss it entirely, degrading it to a nameless orphan.
+        expect(callOrder).toEqual(['journal:put', 'mongo:insert']);
+        expect(journalMock.append).toHaveBeenCalledWith(expect.objectContaining({
+            op: 'put', name: 'cat.jpg', cid: 'root'
+        }));
+    });
+
+    it('ORDER on delete: journal -> Mongo -> unlink slices (orphans beat phantoms, twice)', async () => {
+        const object = new FileObject();
+        const record = createRecord();
+        await object.loadFromRecord(record);
+
+        await object.delete();
+
+        // The same rule applied at both boundaries, and the unlink loses both times.
+        //
+        // journal BEFORE unlink: crash between them and you get slices with no journal record -- an ORPHAN,
+        // which lost+found recovers. The reverse leaves the object in the journal as live with its slices
+        // already gone, so a replay resurrects a PHANTOM.
+        //
+        // Mongo BEFORE unlink: crash between them and you get slices with no row -- again an orphan, and one
+        // the journal has already recorded as deleted, so no replay brings it back. The reverse strands a
+        // row pointing at slices that no longer exist, which reads as data loss for an object the user
+        // deliberately deleted.
+        expect(callOrder).toEqual(['journal:del', 'mongo:delete', 'disk:unlink']);
+        expect(journalMock.append).toHaveBeenCalledWith(expect.objectContaining({ op: 'del', id: record.id }));
+    });
+
+    // The subtle one. commit() journals the PUT before the Mongo insert, so if that insert throws, the put
+    // is DURABLE in the journal while the object was never persisted. The cleanup path would treat it as a
+    // mere aborted upload, unlink the slices and journal nothing -- leaving a `put` record for an object
+    // with no slices and no row, which a replay would faithfully restore as a PHANTOM.
+    it('compensates a half-failed create: a journaled PUT whose Mongo insert failed still gets a del', async () => {
+        databaseMock.createObjectRecord.mockImplementation(async () => {
+            callOrder.push('mongo:insert');
+            throw new Error('mongo is down');
+        });
+
+        const object = new FileObject();
+        await object.createWithSize(4);
+        object.name = 'cat.jpg';
+        await expect(object.commit()).rejects.toThrow('mongo is down');
+
+        // Now the failure path cleans up, exactly as object-put-request does.
+        await object.delete();
+
+        expect(callOrder).toEqual([
+            'journal:put', 'mongo:insert',      // the put IS durable; the insert then failed
+            'journal:del', 'disk:unlink'        // ...so the delete must be journaled before the slices go
+        ]);
+    });
+
+    // The mirror image of the test above, and the nastier one: the Mongo insert SUCCEEDS and something
+    // after it throws. If the object is not marked persisted the instant the row exists, the cleanup path
+    // unlinks the slices and then skips deleteObjectById() -- leaving a Mongo row pointing at nothing.
+    // That is a phantom: it reads as data loss for an object that was never really there.
+    it('leaves no PHANTOM when a create fails AFTER the Mongo insert succeeded', async () => {
+        // The stats hook runs after the insert and is the realistic thing to blow up there.
+        const object = new FileObject({
+            recordObjectCreated: () => { throw new Error('stats hook blew up'); }
+        });
+        await object.createWithSize(4);
+        object.name = 'cat.jpg';
+        await expect(object.commit()).rejects.toThrow('stats hook blew up');
+
+        await object.delete();          // the failure path, exactly as object-put-request runs it
+
+        // The row exists, so the cleanup MUST remove it. Unlinking the slices and leaving the row is the
+        // phantom; leaving the row and the slices would at worst be a live object.
+        expect(databaseMock.deleteObjectById).toHaveBeenCalled();
+        expect(callOrder).toEqual([
+            'journal:put', 'mongo:insert',               // the insert landed...
+            'journal:del', 'mongo:delete', 'disk:unlink' // ...so the row has to come back out with the slices
+        ]);
+    });
+
+    it('does NOT journal an aborted upload -- it was never a namespace change', async () => {
+        const object = new FileObject();
+        await object.createWithSize(4);
+        await object.delete();                       // abort an in-flight write, not a real deletion
+        expect(journalMock.append).not.toHaveBeenCalled();
     });
 
     it('serializes IO locks to guard concurrent access', async () => {

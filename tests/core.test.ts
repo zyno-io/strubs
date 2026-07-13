@@ -23,11 +23,25 @@ vi.mock('../lib/config', () => ({
 
 const manifestWriteMock = vi.fn().mockResolvedValue(undefined);
 const manifestStartPeriodicMock = vi.fn();
+const manifestSetJournalIdsMock = vi.fn();
 vi.mock('../lib/io/bootstrap-manifest', () => ({
     bootstrapManifestWriter: {
         write: manifestWriteMock,
         startPeriodic: manifestStartPeriodicMock,
         stopPeriodic: vi.fn(),
+        setJournalVolumeIds: manifestSetJournalIdsMock,
+    },
+}));
+
+const journalStartMock = vi.fn().mockResolvedValue(undefined);
+const journalStopMock = vi.fn().mockResolvedValue(undefined);
+const journalFlushMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('../lib/io/journal', () => ({
+    journal: {
+        start: journalStartMock,
+        stop: journalStopMock,
+        flush: journalFlushMock,
+        replicaVolumeIds: [4, 17, 23],
     },
 }));
 
@@ -138,6 +152,10 @@ describe('Core', () => {
         configMock.identity = 'a'.repeat(32);   // default: identity present -> normal startup
         manifestWriteMock.mockClear();
         manifestStartPeriodicMock.mockClear();
+        manifestSetJournalIdsMock.mockClear();
+        journalStartMock.mockClear();
+        journalStopMock.mockClear();
+        journalFlushMock.mockClear();
         loadIdentityMock.mockReset();
         connectMock.mockReset();
         ioInitMock.mockReset();
@@ -207,11 +225,55 @@ describe('Core', () => {
         expect(storageStatsStartMock).toHaveBeenCalledTimes(1);
         // The fleet is up, so the bootstrap manifest is refreshed on every writable disk.
         expect(manifestWriteMock).toHaveBeenCalled();
+        // The journal must be running BEFORE the object API accepts a write -- a PUT that lands before it
+        // is a namespace change nobody recorded -- and its replica set is recorded in the manifest so a
+        // recovery knows which disks to look on.
+        expect(journalStartMock).toHaveBeenCalled();
+        expect(manifestSetJournalIdsMock).toHaveBeenCalledWith([4, 17, 23]);
     });
 
     // A rebuilt host with no /var/lib/strubs/identity must NOT crash (it could never reach the UI that
     // offers to restore it) and must NOT start the fleet or the object API -- it cannot verify a single
     // disk, and it must never generate a replacement identity (that orphans every disk permanently).
+    // Stopping the journal before the servers would leave the object API accepting writes while append()
+    // is a no-op -- so a PUT arriving in that window commits to Mongo with NO journal record, which is
+    // exactly the unjournaled namespace change the whole phase exists to prevent.
+    it('stops the SERVERS before the journal, so no write can land unjournaled during shutdown', async () => {
+        const { Core } = await import('../lib/core');
+        const core = new Core();
+        await core.start();
+        await core.stop();
+
+        expect(serverStopMock).toHaveBeenCalled();
+        expect(journalStopMock).toHaveBeenCalled();
+        expect(serverStopMock.mock.invocationCallOrder[0])
+            .toBeLessThan(journalStopMock.mock.invocationCallOrder[0]);
+    });
+
+    // ...and stopping the servers in the right ORDER is not the same as stopping them SUCCESSFULLY.
+    // ServerManager stops in reverse, so the object listener goes last: if FUSE or admin rejects first,
+    // the object API can still be live. Pressing on with the shutdown then does three separate kinds of
+    // damage, so the whole thing ABORTS instead.
+    it('ABORTS the shutdown when the servers fail to stop, leaving everything up', async () => {
+        serverStopMock.mockRejectedValue(new Error('FUSE unmount failed: device busy'));
+
+        const { Core } = await import('../lib/core');
+        const core = new Core();
+        await core.start();
+        await expect(core.stop()).rejects.toThrow('device busy');
+
+        // A listener may still be accepting writes, so:
+        expect(journalStopMock).not.toHaveBeenCalled();   // ...append() must not become a no-op
+        expect(ioStopMock).not.toHaveBeenCalled();        // ...and the volumes must not be unmounted under it
+        expect(journalFlushMock).toHaveBeenCalled();      // but acknowledged records still reach the platter
+
+        // `started` must stay TRUE, or a retry would return early and never finish the job.
+        serverStopMock.mockResolvedValue(undefined);
+        await core.stop();
+        expect(serverStopMock).toHaveBeenCalledTimes(2);  // the retry actually retried
+        expect(journalStopMock).toHaveBeenCalled();       // ...and this time it completed
+    });
+
     it('enters RECOVERY mode when there is no instance identity: admin surface only, no fleet', async () => {
         configMock.identity = null;
 
@@ -224,6 +286,7 @@ describe('Core', () => {
         expect(smartMonitorStartMock).not.toHaveBeenCalled();
         expect(storageStatsStartMock).not.toHaveBeenCalled();
         expect(manifestWriteMock).not.toHaveBeenCalled();   // nothing to write without an identity
+        expect(journalStartMock).not.toHaveBeenCalled();    // no fleet to journal onto
         expect(serverStartMock).toHaveBeenCalledWith({ recovery: true });   // admin-only
     });
 

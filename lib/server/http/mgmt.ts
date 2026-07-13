@@ -9,6 +9,7 @@ import type { Grant } from '../../database/credential-repository';
 import { HttpBadRequestError, HttpNotFoundError, HttpUnauthorizedError, HttpTooManyRequestsError } from './errors';
 import { adminAuth, parseCookies, sessionSetCookie, sessionClearCookie, SESSION_COOKIE } from './admin-auth';
 import { ioManager } from '../../io/manager';
+import { journal } from '../../io/journal';
 import { deviceProvisioner } from '../../io/device-provisioner';
 import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
@@ -884,9 +885,50 @@ export class HttpMgmt {
     // (recoveryComment) are excluded (accepted loss). This forces an drain-first workflow so a drive is
     // never pulled with recoverable data still on it.
     private static async assertVolumeRemovable(id: number): Promise<void> {
+        await this.assertNotLastJournalCopy(id);
+
         const liveRefs = await database.countObjectsOnVolume(id, { excludeDead: true });
         if (liveRefs > 0)
             throw new HttpBadRequestError(`volume ${id} still holds ${liveRefs} live object slice(s); drain it first: POST /$/volumes/${id}/drain`);
+    }
+
+    // Refuse to remove a volume holding the ONLY surviving copy of a journal segment. Journal files are
+    // not object slices: the drain relocates what `content` references and knows nothing about .journal/,
+    // so nothing else stops you from pulling the last copy of the namespace's recent history. Same shape
+    // as refusing to delete a volume that still holds live slices, and for the same reason.
+    private static async assertNotLastJournalCopy(id: number): Promise<void> {
+        try {
+            await journal.assertNotLastCopy(id);
+        }
+        catch (err) {
+            throw new HttpBadRequestError(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    // Move the JOURNAL off a volume that is on its way out, and WAIT for it. The fleet-change hook fires
+    // re-election too, but fire-and-forget -- and a drain is the moment an operator starts treating a disk
+    // as removable. A draining volume is no longer writable, so re-election excludes it and copies its
+    // segments onto a replacement.
+    //
+    // A FAILURE HERE FAILS THE DRAIN. Swallowing it would let a drain "succeed" with the journal still
+    // only on the disk being pulled -- and "drain returned" is exactly what an operator reads as "safe to
+    // pull". The removal guard would still catch a formal DELETE, but not a hand on a drive tray.
+    //
+    // relocateOff() PROVES the journal left rather than assuming it: re-election resolving is not evidence
+    // (it drops a replica whose copy failed and carries on). The drain job asserts the same invariant for
+    // itself, because a resumed or auto-continued drain never passes through here.
+    private static async relocateJournalOffVolume(id: number): Promise<void> {
+        try {
+            await journal.relocateOff(id);
+        }
+        catch (err) {
+            log.error('journal relocation off volume%d failed: %s', id, err);
+            throw new HttpBadRequestError(
+                `refusing to drain volume ${id}: the namespace journal could not be relocated off it `
+                + `(${err instanceof Error ? err.message : String(err)}). Draining now would leave the journal on a `
+                + `disk you are about to remove.`
+            );
+        }
     }
 
     private static async handleVolumeDrainRequest(params: RouteParams): Promise<{ draining: boolean; volumeId: number }> {
@@ -895,6 +937,9 @@ export class HttpMgmt {
         // persist both, then start the drain. Delete stays a separate, manual step.
         await database.updateVolumeFlags(id, { isDraining: true, isReadOnly: true });
         await ioManager.updateVolumeFlags(id, { isDraining: true, isReadOnly: true });
+
+        await this.relocateJournalOffVolume(id);
+
         await drainVolumeJob.start(id);
         return { draining: true, volumeId: id };
     }
@@ -1046,10 +1091,15 @@ export class HttpMgmt {
         }
 
         // Start the drain when drain is turned on; cancel it (abort + clear state) when turned off.
-        if (updates.isDraining === true)
+        // This path starts a drain too, so it gets the same awaited journal relocation as POST /drain --
+        // otherwise it is simply a second door into the same room with no lock on it.
+        if (updates.isDraining === true) {
+            await this.relocateJournalOffVolume(id);
             await drainVolumeJob.start(id);
-        else if (updates.isDraining === false)
+        }
+        else if (updates.isDraining === false) {
             await drainVolumeJob.cancel(id);
+        }
 
         return { updated: true };
     }

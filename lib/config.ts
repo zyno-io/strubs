@@ -113,6 +113,15 @@ export class Config {
     storageStatsIntervalMs: number;
     storageStatsFlushIntervalMs: number;
 
+    // Namespace journal (DR-C): a replicated, plaintext record of {name, container, mime, md5} -- the only
+    // things the disks cannot tell us themselves. Placement is never trusted from it; a restore always
+    // re-derives that by scanning the disks.
+    journalEnabled: boolean;
+    journalReplicas: number;
+    journalFlushMs: number;
+    journalMaxBatch: number;
+    journalSegmentBytes: number;
+
     // Backstop re-write of the per-volume bootstrap manifest. Event hooks cover fleet changes; this
     // catches anything they miss, because a manifest that quietly stopped refreshing is a problem you
     // only find out about during a recovery. 0 disables.
@@ -180,6 +189,19 @@ export class Config {
         this.bootstrapManifestIntervalMs = process.env.STRUBS_BOOTSTRAP_MANIFEST_INTERVAL_MS
             ? parseInt(process.env.STRUBS_BOOTSTRAP_MANIFEST_INTERVAL_MS, 10)
             : 30 * 60 * 1000;
+        this.journalEnabled = process.env.STRUBS_JOURNAL_ENABLED !== 'false';
+        this.journalReplicas = process.env.STRUBS_JOURNAL_REPLICAS
+            ? parseInt(process.env.STRUBS_JOURNAL_REPLICAS, 10)
+            : 3;
+        this.journalFlushMs = process.env.STRUBS_JOURNAL_FLUSH_MS
+            ? parseInt(process.env.STRUBS_JOURNAL_FLUSH_MS, 10)
+            : 50;
+        this.journalMaxBatch = process.env.STRUBS_JOURNAL_MAX_BATCH
+            ? parseInt(process.env.STRUBS_JOURNAL_MAX_BATCH, 10)
+            : 256;
+        this.journalSegmentBytes = process.env.STRUBS_JOURNAL_SEGMENT_BYTES
+            ? parseInt(process.env.STRUBS_JOURNAL_SEGMENT_BYTES, 10)
+            : 64 * 1024 * 1024;
         this.verifyReadDelayMs = parseNonNegativeInt(
             process.env.STRUBS_VERIFY_READ_DELAY_MS,
             DEFAULT_VERIFY_READ_DELAY_MS

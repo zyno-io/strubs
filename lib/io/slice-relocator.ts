@@ -18,6 +18,14 @@ async function copyFile(sourceVol: Volume, targetVol: Volume, fileName: string):
             while (written < bytesRead) { const r = await dst.write(buf, written, bytesRead - written); written += r.bytesWritten; }
             pos += bytesRead;
         }
+        // FSYNC BEFORE THE COMMIT. Closing a file flushes it to the page cache and no further -- the bytes
+        // may not be on the platter at all. commitTemporaryFile() then renames it into place and makes that
+        // NAME durable, and the caller takes the whole thing as proof the slice is safely on the target:
+        // rebalance flips the object's ref to it and DELETES THE SOURCE. Lose power in that window and you
+        // are left with a perfectly durable directory entry for a slice whose contents never existed, and
+        // the only real copy already unlinked. Erasure coding can rebuild one such slice; it cannot rebuild
+        // a habit.
+        await dst.sync();
         await dst.close(); dst = undefined;
         await targetVol.commitTemporaryFile(fileName);
         return true;

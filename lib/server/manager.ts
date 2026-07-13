@@ -99,11 +99,16 @@ export class ServerManager {
             return this.stopping;
 
         this.stopping = (async () => {
+            // Drop each server from the list AS IT STOPS, not all of them at the end. If one throws, the
+            // ones that already went down must not be stopped a second time on the retry: stopping an
+            // already-closed HTTP server throws ERR_SERVER_NOT_RUNNING, and that would abort the retry
+            // before it ever reached the listener that is still up -- which is the only one that matters.
+            // What is left in `servers` after a failure is exactly what still needs stopping.
             for (const server of [...this.servers].reverse()) {
                 if (server.stop)
                     await Promise.resolve(server.stop());
+                this.servers = this.servers.filter(s => s !== server);
             }
-            this.servers = [];
         })();
 
         try {

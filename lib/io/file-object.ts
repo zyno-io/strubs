@@ -6,6 +6,7 @@ import { createLogger } from '../log';
 import { storageStatsTracker } from '../storage/stats-tracker';
 
 import { generateObjectId } from './helpers';
+import { journal } from './journal';
 import { planner } from './planner';
 import { Plan } from './plan';
 
@@ -46,6 +47,11 @@ export type FileObjectDependencies = {
     generatePlan: (size: number) => Promise<Plan>;
     createObjectRecord: (record: StoredObjectRecord) => Promise<void>;
     deleteObjectById: (id: string) => Promise<void>;
+    // AWAITED, unlike recordObjectCreated/Deleted below. Those are synchronous fire-and-forget hooks used
+    // for storage stats, and they fire AFTER the Mongo write -- too late to guarantee anything, and a void
+    // callback cannot be awaited for durability. The journal needs its own calls, in their own positions.
+    journalPut: (record: StoredObjectRecord) => Promise<void>;
+    journalDelete: (id: string) => Promise<void>;
     recordObjectCreated: (record: StoredObjectRecord) => void;
     recordObjectDeleted: (record: StoredObjectRecord) => void;
     createLogger: typeof createLogger;
@@ -56,6 +62,23 @@ const defaultDeps: FileObjectDependencies = {
     generatePlan: (size: number) => Promise.resolve(planner.generatePlan(size)),
     createObjectRecord: record => database.createObjectRecord(record),
     deleteObjectById: id => database.deleteObjectById(id),
+    journalPut: record => journal.append({
+        op: 'put',
+        ts: new Date().toISOString(),
+        id: record.id,
+        cid: record.containerId ?? null,
+        name: record.name,
+        mime: record.mime ?? null,
+        md5: record.md5 ? record.md5.toString('hex') : null,
+        size: record.size,
+        cs: record.chunkSize,
+        // Diagnostic hint ONLY. A restore must never trust these: drain and rebalance relocate slices
+        // without journaling, so a recorded placement can predate the very move that invalidated it --
+        // and rebalance deletes the source. Placement is always re-derived by scanning the disks.
+        dv: record.dataVolumes,
+        pv: record.parityVolumes
+    }),
+    journalDelete: id => journal.append({ op: 'del', ts: new Date().toISOString(), id }),
     recordObjectCreated: record => storageStatsTracker.recordCreated(record),
     recordObjectDeleted: record => storageStatsTracker.recordDeleted(record),
     createLogger
@@ -95,6 +118,10 @@ export class FileObject extends Duplex {
     private _reader: FileObjectReader | null = null;
 
     private _isPersisted = false;
+    // True once this object's `put` record is durable in the journal. Distinct from _isPersisted, which
+    // only becomes true after the Mongo insert -- and the window between the two is exactly where a
+    // half-failed create can leave a journal `put` with no object behind it. See delete().
+    private _journaledPut = false;
     private _lockPromises: ResolveablePromise[] = [];
     private _isAwaitingData = false;
     private _shouldTransmitEOR = false;
@@ -185,10 +212,27 @@ export class FileObject extends Duplex {
         if (!dbObject.mime)
             delete dbObject.mime;
 
-        await this.deps.createObjectRecord(dbObject);
-        this.deps.recordObjectCreated(dbObject);
+        // ORDER: slices committed -> JOURNAL (fsynced) -> Mongo insert.
+        //
+        // A crash between the journal and Mongo leaves the object on disk AND in the journal but not in
+        // Mongo -- the rebuild finds it, fully named. The reverse order would leave it in Mongo but not
+        // the journal, so a snapshot+journal restore would miss it entirely and it would degrade to a
+        // nameless orphan. Journal first. This is an AWAITED call for that reason: the existing
+        // recordObjectCreated hook is a synchronous fire-and-forget that runs after the insert, i.e. too
+        // late to guarantee anything, which is why it cannot be reused here.
+        await this.deps.journalPut(dbObject);
+        this._journaledPut = true;
 
+        await this.deps.createObjectRecord(dbObject);
+
+        // The row EXISTS the moment that returns, so say so BEFORE anything else can throw. Setting this
+        // after the hook below leaves a window where a failure runs the cleanup path with _isPersisted
+        // still false -- and that path unlinks the slices but skips deleteObjectById(), leaving a Mongo row
+        // pointing at nothing. That is a PHANTOM: it reads as data loss, which is the one outcome the whole
+        // ordering exists to avoid. (An orphan we can recover; a phantom just lies.)
         this._isPersisted = true;
+
+        this.deps.recordObjectCreated(dbObject);
         this._mode = null;
 
         this.logger('committed');
@@ -294,6 +338,52 @@ export class FileObject extends Duplex {
     async delete(): Promise<void> {
         this.logger('deleting object');
 
+        // ORDER: JOURNAL (fsynced) -> unlink slices -> Mongo delete.
+        //
+        // A crash after journaling but before unlinking leaves slices with no record: an ORPHAN, which
+        // lands in lost+found and is recoverable. The reverse leaves a record with no slices: a PHANTOM,
+        // which reads as data loss and will alarm you about an object that was deliberately deleted.
+        // Orphans are strictly better than phantoms, so the journal goes first -- before the destroyer,
+        // which is what actually unlinks the slice files.
+        //
+        // We journal a delete if the object is persisted OR if we already journaled its PUT. That second
+        // case is the subtle one: commit() journals before the Mongo insert, so if the insert then throws,
+        // the PUT is durable in the journal while `_isPersisted` is still false. The cleanup path would
+        // treat that as a mere aborted upload, unlink the slices, and journal nothing -- leaving a `put`
+        // record for an object with no slices and no row. A replay would faithfully restore a PHANTOM.
+        // So the compensating `del` is what makes the journal honest about a half-failed create.
+        //
+        // A genuinely aborted upload -- one that never reached the journal -- is not a namespace change
+        // and is still not journaled. There is nothing for a restore to know about.
+        if (this.id && (this._isPersisted || this._journaledPut))
+            await this.deps.journalDelete(this.id);
+
+        // ...and the Mongo row comes out BEFORE the slices, for the same reason in miniature. Unlink first
+        // and a failure in the delete below strands a row pointing at slices that are already gone -- a
+        // LIVE phantom, which reads as data loss for an object the user deliberately deleted. This way
+        // round, a failure strands slices with no row: an orphan, which is inert, recoverable, and already
+        // journaled as deleted so no replay will resurrect it. Orphans beat phantoms, all the way down.
+        if (this._isPersisted && this.id) {
+            const deletedRecord = this.toStoredObjectRecord();
+            try {
+                await this.deps.deleteObjectById(this.id);
+            }
+            catch (err) {
+                // The `del` is already durable, but the row is still there and the slices have not been
+                // touched: the object is still LIVE, and the caller is about to be told the delete FAILED.
+                // Left like this the journal's last word on the object is "deleted" -- so a rebuild from the
+                // platters would honour it and drop the name of an object that still exists, quietly turning
+                // it into a nameless orphan. Put the name back. The journal has to agree with reality, and
+                // reality is that this object is still here.
+                await this.deps.journalPut(deletedRecord).catch(compensationErr =>
+                    this.logger.error('JOURNAL INCONSISTENT: object %s is journaled as DELETED but its Mongo delete '
+                        + 'failed AND the compensating put could not be written (%s). A rebuild from the platters '
+                        + 'would lose its name.', this.id, compensationErr));
+                throw err;
+            }
+            this.deps.recordObjectDeleted(deletedRecord);
+        }
+
         if (this._mode === 'write' && this._writer) {
             await this._writer.abort();
         }
@@ -302,14 +392,9 @@ export class FileObject extends Duplex {
             await destroyer.destroy();
         }
 
-        if (this._isPersisted && this.id) {
-            const deletedRecord = this.toStoredObjectRecord();
-            await this.deps.deleteObjectById(this.id);
-            this.deps.recordObjectDeleted(deletedRecord);
-        }
-
         this._mode = null;
         this._isPersisted = false;
+        this._journaledPut = false;
 
         this.logger('deleted object');
         this._hasVolumeReservations = false;

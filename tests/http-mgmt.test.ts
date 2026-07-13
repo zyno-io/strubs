@@ -126,6 +126,31 @@ vi.mock('../lib/io/volume-smart-monitor', () => ({
     volumeSmartMonitor: volumeSmartMonitorMock
 }));
 
+// A REAL Journal, wired to a fake fleet -- so relocateOff()'s postcondition check (the thing under test)
+// runs its real logic. Only onFleetChange is stubbed, because re-election is what we want to lie about:
+// resolving while leaving the journal exactly where it was is precisely the failure the guard exists for.
+const { journalFleetChangeMock, journalState } = vi.hoisted(() => ({
+    journalFleetChangeMock: vi.fn().mockResolvedValue(undefined),
+    journalState: { replicaVolumeIds: [] as number[] }
+}));
+vi.mock('../lib/io/journal', async importOriginal => {
+    const actual = await importOriginal<typeof import('../lib/io/journal')>();
+    // A fleet of MOUNTED volumes whose mount points hold no journal at all. That is the ordinary case for
+    // these tests (they are about the mgmt routes, not the journal), and it keeps the real guard logic
+    // running rather than stubbing it: an unmounted volume it cannot read would be REFUSED, which is a
+    // different test.
+    const real = new actual.Journal({
+        getWritableVolumes: () => [],
+        getFleetVolumes: () => [3, 7, 9, 11, 15].map(id => ({
+            id, mountPoint: `/tmp/strubs-mgmt-test-no-journal-${id}`, isDeleted: false, isMounted: true
+        }))
+    });
+    real.onFleetChange = journalFleetChangeMock;
+    // An OWN property, to shadow the prototype getter (Object.assign would just throw on it).
+    Object.defineProperty(real, 'replicaVolumeIds', { get: () => journalState.replicaVolumeIds });
+    return { ...actual, journal: real };
+});
+
 let HttpMgmt: typeof import('../lib/server/http/mgmt').HttpMgmt;
 let HttpNotFoundError: typeof import('../lib/server/http/errors').HttpNotFoundError;
 let HttpBadRequestError: typeof import('../lib/server/http/errors').HttpBadRequestError;
@@ -1120,6 +1145,47 @@ describe('HttpMgmt.handle', () => {
         expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(7, { isDraining: true, isReadOnly: true });
         expect(ioManagerMock.updateVolumeFlags).toHaveBeenCalledWith(7, { isDraining: true, isReadOnly: true });
         expect(drainStartMock).toHaveBeenCalledWith(7);
+    });
+
+    // "The drain returned" is what an operator reads as "safe to pull the drive". So the drain has to
+    // PROVE the journal left, not merely ask it to.
+    describe('the drain will not start until the journal has actually moved off the volume', () => {
+        beforeEach(() => {
+            journalState.replicaVolumeIds = [];
+            journalFleetChangeMock.mockClear();
+            journalFleetChangeMock.mockResolvedValue(undefined);
+            drainStartMock.mockClear();
+            databaseUpdateFlagsMock.mockResolvedValue(undefined);
+            ioManagerMock.updateVolumeFlags.mockResolvedValue(undefined);
+        });
+
+        it('refuses when re-election RESOLVED but left the journal on the volume', async () => {
+            // Re-election does not adopt a replica whose segment copy failed -- it logs and carries on with
+            // one fewer. So onFleetChange resolving is not proof of anything: the journal can still be
+            // sitting on the disk the operator is about to pull.
+            journalState.replicaVolumeIds = [7, 9];
+
+            const req = createRequest('POST', '/$/volumes/7/drain');
+            await expect(HttpMgmt.handle(17, req, nullResponse)).rejects.toThrow(/still replicated on volume 7/);
+            expect(journalFleetChangeMock).toHaveBeenCalled();
+            expect(drainStartMock).not.toHaveBeenCalled();
+        });
+
+        it('refuses when re-election itself failed', async () => {
+            journalFleetChangeMock.mockRejectedValue(new Error('no writable volume left to adopt'));
+
+            const req = createRequest('POST', '/$/volumes/7/drain');
+            await expect(HttpMgmt.handle(17, req, nullResponse)).rejects.toThrow(/could not be relocated off it/);
+            expect(drainStartMock).not.toHaveBeenCalled();
+        });
+
+        it('starts the drain once the journal is demonstrably elsewhere', async () => {
+            journalState.replicaVolumeIds = [9, 11];
+
+            const req = createRequest('POST', '/$/volumes/7/drain');
+            await expect(HttpMgmt.handle(17, req, nullResponse)).resolves.toEqual({ draining: true, volumeId: 7 });
+            expect(drainStartMock).toHaveBeenCalledWith(7);
+        });
     });
 
     it('starts a rebalance via POST /$/rebalance with options', async () => {

@@ -15,6 +15,7 @@ import { systemLogWatcher } from './io/system-log-watcher';
 import { volumeHealthMonitor } from './io/volume-health-monitor';
 import { deviceReconciler } from './io/device-reconciler';
 import { bootstrapManifestWriter } from './io/bootstrap-manifest';
+import { journal } from './io/journal';
 import { configureNotifications } from './notify/bootstrap';
 import { remediationService } from './remediation/service';
 import { repairWorker } from './remediation/repair-worker';
@@ -82,6 +83,10 @@ export class Core {
             }
 
             await ioManager.init();
+            // The journal must be up BEFORE the object API accepts a write: a PUT that lands before the
+            // journal is running is a namespace change nobody recorded.
+            await journal.start();
+            bootstrapManifestWriter.setJournalVolumeIds(journal.replicaVolumeIds);
             // The fleet is up: refresh the bootstrap manifest on every writable volume. Fire-and-forget --
             // a manifest write must never delay or fail startup -- plus a periodic backstop so a manifest
             // can never silently stop refreshing (which you'd only discover during a recovery).
@@ -150,6 +155,29 @@ export class Core {
         this.stopPromise = (async () => {
             let stopError: unknown = null;
 
+            // THE SERVERS GO DOWN FIRST -- before the journal, and before ANY other teardown.
+            //
+            // Everything below this line dismantles machinery that a live listener depends on: the journal
+            // it must write to, the volumes it reads from, the workers that keep them honest. None of it may
+            // run until we have PROVEN that nothing is listening. Stopping the journal while a listener is
+            // still up is the worst of them -- append() becomes a no-op, so a PUT in that window commits to
+            // Mongo with no journal record, which is exactly the unjournaled namespace change this whole
+            // phase exists to prevent.
+            //
+            // So if the servers do not stop, we ABORT the shutdown with the system still WHOLE: background
+            // jobs still running, journal still armed, disks still mounted, `started` still true so a second
+            // stop() is a real retry rather than an early return. We flush what is queued (those records are
+            // already acknowledged) and hand the problem back to the caller.
+            try {
+                await this.deps.serverManager.stop();
+            }
+            catch (err) {
+                log.error('server stop FAILED: ABORTING shutdown with everything still up -- a listener may '
+                    + 'still be accepting writes, so nothing it depends on may be torn down', err);
+                await journal.flush().catch(flushErr => log.error('journal flush during failed shutdown failed', flushErr));
+                throw err;
+            }
+
             verifyScheduler.stop();
             systemLogWatcher.stop();
             repairWorker.stop();
@@ -157,12 +185,8 @@ export class Core {
             volumeHealthMonitor.stop();
             deviceReconciler.stop();
 
-            try {
-                await this.deps.serverManager.stop();
-            }
-            catch (err) {
-                stopError = err;
-            }
+            // Nothing can accept a write now: flush what is queued and close the segments.
+            await journal.stop().catch(err => log.error('journal stop failed', err));
 
             try {
                 await storageStatsTracker.stop();

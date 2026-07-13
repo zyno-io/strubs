@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ObjectId } from 'mongodb';
 
 import { ContentRepository } from '../lib/database/content-repository';
@@ -143,6 +143,62 @@ describe('bucketId denormalisation', () => {
     beforeEach(() => {
         collection = new FakeContentCollection();
         repo = new ContentRepository(collection as any, new ContainerCache(), normalize as any, toMongoId);
+    });
+
+    // A container's name exists NOWHERE on disk -- the slice headers know nothing about it -- so an
+    // unjournaled container turns every object beneath it into an orphan. One lost row costs a subtree.
+    describe('container journaling', () => {
+        it('journals a new container BEFORE its Mongo insert, and parent-first down the chain', async () => {
+            const order: string[] = [];
+            const journalContainer = vi.fn(async (rec: { name: string }) => { order.push(`journal:${rec.name}`); });
+
+            const c = new FakeContentCollection();
+            const original = c.insertOne.bind(c);
+            c.insertOne = async (doc: any) => { order.push(`insert:${doc.name}`); return original(doc); };
+
+            const r = new ContentRepository(c as any, new ContainerCache(), normalize as any, toMongoId, journalContainer);
+            await r.resolveContainerWithBucket('photo/2024/spain', true);
+
+            // Each container is journaled before it is inserted, and a parent is fully durable before its
+            // child is journaled -- so a replay can never meet an object whose container it has not seen.
+            expect(order).toEqual([
+                'journal:photo', 'insert:photo',
+                'journal:2024', 'insert:2024',
+                'journal:spain', 'insert:spain'
+            ]);
+        });
+
+        // The same post-journal/pre-Mongo hole that a half-failed object PUT has. The container record is
+        // durable in the journal, then the insert throws -- and a replay would faithfully restore a
+        // container that never existed.
+        it('compensates a container whose journal record is durable but whose Mongo insert failed', async () => {
+            const order: string[] = [];
+            const journalContainer = vi.fn(async (rec: { name: string }) => { order.push(`journal:${rec.name}`); });
+            const journalRemove = vi.fn(async (id: string) => { order.push(`journal:del:${id.slice(0, 4)}`); });
+
+            const c = new FakeContentCollection();
+            c.insertOne = async () => { order.push('insert:throws'); throw new Error('mongo is down'); };
+
+            const r = new ContentRepository(c as any, new ContainerCache(), normalize as any, toMongoId, journalContainer, journalRemove);
+            await expect(r.resolveContainerWithBucket('photo', true)).rejects.toThrow('mongo is down');
+
+            expect(order[0]).toBe('journal:photo');
+            expect(order[1]).toBe('insert:throws');
+            expect(order[2]).toMatch(/^journal:del:/);      // compensated, so no phantom container on replay
+            expect(journalRemove).toHaveBeenCalledTimes(1);
+        });
+
+        it('does not journal a container that already exists', async () => {
+            const journalContainer = vi.fn(async () => undefined);
+            const r = new ContentRepository(collection as any, new ContainerCache(), normalize as any, toMongoId, journalContainer);
+
+            await r.resolveContainerWithBucket('photo', true);
+            expect(journalContainer).toHaveBeenCalledTimes(1);
+
+            journalContainer.mockClear();
+            await r.resolveContainerWithBucket('photo', true);      // second walk: already there
+            expect(journalContainer).not.toHaveBeenCalled();
+        });
     });
 
     describe('resolveContainerWithBucket at creation time', () => {

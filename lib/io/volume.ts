@@ -7,7 +7,7 @@ import type { FileHandle } from 'fs/promises';
 
 import { createLogger } from '../log';
 import { config } from '../config';
-import { formatBytes, mount as mountVolume, unmount as unmountVolume } from './helpers';
+import { ensureDirectoryDurable, formatBytes, fsyncDirectory, mount as mountVolume, unmount as unmountVolume } from './helpers';
 import { buildVolumeIdentityBuffer } from './volume-identity';
 import { ensureExtFilesystemHealthy } from './filesystem-check';
 import type { CachedDevice, CachedPartition } from './device-discovery';
@@ -387,12 +387,24 @@ export class Volume extends EventEmitter {
             identityBuffer: config.identityBuffer
         });
 
-        try {
-            await fsp.mkdir(this.mountPoint + '/strubs');
-        }
-        catch (err) {}
+        // .identity is what makes this disk OURS. Without it the volume is rejected at startup ("not from
+        // this STRUBS instance") and every slice on it becomes unreadable until an operator intervenes --
+        // and the device probe, which fails closed, will not call it clean either. So it cannot be written
+        // and merely hoped about: a power cut here would otherwise leave a disk that is full of our data
+        // and cannot prove it. Both the file and the directory entry that names it go to the platter before
+        // provisioning is allowed to report success.
+        const strubsDir = this.mountPoint + '/strubs';
+        await ensureDirectoryDurable(strubsDir);
 
-        await fsp.writeFile(this.mountPoint + '/strubs/.identity', identityBuf);
+        const fh = await fsp.open(strubsDir + '/.identity', 'w');
+        try {
+            await fh.write(identityBuf);
+            await fh.sync();
+        }
+        finally {
+            await fh.close();
+        }
+        await fsyncDirectory(strubsDir);
 
         return identityBuf;
     }
@@ -510,15 +522,26 @@ export class Volume extends EventEmitter {
         const dstFolder = this.resolveSliceDirectory(fileName);
         const dstPath = dstFolder + '/' + fileName;
 
-        try {
-            await fsp.mkdir(dstFolder, { recursive: true });
-        }
-        catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== 'EEXIST')
-                throw err;
-        }
+        // The shard directory must be DURABLE before the slice is renamed into it -- and shared, so that a
+        // second object landing in the same brand-new shard waits for those fsyncs rather than assuming
+        // them (see ensureDirectoryDurable). In the steady state the shard already exists and this is a
+        // single mkdir syscall.
+        await ensureDirectoryDurable(dstFolder);
 
         await fsp.rename(srcPath, dstPath);
+
+        // The bytes were fsynced before we got here. The NAME was not.
+        //
+        // An fsync on a file says nothing about the directory entry that points at it, so without this the
+        // slice can vanish whole on a power cut -- while the namespace journal and Mongo, which are written
+        // AFTER this call returns and are told by it that the slices are safe, both still swear the object
+        // exists. That is a PHANTOM: an object that reads as data loss because its data was never really
+        // there. It is the exact failure the whole write ordering is built to prevent, and it would be
+        // handed to us by the one event the journal exists for.
+        //
+        // The six slices of an object commit in parallel on six different disks, so this costs about one
+        // directory fsync of latency per PUT, not six.
+        await fsyncDirectory(dstFolder);
     }
 
     async deleteTemporaryFile(fileName: string): Promise<void> {

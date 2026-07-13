@@ -84,7 +84,17 @@ export class Database {
                     this._collections.content,
                     this._containerCache,
                     this._normalizeObject.bind(this),
-                    this.getMongoId.bind(this)
+                    this.getMongoId.bind(this),
+                    // Lazily resolved: the journal lives in the io layer and reaches back for the fleet's
+                    // mount points, so importing it at module scope here would close a cycle.
+                    async record => {
+                        const { journal } = require('./io/journal') as typeof import('./io/journal');
+                        await journal.append({ op: 'container', ts: new Date().toISOString(), ...record });
+                    },
+                    async id => {
+                        const { journal } = require('./io/journal') as typeof import('./io/journal');
+                        await journal.append({ op: 'del', ts: new Date().toISOString(), id });
+                    }
                 ),
                 runtimeConfig: new RuntimeConfigRepository(this._collections.runtimeConfig),
                 faults: new FaultRepository(this._collections.faults),

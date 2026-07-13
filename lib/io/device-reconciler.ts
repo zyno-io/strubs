@@ -127,6 +127,13 @@ export class DeviceReconciler {
                 this.log('reconcile (%s) produced %d transition(s)', reason, transitions.length);
             for (const transition of transitions)
                 await this.handleTransition(transition);
+
+            // A disk PHYSICALLY appearing or disappearing is a fleet change too, and it does not pass
+            // through ioManager.updateVolumeFlags -- so it would otherwise miss the journal's re-election
+            // and the manifest refresh entirely. Pulling a journal disk is exactly the case that matters:
+            // nothing else would notice the replica had gone.
+            if (transitions.length)
+                await this.refreshRecoveryArtifacts();
         }
         catch (err) {
             this.log.error('device reconcile (%s) failed: %s', reason, err instanceof Error ? err.message : String(err));
@@ -137,6 +144,23 @@ export class DeviceReconciler {
                 this.queued = false;
                 setImmediate(() => void this.reconcile('coalesced'));
             }
+        }
+    }
+
+    // Keep the recovery artifacts in step with a fleet that changed by itself. Lazily required: the
+    // journal reaches back into the io layer for mount points, so a top-level import closes a cycle.
+    private async refreshRecoveryArtifacts(): Promise<void> {
+        try {
+            const { journal } = require('./journal') as typeof import('./journal');
+            const { bootstrapManifestWriter } = require('./bootstrap-manifest') as typeof import('./bootstrap-manifest');
+            await journal.onFleetChange();
+            bootstrapManifestWriter.setJournalVolumeIds(journal.replicaVolumeIds);
+            await bootstrapManifestWriter.write();
+        }
+        catch (err) {
+            // A reconcile pass must never fail because a recovery artifact could not be refreshed; the
+            // periodic manifest backstop will retry.
+            this.log.error('failed to refresh recovery artifacts after reconcile: %s', err instanceof Error ? err.message : String(err));
         }
     }
 

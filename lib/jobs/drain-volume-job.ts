@@ -39,6 +39,12 @@ type DrainVolumeJobDeps = {
     recordRelocated: (fromVolumeId: number, toVolumeId: number, size: number, sliceSize: number, isParity: boolean) => void;
     runtimeConfig: typeof runtimeConfig;
     isFrozen: () => Promise<boolean>;
+    // Move the namespace journal off the volume and PROVE it left. THROWS if it did not. The drain job
+    // relocates the slices that `content` references and knows nothing about .journal/, so without this
+    // a drain would happily run to completion -- and report the drive drained -- with the only copy of the
+    // namespace history still on it. The HTTP drain endpoint calls this too, but a RESUMED or
+    // AUTO-CONTINUED drain never goes through the endpoint, so the invariant lives here as well.
+    relocateJournalOff: (volumeId: number) => Promise<void>;
     createLogger: typeof createLogger;
     concurrency: number;
     delayMs: number;
@@ -74,6 +80,10 @@ const defaultDeps: DrainVolumeJobDeps = {
     },
     runtimeConfig,
     isFrozen: isMaintenanceFrozen,
+    relocateJournalOff: async (volumeId: number) => {
+        const { journal } = require('../io/journal') as typeof import('../io/journal');
+        await journal.relocateOff(volumeId);
+    },
     createLogger,
     concurrency: config.drainConcurrency,
     delayMs: config.verifyReadDelayMs
@@ -91,6 +101,9 @@ export class DrainVolumeJob {
     private readonly deps: DrainVolumeJobDeps;
     private readonly log: ReturnType<typeof createLogger>;
     private running = false;
+    // The volume a start() is mid-way through claiming: set before its persisted writes, cleared once
+    // run() can take over. Closes the window where two starts could both think they were first.
+    private claiming: number | null = null;
     private cancelled = false; // paused (freeze) — persisted state kept so it resumes
     private aborted = false;   // operator cancel — persisted state cleared so it does NOT resume
     private activeVolumeId: number | null = null;
@@ -108,14 +121,26 @@ export class DrainVolumeJob {
 
     // Begin (or restart) draining a volume. Idempotent while a drain for the same volume is running.
     async start(volumeId: number): Promise<void> {
-        if (this.running) {
+        // `claiming` covers the AWAIT WINDOW below. run() claims `running` synchronously, but it is not
+        // reached until after the two persisted writes -- so without this, two concurrent start()s both see
+        // running=false, both write drainVolumeId, and the loser's id is what ends up persisted while the
+        // winner's drain is the one actually running. A restart would then resume the wrong volume.
+        if (this.running || this.claiming) {
             if (this.activeVolumeId === volumeId)
                 return;
-            this.log('cannot drain volume %d: a drain of volume %d is already running', volumeId, this.activeVolumeId);
+            this.log('cannot drain volume %d: a drain of volume %d is already starting or running',
+                volumeId, this.activeVolumeId ?? this.claiming);
             return;
         }
-        await this.deps.runtimeConfig.set(DRAIN_VOLUME_ID_KEY, volumeId);
-        await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
+
+        this.claiming = volumeId;
+        try {
+            await this.deps.runtimeConfig.set(DRAIN_VOLUME_ID_KEY, volumeId);
+            await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
+        }
+        finally {
+            this.claiming = null;
+        }
         void this.run(volumeId, undefined);
     }
 
@@ -162,11 +187,46 @@ export class DrainVolumeJob {
     private async run(volumeId: number, afterId: string | undefined): Promise<void> {
         if (this.running)
             return;
+
+        // CLAIM THE SINGLETON FIRST, before any await. The journal relocation below yields (it copies
+        // segments between disks), and start() fires run() without awaiting it -- so leaving the claim until
+        // after the relocation lets a second start/resume walk straight in behind the first and share
+        // activeVolumeId, the cancel flags and the persisted cursor with it.
         this.running = true;
         this.cancelled = false;
         this.aborted = false;
         this.activeVolumeId = volumeId;
+        // Recorded even if the relocation refuses below: auto-continue skips volumes already attempted this
+        // run, and without this a volume the journal cannot leave would be picked again and again, starving
+        // every other queued drain behind it.
         this.attemptedVolumeIds.add(volumeId);
+
+        // BEFORE a single slice moves: get the namespace journal off this disk, and prove it left.
+        //
+        // The drain walks `content` and relocates what it references. It has never heard of .journal/, so
+        // it will finish, report the volume drained, and leave the only copy of the namespace's recent
+        // history sitting on a drive the operator is now holding in their hand. Refusing to start is the
+        // right failure: nothing has moved yet, the volume stays flagged, and the persisted state is left
+        // alone so a retry resumes cleanly once there is somewhere for the journal to go.
+        //
+        // This is enforced HERE rather than at the callers because run() is the one thing every path goes
+        // through -- the HTTP endpoint, a resume after restart, and auto-continuing to the next queued
+        // volume. The endpoint checks it too, so an operator gets the failure in their response instead of
+        // only in the log.
+        try {
+            await this.deps.relocateJournalOff(volumeId);
+        }
+        catch (err) {
+            this.log('REFUSING to drain volume %d: %s', volumeId, err instanceof Error ? err.message : String(err));
+            this.running = false;
+            this.activeVolumeId = null;
+            // The volume keeps its isDraining flag, so it is not forgotten -- but it must not STARVE the
+            // volumes queued behind it. A disk the journal cannot be moved off could sit at the head of the
+            // queue indefinitely, and everything else the operator asked to drain would simply never happen.
+            // Move on; this one keeps its flag and gets picked up again on a later run.
+            await this.continueToNextFlagged(volumeId);
+            return;
+        }
         const s: DrainSummary = { objects: 0, relocated: 0, unrecoverable: 0, skippedDead: new Set(), noDest: 0, duplicateRefs: new Set() };
         this.log('draining volume %d — reconstructing and relocating its slices', volumeId);
         let completed = false;    // the drain loop ran to its natural end (not paused/aborted/frozen)
@@ -232,17 +292,27 @@ export class DrainVolumeJob {
         // Auto-continue: if this drain finished cleanly and other volumes are still flagged for draining
         // (e.g. the operator queued several), pick up the next one so they don't have to babysit it.
         // The just-completed volume has had isDraining cleared, so it won't be re-selected.
-        if (completed && !this.cancelled && !this.aborted && !(await this.deps.isFrozen())) {
-            // Skip any volume already attempted this run: a stuck volume keeps isDraining=true (so it
-            // still blocks its own removal) and would otherwise be re-selected here forever.
-            const next = this.deps.getDrainingVolumeIds().find(id => id !== volumeId && !this.attemptedVolumeIds.has(id));
-            if (typeof next === 'number') {
-                this.log('drain of volume %d complete; auto-continuing to next flagged volume %d', volumeId, next);
-                await this.deps.runtimeConfig.set(DRAIN_VOLUME_ID_KEY, next);
-                await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
-                await this.run(next, undefined);
-            }
-        }
+        if (completed && !this.cancelled && !this.aborted)
+            await this.continueToNextFlagged(volumeId);
+    }
+
+    // Move on to the next volume the operator has flagged for draining. Called both when a drain FINISHES
+    // and when one is REFUSED, because a queue that stops dead at its first stuck volume is not a queue.
+    private async continueToNextFlagged(afterVolumeId: number): Promise<void> {
+        if (this.cancelled || this.aborted || await this.deps.isFrozen())
+            return;
+
+        // Skip any volume already attempted this run: one that cannot be drained keeps isDraining=true (so
+        // it still blocks its own removal) and would otherwise be re-selected here forever.
+        const next = this.deps.getDrainingVolumeIds()
+            .find(id => id !== afterVolumeId && !this.attemptedVolumeIds.has(id));
+        if (typeof next !== 'number')
+            return;
+
+        this.log('continuing to the next volume flagged for draining: volume %d', next);
+        await this.deps.runtimeConfig.set(DRAIN_VOLUME_ID_KEY, next);
+        await this.deps.runtimeConfig.delete(DRAIN_CURSOR_ID_KEY);
+        await this.run(next, undefined);
     }
 
     private async processBatch(batch: ContentDocument[], volumeId: number, s: DrainSummary): Promise<void> {

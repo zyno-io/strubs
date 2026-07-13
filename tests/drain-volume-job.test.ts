@@ -38,6 +38,7 @@ const makeJob = (overrides?: any) => {
         recordRelocated: vi.fn(),
         runtimeConfig: { get: vi.fn(), set: vi.fn(), delete: vi.fn() },
         isFrozen: vi.fn().mockResolvedValue(false),
+        relocateJournalOff: vi.fn().mockResolvedValue(undefined),
         createLogger: loggerFactory(),
         concurrency: 4,
         delayMs: 0,
@@ -181,6 +182,124 @@ describe('DrainVolumeJob', () => {
         await runDrain(job, 5);
         expect(deps.markDrainComplete).toHaveBeenCalledTimes(1);
         expect(deps.markDrainComplete).toHaveBeenCalledWith(5);
+    });
+
+    // The drain relocates the slices `content` references. It has never heard of .journal/, so left to
+    // itself it will finish, report the volume drained, and leave the only copy of the namespace history
+    // on a drive the operator is now holding. The invariant lives in run() rather than at the HTTP
+    // endpoint precisely because a RESUMED or AUTO-CONTINUED drain never goes through the endpoint.
+    describe('will not move a single slice until the journal is off the volume', () => {
+        it('refuses to start when the journal could not be relocated', async () => {
+            const { job, deps } = makeJob({
+                relocateJournalOff: vi.fn().mockRejectedValue(
+                    new Error('volume 5 holds the only complete copy of 2 journal segment(s)'))
+            });
+
+            await runDrain(job, 5);
+
+            expect(deps.relocateJournalOff).toHaveBeenCalledWith(5);
+            expect(deps.deleteSlice).not.toHaveBeenCalled();          // nothing moved...
+            expect(deps.markDrainComplete).not.toHaveBeenCalled();    // ...and it never reports "drained"
+            expect(deps.runtimeConfig.delete).not.toHaveBeenCalled(); // state kept, so a retry resumes
+        });
+
+        it('enforces it on a RESUMED drain, which never passes through the HTTP endpoint', async () => {
+            const relocateJournalOff = vi.fn().mockRejectedValue(new Error('nowhere to put the journal'));
+            const { job, deps } = makeJob({ relocateJournalOff });
+            deps.runtimeConfig.get = vi.fn(async (key: string) => (key === 'drainVolumeId' ? 5 : undefined)) as never;
+
+            await job.resumePendingJob();
+            await new Promise(r => setImmediate(r));   // run() is kicked off with void
+
+            expect(relocateJournalOff).toHaveBeenCalledWith(5);
+            expect(deps.deleteSlice).not.toHaveBeenCalled();
+            expect(deps.markDrainComplete).not.toHaveBeenCalled();
+        });
+
+        // The relocation copies segments between disks, so it YIELDS -- and start() fires run() without
+        // awaiting it. If the singleton claim waited for the relocation to finish, a second start could
+        // walk in behind the first and the two drains would share activeVolumeId, the cancel flags and the
+        // persisted cursor.
+        it('claims the singleton BEFORE the relocation, so a second start cannot slip in behind it', async () => {
+            let release!: () => void;
+            const relocateJournalOff = vi.fn(() => new Promise<void>(r => { release = r; }));
+            const { job, deps } = makeJob({ relocateJournalOff });
+
+            void job.start(5);
+            await new Promise(r => setImmediate(r));      // parked inside the relocation
+            void job.start(9);                            // a second drain tries to start
+            await new Promise(r => setImmediate(r));
+
+            expect(relocateJournalOff).toHaveBeenCalledTimes(1);       // the second never got in
+            expect(relocateJournalOff).toHaveBeenCalledWith(5);
+            release();
+            await new Promise(r => setImmediate(r));
+            expect(deps.markDrainComplete).not.toHaveBeenCalledWith(9);
+        });
+
+        it('does not let an unrelocatable volume starve the drains queued behind it', async () => {
+            const draining = new Set([5, 8]);
+            // Volume 5 can NEVER release the journal. Without recording it as attempted, auto-continue
+            // would pick it again every time volume 8 finishes, and nothing else would ever drain.
+            const relocateJournalOff = vi.fn(async (id: number) => {
+                if (id === 5) throw new Error('volume 5 holds the only complete copy of 1 journal segment(s)');
+            });
+            const { job, deps } = makeJob({
+                getDrainingVolumeIds: vi.fn(() => [...draining]),
+                markDrainComplete: vi.fn(async (id: number) => { draining.delete(id); }),
+                relocateJournalOff
+            });
+
+            await runDrain(job, 8);                       // 8 drains fine; auto-continue then reaches for 5
+
+            expect(relocateJournalOff).toHaveBeenCalledWith(5);
+            expect(deps.markDrainComplete).toHaveBeenCalledWith(8);
+            expect(deps.markDrainComplete).not.toHaveBeenCalledWith(5);
+            // Attempted exactly once -- it is not retried in a loop within this run.
+            expect(relocateJournalOff.mock.calls.filter(([id]) => id === 5)).toHaveLength(1);
+        });
+
+        // ...and the same starvation the other way round: the STUCK volume at the HEAD of the queue. A
+        // refusal used to return before the auto-continue, so a disk the journal could not leave sat at the
+        // front of the line indefinitely and everything the operator had queued behind it simply never ran.
+        it('moves on to the queued volumes when the FIRST one cannot release the journal', async () => {
+            const draining = new Set([5, 8]);
+            const relocateJournalOff = vi.fn(async (id: number) => {
+                if (id === 5) throw new Error('volume 5 holds the only complete copy of 1 journal segment(s)');
+            });
+            const { job, deps } = makeJob({
+                getDrainingVolumeIds: vi.fn(() => [...draining]),
+                markDrainComplete: vi.fn(async (id: number) => { draining.delete(id); }),
+                relocateJournalOff
+            });
+
+            await runDrain(job, 5);                       // the stuck one goes FIRST
+
+            expect(relocateJournalOff).toHaveBeenCalledWith(5);
+            expect(deps.markDrainComplete).not.toHaveBeenCalledWith(5);   // refused, as it must be
+            // ...but volume 8, queued behind it, still gets drained rather than waiting forever.
+            expect(relocateJournalOff).toHaveBeenCalledWith(8);
+            expect(deps.markDrainComplete).toHaveBeenCalledWith(8);
+        });
+
+        it('enforces it on the AUTO-CONTINUED volume, not just the first one', async () => {
+            const draining = new Set([5, 8]);
+            // Volume 5 is fine; volume 8 still carries the journal.
+            const relocateJournalOff = vi.fn(async (id: number) => {
+                if (id === 8) throw new Error('volume 8 holds the only complete copy of 1 journal segment(s)');
+            });
+            const { job, deps } = makeJob({
+                getDrainingVolumeIds: vi.fn(() => [...draining]),
+                markDrainComplete: vi.fn(async (id: number) => { draining.delete(id); }),
+                relocateJournalOff
+            });
+
+            await runDrain(job, 5);
+
+            expect(relocateJournalOff).toHaveBeenCalledWith(8);
+            expect(deps.markDrainComplete).toHaveBeenCalledWith(5);
+            expect(deps.markDrainComplete).not.toHaveBeenCalledWith(8);   // refused, not silently drained
+        });
     });
 
     it('cancel() clears persisted drain state so it does not resume', async () => {
