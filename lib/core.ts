@@ -18,6 +18,8 @@ import { bootstrapManifestWriter } from './io/bootstrap-manifest';
 import { journal } from './io/journal';
 import { snapshotJob } from './jobs/snapshot-job';
 import { configureNotifications } from './notify/bootstrap';
+import { notificationService } from './notify/service';
+import { ensureKeyfile } from './io/luks';
 import { remediationService } from './remediation/service';
 import { repairWorker } from './remediation/repair-worker';
 import { storageStatsTracker } from './storage/stats-tracker';
@@ -54,6 +56,30 @@ export class Core {
         this.deps = { ...defaultDeps, ...deps } as CoreDependencies;
     }
 
+    // Best-effort and never fatal: an array with no encrypted disks and no keyfile is just an array that has
+    // never used encryption, and it must start regardless. What must NOT happen quietly is the other case.
+    private async ensureLuksKeyfile(): Promise<void> {
+        try {
+            const result = await ensureKeyfile();
+
+            if (result.state === 'missing-but-disks-are-encrypted')
+                void notificationService.notify({
+                    severity: 'critical',
+                    title: 'THE LUKS KEYFILE IS MISSING AND THIS ARRAY HAS ENCRYPTED DISKS',
+                    body: `The keyfile is gone but ${result.disks.length} encrypted disk(s) are attached `
+                        + `(${result.disks.join(', ')}). This is what a LOST key looks like -- most likely the OS `
+                        + `disk was restored, or /var/lib/strubs was wiped. STRUBS has NOT generated a new one: a `
+                        + `fresh key opens none of those disks. Those volumes will not unlock. Restore the keyfile `
+                        + `from backup, or recover using the fleet recovery passphrase, which writes a new keyfile `
+                        + `slot onto every disk.`
+                });
+        }
+        catch (err) {
+            log.error('could not establish the LUKS keyfile: %s. Encryption will refuse to run until this is '
+                + 'resolved; the rest of the array is unaffected.', err);
+        }
+    }
+
     async start(): Promise<void> {
         if (this.started)
             return;
@@ -69,6 +95,12 @@ export class Core {
             await this.createRunDirectory();
             await database.connect();
             await remediationService.hydrate();
+
+            // The LUKS keyfile: made for the operator if the array has nothing encrypted, and REFUSED -- loudly
+            // -- if it is missing while encrypted disks are in the rack, because that is not a new array, it is
+            // an array whose key has been lost. See luks.ensureKeyfile(): a fresh key opens none of those disks,
+            // and generating one would leave a system that looks healthy and cannot read a byte.
+            await this.ensureLuksKeyfile();
 
             // No instance identity => this host cannot verify a single disk. Starting the fleet would
             // reject every volume ("not from this STRUBS instance"), and starting the object API would

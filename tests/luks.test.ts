@@ -8,7 +8,8 @@ vi.mock('fs', () => ({
         realpath: vi.fn(),
         readdir: vi.fn(),
         access: vi.fn(),
-        open: vi.fn()
+        open: vi.fn(),
+        mkdir: vi.fn()
     }
 }));
 
@@ -19,6 +20,7 @@ const statMock = vi.mocked(fsp.stat);
 const realpathMock = vi.mocked(fsp.realpath);
 const readdirMock = vi.mocked(fsp.readdir);
 const openMock = vi.mocked(fsp.open);
+const mkdirMock = vi.mocked(fsp.mkdir);
 
 import {
     absentVolumeIds,
@@ -35,6 +37,7 @@ import {
 import {
     addPassphrase,
     assertRecoverable,
+    ensureKeyfile,
     ensureKeyfileSlot,
     findEncryptedPartitions,
     testPassphrase,
@@ -155,6 +158,7 @@ describe('luks', () => {
         realpathMock.mockReset();
         readdirMock.mockReset();
         openMock.mockReset();
+        mkdirMock.mockReset();
         mapperExists = false;   // default: no mapper open yet
         stubFs();
     });
@@ -313,6 +317,61 @@ describe('luks', () => {
 
             spawnHelper.mockResolvedValueOnce({ code: 4, stdout: 'Device /dev/sdf1 does not exist' });
             expect(await testPassphrase('/dev/sdf1', 'x')).toBe('unreadable');
+        });
+    });
+
+    // ⚠️ A MISSING KEYFILE IS NOT ALWAYS A NEW ARRAY. IT IS ALSO WHAT A LOST ONE LOOKS LIKE.
+    //
+    // An operator should not have to hand-roll a secret with `dd` before they can use a feature, so STRUBS makes
+    // the keyfile itself at startup. But restore the OS disk from an old backup, or wipe /var/lib/strubs, and the
+    // keyfile is gone while thirty ENCRYPTED disks are still in the rack. Generate a fresh one there and STRUBS
+    // comes up looking perfectly healthy while not one disk in the building opens with it -- silently, at boot,
+    // with no operator in the room. That is the worst thing this codebase could do.
+    describe('ensuring the keyfile exists', () => {
+        const disks = (fstypes: Array<string | null>) =>
+            (async () => [{
+                name: 'sdf', path: '/dev/sdf', type: 'disk', size: 1,
+                children: fstypes.map((fstype, i) => ({ type: 'part', name: `sdf${i}`, path: `/dev/sdf${i}`, fstype }))
+            }]) as never;
+
+        it('creates one when nothing is encrypted -- there is no key to have lost', async () => {
+            statMock.mockRejectedValue(new Error('ENOENT'));   // no keyfile
+            const written: Buffer[] = [];
+            const handle = {
+                write: vi.fn(async (b: Buffer) => { written.push(b); }),
+                sync: vi.fn().mockResolvedValue(undefined),
+                close: vi.fn().mockResolvedValue(undefined)
+            };
+            mkdirMock.mockResolvedValue(undefined as never);
+            openMock.mockResolvedValue(handle as never);
+
+            expect(await ensureKeyfile('/var/lib/strubs/luks.key', disks(['ext4', null]))).toEqual({ state: 'created' });
+
+            // Exclusive create, mode 0400, and 512 bytes of real entropy that hit the platter before we say so.
+            expect(openMock).toHaveBeenCalledWith('/var/lib/strubs/luks.key', 'wx', 0o400);
+            expect(written[0].length).toBe(512);
+            expect(handle.sync).toHaveBeenCalled();
+        });
+
+        // THE ONE THAT MATTERS.
+        it('REFUSES to invent a key while encrypted disks are in the rack', async () => {
+            statMock.mockRejectedValue(new Error('ENOENT'));   // the keyfile is gone...
+            openMock.mockResolvedValue({} as never);
+
+            const result = await ensureKeyfile('/var/lib/strubs/luks.key', disks(['crypto_LUKS', 'ext4']));
+
+            expect(result).toEqual({ state: 'missing-but-disks-are-encrypted', disks: ['/dev/sdf0'] });
+
+            // It did not create anything. A fresh key opens NONE of those disks, and a system that looks healthy
+            // and cannot read a byte is worse than one that refuses to start quietly.
+            expect(openMock).not.toHaveBeenCalled();
+        });
+
+        it('leaves an existing keyfile alone', async () => {
+            statMock.mockResolvedValue({ mode: 0o400 } as never);
+
+            expect(await ensureKeyfile('/var/lib/strubs/luks.key', disks([]))).toEqual({ state: 'present' });
+            expect(openMock).not.toHaveBeenCalled();
         });
     });
 

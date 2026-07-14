@@ -144,14 +144,20 @@ serve reads, so a root shell on this box reads everything regardless. Defence in
 
 Two secrets, and they do different jobs.
 
-```bash
-# 1. The KEYFILE. Unattended boot: `Restart=always` means a passphrase prompt at boot is a non-starter.
-install -d -m 0700 /var/lib/strubs
-dd if=/dev/urandom of=/var/lib/strubs/luks.key bs=512 count=1
-chmod 0400 /var/lib/strubs/luks.key
-```
+**The keyfile — STRUBS makes this for you.** It is created at startup if it does not exist
+(`/var/lib/strubs/luks.key`, mode 0400, 512 random bytes). It is what unlocks the disks unattended:
+`Restart=always` means a passphrase prompt at boot is a non-starter.
 
-The second is the **recovery passphrase**:
+> ⚠️ **A missing keyfile is not always a new array — it is also what a LOST one looks like.** So STRUBS will
+> only create one when **nothing is encrypted**. If the keyfile is gone while encrypted disks are attached — you
+> restored the OS disk from an old backup, or wiped `/var/lib/strubs` — it **refuses** to generate a new one and
+> raises a `critical` notification. A fresh key opens *none* of those disks, and inventing one would leave a
+> system that looks perfectly healthy and cannot read a byte. Restore the keyfile from backup, or recover with
+> the recovery passphrase (which writes a new keyfile slot onto every disk).
+
+**Back the keyfile up.** It is the key to every disk this array will ever encrypt.
+
+**The recovery passphrase — you set this**, in the UI (Volumes → Recovery passphrase → Set) or:
 
 ```bash
 curl -X PUT localhost/\$/encryption/passphrase -H 'Content-Type: application/json' \

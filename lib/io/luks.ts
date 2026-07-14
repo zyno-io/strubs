@@ -1,5 +1,6 @@
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { promises as fsp } from 'fs';
+import path from 'path';
 
 import { spawnHelper } from '../helpers/spawn';
 import { listRawBlockDevices, type RawBlockDeviceChild } from './device-discovery';
@@ -68,6 +69,81 @@ export async function keyfileReadable(keyfile = DEFAULT_KEYFILE): Promise<boolea
     catch {
         return false;
     }
+}
+
+// ENSURE THE KEYFILE EXISTS -- AND REFUSE, LOUDLY, IF ITS ABSENCE MEANS SOMETHING TERRIBLE.
+//
+// An operator should not have to hand-roll a secret with `dd` before they can use a feature. So STRUBS makes
+// the keyfile itself, at startup, if there isn't one.
+//
+// ⚠️ BUT A MISSING KEYFILE IS NOT ALWAYS A NEW ARRAY. IT IS ALSO WHAT A LOST ONE LOOKS LIKE.
+//
+// Restore the OS disk from an old backup, or wipe /var/lib/strubs, and the keyfile is gone while thirty
+// encrypted disks are still in the rack. If we simply generated a fresh one, STRUBS would come up looking
+// perfectly healthy -- and not one disk in the building would open with it. Every volume would fail to unlock,
+// and the new key would be a 512-byte file with no relationship to anything. That is the single worst thing
+// this codebase could do, and it would do it silently, at boot, with no operator in the room.
+//
+// So the rule is not "make one if it is missing". The rule is:
+//
+//   nothing encrypted   -- there is no key to lose, so a fresh one costs nothing. MAKE IT.
+//   something encrypted -- the key we needed is GONE. Do not paper over that with a new one that opens nothing.
+//                          REFUSE, say so at `critical`, and let the operator restore it -- or recover with the
+//                          recovery passphrase, which re-installs a keyfile slot on every disk (see the
+//                          bootstrap recovery path). That is what the passphrase is FOR.
+//
+// The check asks the PLATTERS, not the database: a LUKS container is a LUKS container whatever Mongo thinks.
+export type KeyfileState =
+    | { state: 'present' }
+    | { state: 'created' }
+    | { state: 'missing-but-disks-are-encrypted'; disks: string[] };
+
+export async function ensureKeyfile(
+    keyfile = DEFAULT_KEYFILE,
+    list: typeof listRawBlockDevices = listRawBlockDevices
+): Promise<KeyfileState> {
+    if (await keyfileReadable(keyfile))
+        return { state: 'present' };
+
+    // Any LUKS container at all -- ours, a stranger's, or one we cannot identify. If there is encryption on this
+    // machine and no key for it, we are not in a position to be inventing keys.
+    const encrypted: string[] = [];
+    for (const device of await list())
+        for (const child of device.children ?? [])
+            if (isLuksFsType(child.fstype))
+                encrypted.push(child.path ?? `/dev/${child.name}`);
+
+    if (encrypted.length) {
+        log.error('THE LUKS KEYFILE (%s) IS MISSING, AND THERE ARE %d ENCRYPTED DISK(S) ON THIS MACHINE (%s). '
+            + 'This is not a new array -- it is an array whose key has been LOST, most likely because the OS disk '
+            + 'was restored or /var/lib/strubs was wiped. STRUBS will NOT generate a new keyfile: a fresh key '
+            + 'opens NONE of those disks, and creating one would leave a system that looks healthy and cannot '
+            + 'read a single byte. Restore the keyfile from your backup, or recover with the fleet recovery '
+            + 'passphrase (which will write a new keyfile slot onto every disk).',
+            keyfile, encrypted.length, encrypted.join(', '));
+
+        return { state: 'missing-but-disks-are-encrypted', disks: encrypted };
+    }
+
+    // Nothing is encrypted, so there is no key to have lost. Make one.
+    await fsp.mkdir(path.dirname(keyfile), { recursive: true, mode: 0o700 });
+
+    // 'wx' -- create exclusively. If two starts race, the loser fails rather than clobbering a key the winner
+    // may already have encrypted a disk with.
+    const handle = await fsp.open(keyfile, 'wx', 0o400);
+    try {
+        await handle.write(randomBytes(512));
+        await handle.sync();   // it is a KEY. It goes to the platter before we tell anyone it exists.
+    }
+    finally {
+        await handle.close();
+    }
+
+    log('created a LUKS keyfile at %s (nothing is encrypted, so there was no key to lose). It is mode 0400 and '
+        + 'it is the key to every disk this array will ever encrypt: back it up, and do not lose it. The recovery '
+        + 'passphrase is what saves you if you do.', keyfile);
+
+    return { state: 'created' };
 }
 
 // UNLOCK. Returns the mapper path.
