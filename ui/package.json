@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "typecheck": "npx vue-tsc --noEmit --pretty false > .tsc.out 2>&1; ! grep -E '^src/' .tsc.out; rc=$?; rm -f .tsc.out; exit $rc"
   },
   "dependencies": {
     "vue": "^3.5.24"

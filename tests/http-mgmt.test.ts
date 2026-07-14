@@ -72,6 +72,10 @@ vi.mock('../lib/recovery/recovery', async importOriginal => ({
 
 // The encrypted-volume record and the fleet scan. Real in production; injected here so the undelete guard can
 // be driven without a rack of disks.
+const sealedRecoveryPassphraseMock = vi.fn<() => Promise<string | null>>();
+const auditRecoveryKeyMock = vi.fn();
+const listRawBlockDevicesMock = vi.fn();
+const assertFleetRecoveryPassphraseMock = vi.fn();
 const scanFleetMock = vi.fn(async () => ({ ours: [] as unknown[], unknown: [] as string[], absent: [] as number[] }));
 // ⚠️ Asked of THIS volume's disk. `scanFleet().absent` CANNOT answer it -- that list excludes deleted volumes,
 // so it can never report the very volume being undeleted. An earlier guard asked it anyway (dead code), and the
@@ -85,7 +89,17 @@ vi.mock('../lib/io/luks-recovery-key', async importOriginal => ({
     ...await importOriginal<typeof import('../lib/io/luks-recovery-key')>(),
     scanFleet: scanFleetMock,
     volumeDiskIsAttached: volumeDiskIsAttachedMock,
-    withEncryptionSlot: withEncryptionSlotMock
+    withEncryptionSlot: withEncryptionSlotMock,
+    sealedRecoveryPassphrase: sealedRecoveryPassphraseMock,
+    auditRecoveryKey: auditRecoveryKeyMock,
+    assertFleetRecoveryPassphrase: assertFleetRecoveryPassphraseMock
+}));
+
+// The machine's own view of the rack. A volume's blockPath is a PARTITION (/dev/sde1); this list only ever
+// contains WHOLE DISKS (/dev/sde), with the partitions as children. That gap is the whole bug below.
+vi.mock('../lib/io/device-discovery', async importOriginal => ({
+    ...await importOriginal<typeof import('../lib/io/device-discovery')>(),
+    listRawBlockDevices: listRawBlockDevicesMock
 }));
 
 vi.mock('../lib/io/device-provisioner', () => ({
@@ -210,6 +224,17 @@ beforeAll(async () => {
 
 beforeEach(() => {
     vi.clearAllMocks();
+
+    // The ordinary state of a live array: a passphrase was set, so STRUBS holds it sealed under the keyfile.
+    // (mockResolvedValue sets an IMPLEMENTATION -- clearAllMocks does not remove it, so a rejection staged by
+    // one test would otherwise leak into the next.)
+    sealedRecoveryPassphraseMock.mockResolvedValue('correct horse battery staple');
+    assertFleetRecoveryPassphraseMock.mockResolvedValue(undefined);
+    auditRecoveryKeyMock.mockResolvedValue({
+        checkedAt: '2026-07-14T00:00:00.000Z', healthy: true, total: 1,
+        opened: [], refused: [], unreadable: [], unidentified: [], notChecked: []
+    });
+
     ioManagerMock.getVolumeEntries.mockReset();
     ioManagerMock.getVolume.mockReset();
     ioManagerMock.registerVolume.mockReset();
@@ -816,6 +841,7 @@ describe('HttpMgmt.handle', () => {
             gbFree: 100 / (1024 ** 3),
             encryption: {
                 encryptNewVolumes: false,
+            passphraseUsable: true,
                 hasRecoveryPassphrase: false,
                 // Never audited. Reported as null rather than as healthy -- on an encrypted fleet, "nobody has
                 // ever confirmed these disks can be recovered" is a fact worth stating, not an absence.
@@ -1573,7 +1599,13 @@ describe('encrypting a volume', () => {
     const plaintextVolume = {
         id: 15,
         uuid: 'vol-15',
-        blockPath: '/dev/sde',
+
+        // ⚠️ A PARTITION, because that is what a real volume carries. This fixture used to say '/dev/sde' -- a
+        // whole disk -- and so it modelled a machine that does not exist. Every conversion test passed against
+        // it while the real conversion could not run at all: the provisioner is handed this path and looks for
+        // it among the WHOLE DISKS, where a partition never appears. "block device not found", every time.
+        blockPath: '/dev/sde1',
+        partitionUuid: 'part-uuid-15',
         // Mounted, because the journal guard REFUSES a volume it cannot read: an unmounted disk might be the
         // last home of a journal segment and there is no way to know. Volume 15 is in the journal mock's fleet.
         isMounted: true,
@@ -1600,7 +1632,15 @@ describe('encrypting a volume', () => {
         buildSliceIndexMock.mockResolvedValue(new Map());   // the platter is genuinely empty
         databaseClassifySlicesMock.mockResolvedValue({ stale: 0, stillReferenced: [], orphans: [] });
         // ...and the kernel agrees the disk really is mounted where the volume thinks it is.
-        readProcMountsMock.mockResolvedValue(new Map([[mountPoint, '/dev/sde']]));
+        readProcMountsMock.mockResolvedValue(new Map([[mountPoint, '/dev/sde1']]));
+
+        // The rack, as lsblk actually reports it: whole disks, partitions underneath.
+        listRawBlockDevicesMock.mockResolvedValue([
+            { name: 'sdd', path: '/dev/sdd', type: 'disk', size: 1, children: [
+                { name: 'sdd1', path: '/dev/sdd1', type: 'part', size: 1, uuid: 'part-uuid-other' }] },
+            { name: 'sde', path: '/dev/sde', type: 'disk', size: 1, children: [
+                { name: 'sde1', path: '/dev/sde1', type: 'part', size: 1, uuid: 'part-uuid-15' }] }
+        ]);
     });
 
     const encrypt = (body: unknown) =>
@@ -1702,9 +1742,29 @@ describe('encrypting a volume', () => {
     // which is worse than no test. The conversion calls the very same `assertVolumeRemovable()` as the delete
     // path, where the guard IS covered; the live-slices test above proves the call is on this path.
 
-    it('refuses without a recovery passphrase, before touching anything', async () => {
-        await expect(encrypt({})).rejects.toThrow(/recoveryPassphrase is required/);
+    // THE OPERATOR IS NOT ASKED, BECAUSE STRUBS ALREADY KNOWS. The passphrase is sealed under the keyfile, and
+    // the provisioner reads it from there -- which is the only reason `encryptNewVolumes` can work at all, since
+    // an automatically provisioned disk has nobody to prompt.
+    it('does not require the passphrase in the request: STRUBS holds it', async () => {
+        await encrypt({});
+
+        expect(deviceProvisionerProvisionMock).toHaveBeenCalled();
+        // ...and it did NOT pass one down: the provisioner takes it from the seal.
+        expect(deviceProvisionerProvisionMock.mock.calls[0][0]).toMatchObject({ recoveryPassphrase: undefined });
+    });
+
+    // ...but a passphrase nobody knows cannot be invented. This is the guard that used to be "the body must
+    // carry one", and it still has to hold -- a disk with only the keyfile slot dies with the OS disk.
+    it('still refuses when no passphrase exists anywhere, before touching anything', async () => {
+        deviceProvisionerProvisionMock.mockRejectedValueOnce(
+            new HttpBadRequestError('refusing to encrypt: this array has no recovery passphrase.'));
+
+        await expect(encrypt({})).rejects.toThrow(/no recovery passphrase/);
         expect(databaseUpdateFlagsMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-string passphrase rather than coercing it', async () => {
+        await expect(encrypt({ recoveryPassphrase: 42 })).rejects.toThrow(/must be a string/);
         expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
     });
 
@@ -1821,13 +1881,144 @@ describe('encrypting a volume', () => {
         });
     });
 
-    // The audit is the only thing in the system that ever asks whether the recovery passphrase still works.
-    // It needs the passphrase, and we will not keep that on the machine it exists to recover -- so the endpoint
-    // demands it and refuses without one.
-    it('refuses to audit without the recovery passphrase', async () => {
+    // The audit asks every disk whether the passphrase still opens it. WHICH passphrase? The one the fleet
+    // RECORDS -- taken from the seal -- because that is the one an operator would be told to use on the day the
+    // OS disk dies. Auditing whatever a human happened to type would prove something else entirely.
+    it('audits the passphrase STRUBS holds, without asking for it', async () => {
+        sealedRecoveryPassphraseMock.mockResolvedValue('correct horse battery staple');
+
+        await HttpMgmt.handle(5, createRequest('POST', '/$/encryption/audit', {}), nullResponse);
+
+        expect(auditRecoveryKeyMock).toHaveBeenCalledWith('correct horse battery staple');
+    });
+
+    it('refuses to audit when there is no passphrase to audit', async () => {
+        sealedRecoveryPassphraseMock.mockResolvedValue(null);
+
         await expect(HttpMgmt.handle(
             5, createRequest('POST', '/$/encryption/audit', {}), nullResponse
-        )).rejects.toThrow(/recoveryPassphrase is required/);
+        )).rejects.toThrow(/no recovery passphrase/);
+        expect(auditRecoveryKeyMock).not.toHaveBeenCalled();
+    });
+
+    // ⚠️ TWO REQUESTS MUST NOT WIPE TWO DISKS.
+    //
+    // "Is a conversion running? No? Then convert." is only a guard if nothing can happen in between -- and
+    // between those two lines the handler now awaits an lsblk to work out which disk it is even talking about.
+    // Both requests sail through the check while the first sits in that await, and the array eats two disks.
+    //
+    // So the claim IS the check: beginConversion() is a synchronous test-and-set, taken before the first await.
+    it('refuses a second conversion that arrives while the first is still resolving the disk', async () => {
+        let releaseTheFirstOne: () => void = () => {};
+        const firstIsInFlight = new Promise<void>(resolve => { releaseTheFirstOne = resolve; });
+
+        // The first request blocks exactly where the old guard had its hole: inside the async disk lookup.
+        listRawBlockDevicesMock.mockImplementationOnce(async () => {
+            await firstIsInFlight;
+            return [{ name: 'sde', path: '/dev/sde', type: 'disk', size: 1, children: [
+                { name: 'sde1', path: '/dev/sde1', type: 'part', size: 1, uuid: 'part-uuid-15' }] }];
+        });
+
+        const first = encrypt({});
+        const second = encrypt({});   // arrives while the first is still in lsblk
+
+        await expect(second).rejects.toThrow(/another volume is already being converted/);
+
+        releaseTheFirstOne();
+        await first;
+
+        // ONE disk was wiped, not two.
+        expect(deviceProvisionerProvisionMock).toHaveBeenCalledTimes(1);
+    });
+
+    // ---- WHICH SPINDLE ARE WE ABOUT TO WIPE? ----
+    //
+    // The provisioner runs `parted` on whatever path it is handed. Hand it the wrong one and you have formatted
+    // a disk full of customer data. So this is pinned three ways.
+    describe('resolving the disk to convert', () => {
+        // THE BUG THAT MADE THE FEATURE IMPOSSIBLE. The volume knows /dev/sde1; the provisioner needs /dev/sde.
+        it('hands the provisioner the WHOLE DISK, not the volume\'s partition', async () => {
+            await encrypt({});
+
+            expect(deviceProvisionerProvisionMock).toHaveBeenCalledWith(
+                expect.objectContaining({ blockPath: '/dev/sde', convertVolumeId: 15 }));
+        });
+
+        // ⚠️ RESOLVED BY IDENTITY, NOT BY CHOPPING THE '1' OFF THE PATH. These are USB disks: /dev/sde is
+        // whatever the kernel most recently decided to call the thing in that slot. If the partition has moved
+        // to another spindle since the fleet last looked, we follow the UUID -- we do not `parted` the disk that
+        // happens to be sitting on the old name.
+        it('follows the partition uuid when the kernel has renamed the disk', async () => {
+            listRawBlockDevicesMock.mockResolvedValue([
+                { name: 'sde', path: '/dev/sde', type: 'disk', size: 1, children: [
+                    { name: 'sde1', path: '/dev/sde1', type: 'part', size: 1, uuid: 'somebody-elses-partition' }] },
+                { name: 'sdk', path: '/dev/sdk', type: 'disk', size: 1, children: [
+                    { name: 'sdk1', path: '/dev/sdk1', type: 'part', size: 1, uuid: 'part-uuid-15' }] }
+            ]);
+
+            await encrypt({});
+
+            // The volume still SAYS /dev/sde1. The disk carrying its partition is /dev/sdk. Wipe /dev/sdk.
+            expect(deviceProvisionerProvisionMock).toHaveBeenCalledWith(
+                expect.objectContaining({ blockPath: '/dev/sdk' }));
+        });
+
+        it('refuses when no attached disk carries the volume\'s partition', async () => {
+            listRawBlockDevicesMock.mockResolvedValue([
+                { name: 'sdd', path: '/dev/sdd', type: 'disk', size: 1, children: [
+                    { name: 'sdd1', path: '/dev/sdd1', type: 'part', size: 1, uuid: 'part-uuid-other' }] }
+            ]);
+
+            await expect(encrypt({})).rejects.toThrow(/no attached disk carries/);
+            expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+        });
+
+        it('refuses to guess when the volume has no partition uuid on record', async () => {
+            ioManagerMock.getVolume.mockReturnValue({ ...plaintextVolume, partitionUuid: null });
+
+            await expect(encrypt({})).rejects.toThrow(/Refusing to guess which spindle to wipe/);
+            expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+        });
+    });
+
+    // ---- HANDING THE PASSPHRASE BACK ONCE ----
+    //
+    // The array that recorded a passphrase it cannot USE. A hash does not run backwards, so no restart, repair
+    // or rotation recovers this: the operator says it one more time, or nothing here can encrypt a disk.
+    describe('re-sealing a recorded passphrase', () => {
+        const seal = (body: unknown) =>
+            HttpMgmt.handle(5, createRequest('POST', '/$/encryption/seal', body), nullResponse);
+
+        it('checks the passphrase against the record, then makes it usable', async () => {
+            sealedRecoveryPassphraseMock.mockResolvedValue('correct horse battery staple');
+
+            await expect(seal({ passphrase: 'correct horse battery staple' }))
+                .resolves.toMatchObject({ passphraseUsable: true });
+
+            expect(assertFleetRecoveryPassphraseMock).toHaveBeenCalledWith('correct horse battery staple');
+        });
+
+        // A WRONG passphrase must change nothing. assertFleetRecoveryPassphrase throws, and nothing is sealed --
+        // sealing an unverified passphrase would hand the next disk a keyslot nobody can open.
+        it('refuses a passphrase that is not the recorded one', async () => {
+            assertFleetRecoveryPassphraseMock.mockRejectedValue(
+                new HttpBadRequestError('that is not this fleet\'s recovery passphrase.'));
+
+            await expect(seal({ passphrase: 'a guess' })).rejects.toThrow(/not this fleet's recovery passphrase/);
+        });
+
+        it('requires a passphrase', async () => {
+            await expect(seal({})).rejects.toThrow(/passphrase is required/);
+            expect(assertFleetRecoveryPassphraseMock).not.toHaveBeenCalled();
+        });
+
+        // The passphrase was right and it STILL could not be sealed -- which means the keyfile is gone. Saying
+        // "done" here would leave an operator believing encryption works when the next disk will refuse.
+        it('does not claim success when the passphrase could not be sealed', async () => {
+            sealedRecoveryPassphraseMock.mockResolvedValue(null);
+
+            await expect(seal({ passphrase: 'correct horse battery staple' })).rejects.toThrow(/could not be sealed/);
+        });
     });
 
     // Turning the fleet default on must not convert a single existing disk. "Encryption: on" is exactly what

@@ -2,6 +2,11 @@
 import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue';
 import type { VolumeStatus, BlockDevice, StatusResponse } from '@strubs/server/http/mgmt';
 
+// The SERVER's type, not a copy of it. The copy that used to live here had drifted -- it was missing
+// `concurrency`, so the one place the UI reads it (the rebalance concurrency box) was a type error that nobody
+// saw, because vue-tsc was aborting on a tsconfig deprecation before it checked anything.
+import type { RebalanceStatus } from '@strubs/jobs/rebalance-job';
+
 const volumes = ref<VolumeStatus[]>([]);
 const blockDevices = ref<BlockDevice[]>([]);
 const loading = ref<boolean>(true);
@@ -155,28 +160,6 @@ let verifyPollTimer: ReturnType<typeof setInterval> | null = null;
 
 // Rebalance: evens out fill across the pool by relocating slices off over-full drives onto under-full
 // ones. bytesToMove is how far the pool still is from the balance point, so it doubles as progress.
-interface RebalanceStatus {
-  running: boolean;
-  // Cancelled, but the slice moves already in the air are still landing. See the note on the button below.
-  stopping: boolean;
-  targetFill: number;
-  deadband: number;
-  bytesToMove: number;
-  bytesMoved: number;
-  bytesPerSec: number;
-  etaSeconds: number | null;
-  sourceVolumeIds: number[];
-  currentSourceVolumeId: number | null;
-  currentMinObjectSize: number | null;
-  startedAt: string | null;
-  moves: number;
-  copied: number;
-  reconstructed: number;
-  noDest: number;
-  unrecoverable: number;
-  sourceDeleteFailed: number;
-  duplicateRefs: number;
-}
 const rebalanceStatus = ref<RebalanceStatus | null>(null);
 const rebalancePending = ref<boolean>(false);
 const concurrencyPending = ref<boolean>(false);
@@ -1296,6 +1279,39 @@ async function setRecoveryPassphrase(): Promise<void> {
   }
 }
 
+// HAND THE PASSPHRASE BACK ONCE, so STRUBS can use it rather than merely recognise it.
+//
+// An array that recorded its passphrase before STRUBS kept a usable copy (or whose keyfile was restored from a
+// different backup) holds a hash and nothing else -- it can check what you type and cannot encrypt a disk by
+// itself. A hash does not run backwards, so the only way out is for the operator to say it one more time.
+async function sealRecoveryPassphrase(): Promise<void> {
+  const passphrase = prompt(
+    'Enter the recovery passphrase you already set.\n\n'
+    + 'It is checked against the one on record — a wrong one changes nothing — and then stored sealed with the '
+    + 'keyfile, so STRUBS can encrypt disks without asking you again.\n\n'
+    + 'No keyslot is touched. This is not a change of passphrase.'
+  );
+  if (!passphrase) return;
+
+  encryptionBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/encryption/seal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ passphrase })
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Could not store the passphrase (HTTP ${res.status})${text ? `: ${text}` : ''}`);
+    }
+    await fetchEncryptionStatus();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to store the recovery passphrase';
+  } finally {
+    encryptionBusy.value = false;
+  }
+}
+
 // PROVE THE RECOVERY PASSPHRASE STILL OPENS EVERY ENCRYPTED DISK.
 //
 // The keyfile makes the passphrase enforceable, so this is not the authority it once was -- but there is exactly
@@ -1306,19 +1322,21 @@ async function auditRecoveryPassphrase(): Promise<void> {
   const total = encryptionCoverage.value?.encrypted ?? 0;
   if (!total) return;
 
-  const passphrase = prompt(
-    `Check the recovery passphrase against all ${total} encrypted volume(s).\n\n`
+  // No prompt: we audit the passphrase THE FLEET RECORDS, which STRUBS holds sealed under the keyfile. Asking
+  // the operator to type one would audit whatever they typed -- not what the array would actually tell them to
+  // use on the day the OS disk dies. (This used to prompt and then throw the answer away, sending {}.)
+  if (!confirm(
+    `Check the recovery passphrase against all ${total} encrypted volume(s)?\n\n`
     + `This opens nothing and changes nothing — it asks each disk's LUKS header whether the passphrase still `
     + `fits. Takes about ${Math.ceil(total * 3)} seconds.`
-  );
-  if (!passphrase) return;
+  )) return;
 
   encryptionBusy.value = true;
   try {
     const res = await apiFetch(`${apiBaseUrl}/$/encryption/audit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recoveryPassphrase: passphrase })
+      body: JSON.stringify({})
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -1359,6 +1377,21 @@ const CONVERSION_STEPS: Record<string, string> = {
   registering: 'Bringing the volume back into service'
 };
 
+// A warning that lives behind a tab is a warning nobody sees. The dot is the only thing that reaches an
+// operator who is looking at some other page -- so it has to fire for "you never set a passphrase" too, not
+// just for the audit failures, because an array with no passphrase cannot be encrypted at all.
+const encryptionAttentionReason = computed<string | null>(() => {
+    const e = encryption.value;
+    if (!e) return null;
+    if (!e.hasRecoveryPassphrase) return 'No recovery passphrase is set';
+    if (!e.passphraseUsable) return 'STRUBS cannot use the recorded recovery passphrase';
+    if (e.lastAudit?.refused.length) return 'The recovery passphrase does not open every disk';
+    if (e.lastAudit && !e.lastAudit.healthy) return 'The recovery passphrase could not be proven against every disk';
+    if (auditIsStale.value) return 'The recovery passphrase has not been checked against the disks';
+    return null;
+});
+const encryptionNeedsAttention = computed(() => encryptionAttentionReason.value !== null);
+
 const conversion = computed(() => encryption.value?.conversion ?? null);
 
 const conversionLabel = computed(() => {
@@ -1382,23 +1415,31 @@ async function encryptVolume(): Promise<void> {
   const volumeId = volume.id;
   hideContextMenu();
 
+  // NOT ASKED FOR THE PASSPHRASE. STRUBS holds it, sealed under the keyfile, and it wrote these disks with it
+  // in the first place -- re-typing it here guarded nothing and would have made an automatic provision (which
+  // has no operator to ask) impossible. The server refuses if no passphrase has ever been set.
+  if (!encryption.value?.hasRecoveryPassphrase) {
+    error.value = 'Set a recovery passphrase before encrypting a disk — a volume with only the keyfile slot '
+      + 'dies with the OS disk. Encryption tab → Set the recovery passphrase.';
+    selectTab('encryption');
+    return;
+  }
+
+  // Recorded, but not usable: STRUBS can check the passphrase and cannot produce it, so it cannot write the
+  // keyslot. Send the operator to the one thing that fixes it rather than failing at the disk.
+  if (!encryption.value.passphraseUsable) {
+    error.value = 'STRUBS cannot use the recorded recovery passphrase — enter it once on the Encryption tab, '
+      + 'and encryption will work without asking again.';
+    selectTab('encryption');
+    return;
+  }
+
   if (!confirm(
     `Encrypt volume ${volumeId}?\n\n`
     + `This WIPES AND REBUILDS the disk as an encrypted volume. It only works on a volume that has already `
     + `been drained; the rebalance will refill it afterwards.\n\n`
-    + `You will need the fleet recovery passphrase.`
+    + `It is unlocked with the fleet recovery passphrase you already set.`
   )) return;
-
-  // Never defaulted, never remembered, never sent anywhere but this one request.
-  const passphrase = prompt(
-    `Recovery passphrase for volume ${volumeId}.\n\n`
-    + (encryption.value?.hasRecoveryPassphrase
-      ? 'Enter the SAME passphrase the rest of the fleet was encrypted with.'
-      : 'This is the FIRST encrypted volume, so this passphrase becomes the fleet recovery passphrase. '
-        + 'If the OS disk dies, it is the only thing that can open these disks. WRITE IT DOWN SOMEWHERE '
-        + 'THAT IS NOT THIS MACHINE. There is no undo.')
-  );
-  if (!passphrase) return;
 
   encryptionBusy.value = true;
 
@@ -1409,7 +1450,8 @@ async function encryptVolume(): Promise<void> {
     const res = await apiFetch(`${apiBaseUrl}/$/volumes/${volumeId}/encrypt`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recoveryPassphrase: passphrase })
+      // Empty: STRUBS takes the passphrase from the seal. There is no `passphrase` here to send.
+      body: JSON.stringify({})
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -1520,8 +1562,8 @@ async function deleteVolume(): Promise<void> {
 // where you were. The path is never trusted on the way back in: it is re-traversed against the server,
 // so a deep link to a since-deleted folder resolves to "gone" rather than silently landing somewhere
 // else that now occupies part of the chain.
-type MainTab = 'overview' | 'maintenance' | 'volumes' | 'buckets' | 'credentials';
-const MAIN_TABS: MainTab[] = ['overview', 'maintenance', 'volumes', 'buckets', 'credentials'];
+type MainTab = 'overview' | 'maintenance' | 'volumes' | 'encryption' | 'buckets' | 'credentials';
+const MAIN_TABS: MainTab[] = ['overview', 'maintenance', 'volumes', 'encryption', 'buckets', 'credentials'];
 const activeTab = ref<MainTab>('overview');
 
 function parseHash(): { tab: MainTab; path: string } {
@@ -1542,10 +1584,14 @@ function writeHash(tab: MainTab, path = ''): void {
 }
 
 function selectTab(tab: MainTab): void {
+  // An error from the Volumes tab has nothing to say about Buckets. It used to scroll out of sight on its own;
+  // now that it is pinned, leaving it up would follow the operator around the whole app.
+  error.value = null;
   activeTab.value = tab;
   writeHash(tab, tab === 'buckets' ? browsePath.value : '');
   if (tab === 'buckets' && !buckets.value.length) void fetchBuckets();
   if (tab === 'credentials' && !credentials.value.length) void fetchCredentials();
+  if (tab === 'encryption') void fetchEncryptionStatus();
 }
 
 // ---- Buckets & Access (Phase 4 UI over the dark bucket-auth model) ----
@@ -1980,6 +2026,7 @@ onUnmounted(() => {
         {{ tab === 'overview' ? 'Overview'
          : tab === 'maintenance' ? 'Maintenance'
          : tab === 'volumes' ? 'Volumes'
+         : tab === 'encryption' ? 'Encryption'
          : tab === 'buckets' ? 'Buckets'
          : 'Credentials' }}
         <span
@@ -1988,12 +2035,27 @@ onUnmounted(() => {
           title="Maintenance is running"
         >●</span>
         <span
+          v-if="tab === 'encryption' && encryptionNeedsAttention"
+          class="tab-dot warn"
+          :title="encryptionAttentionReason ?? undefined"
+        >●</span>
+        <span
           v-if="tab === 'buckets' && authEnforced === false"
           class="tab-dot warn"
           title="The object API is unauthenticated"
         >●</span>
       </button>
     </nav>
+
+    <!-- PINNED, NOT AT THE BOTTOM OF THE PAGE. It used to render after every section, which on the Volumes tab
+         put it below thirty volume rows -- an error message you have to go looking for is not an error message. -->
+    <div v-if="error" class="error">
+      <span>Error: {{ error }}</span>
+      <button type="button" class="error-dismiss" title="Dismiss" @click="error = null">&times;</button>
+    </div>
+
+    <!-- Everything below the tabs scrolls; the tabs and the error do not. -->
+    <main class="tab-body">
 
     <!-- ===================== OVERVIEW ===================== -->
     <!-- Status at a glance: the maintenance BADGES (not its details -- those live on their own tab) and
@@ -2307,7 +2369,7 @@ onUnmounted(() => {
       <!-- A CONVERSION IS RUNNING. It takes minutes and it wipes a disk. Say what it is doing, or a disabled
            button for two minutes looks exactly like a wedged system -- and the reasonable response to that
            (reload, click again, restart) is the worst thing you can do to a disk that is mid-wipe. -->
-      <div v-if="conversion" class="access-banner warn banner-standalone conversion-banner">
+      <div v-if="conversion" class="access-banner warn conversion-banner">
         <span class="conversion-spinner" aria-hidden="true"></span>
         <span>
           <strong>Encrypting volume {{ conversion.volumeId }}.</strong>
@@ -2317,150 +2379,6 @@ onUnmounted(() => {
           </em>
           <em v-else>The disk is being rewritten. Do not pull it, and do not restart STRUBS.</em>
         </span>
-      </div>
-
-      <!-- ENCRYPTION COVERAGE. Deliberately never says "protected" while a single plaintext disk remains:
-           pulling that disk still leaks every slice on it, and a green tick here would be a lie. -->
-      <div v-if="encryptionCoverage" class="encryption-bar">
-        <div class="encryption-state">
-          <span
-            class="verify-state"
-            :class="encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext === 0 ? 'running' : 'idle'"
-          >
-            {{ encryptionCoverage.encrypted }} / {{ encryptionCoverage.total }} encrypted
-          </span>
-          <span v-if="encryptionCoverage.unknown" class="access-hint">
-            {{ encryptionCoverage.unknown }} disk(s) absent — encryption state unknown
-          </span>
-        </div>
-
-        <div class="access-enforce-row encryption-default">
-          <div>
-            <div class="access-subtitle">Encrypt new volumes</div>
-            <div class="access-hint">
-              Applies to disks added from now on. <em>It converts nothing that is already in the array</em> —
-              use “Encrypt” on a drained volume for that.
-            </div>
-          </div>
-          <button
-            class="access-toggle-btn"
-            :class="{ on: encryption?.encryptNewVolumes }"
-            :disabled="encryptionBusy || !encryption"
-            @click="setEncryptNewVolumes(!encryption?.encryptNewVolumes)"
-          >
-            {{ encryption?.encryptNewVolumes ? 'On' : 'Off' }}
-          </button>
-        </div>
-
-        <div class="access-enforce-row encryption-default">
-          <div>
-            <div class="access-subtitle">Recovery passphrase</div>
-            <div class="access-hint">
-              The only thing that opens these disks if the OS disk dies. Changing it rewrites the keyslot on
-              every encrypted volume — <em>which works because STRUBS holds the keyfile</em>.
-            </div>
-          </div>
-          <button class="access-toggle-btn" :disabled="encryptionBusy" @click="setRecoveryPassphrase">
-            {{ encryption?.hasRecoveryPassphrase ? 'Change' : 'Set' }}
-          </button>
-        </div>
-
-        <div v-if="encryptionCoverage && encryptionCoverage.encrypted > 0" class="access-enforce-row encryption-default">
-          <div>
-            <div class="access-subtitle">Prove it against the disks</div>
-            <div class="access-hint">
-              <template v-if="encryption?.lastAudit?.healthy">
-                Last proven against all {{ encryption.lastAudit.total }} encrypted disk(s)
-                {{ auditAgeDays === 0 ? 'today' : `${auditAgeDays} day(s) ago` }}.
-              </template>
-              <template v-else-if="auditAgeDays === null">
-                <em>Never checked.</em> Nobody has confirmed these disks can actually be recovered.
-              </template>
-              <template v-else>Last checked {{ auditAgeDays }} day(s) ago.</template>
-            </div>
-          </div>
-          <button
-            class="access-toggle-btn"
-            :class="{ on: encryption?.lastAudit?.healthy }"
-            :disabled="encryptionBusy"
-            @click="auditRecoveryPassphrase"
-          >
-            Check the disks
-          </button>
-        </div>
-      </div>
-
-      <div
-        v-if="encryptionCoverage && encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext > 0"
-        class="access-banner warn banner-standalone"
-      >
-        <strong>This array is partially encrypted.</strong>
-        {{ encryptionCoverage.plaintext }} volume(s) are still plaintext — pulling any one of them exposes
-        every slice it holds. Encryption protects a disk that leaves the building; it does nothing for the
-        disks that haven't been converted.
-      </div>
-
-      <!-- THE WORST NEWS THIS PAGE CAN CARRY. Every disk mounts, every disk serves, the array looks perfect --
-           and the passphrase in your safe opens only some of them. Nothing else in the system will ever notice,
-           because STRUBS mounts with the keyfile and never touches the passphrase slot. -->
-      <div
-        v-if="encryption?.lastAudit && encryption.lastAudit.refused.length"
-        class="access-banner error banner-standalone"
-      >
-        <strong>THE RECOVERY PASSPHRASE DOES NOT OPEN EVERY DISK.</strong>
-        Volume{{ encryption.lastAudit.refused.length === 1 ? '' : 's' }}
-        {{ encryption.lastAudit.refused.map(d => d.volumeId).join(', ') }}
-        do not open with it — almost certainly because they were unplugged when the passphrase was last changed.
-        If the keyfile is lost, those disks are lost with it.
-        <strong>Set the passphrase again with every disk attached</strong>, and they will be rewritten.
-      </div>
-
-      <div
-        v-else-if="encryption?.lastAudit && encryption.lastAudit.unreadable.length"
-        class="access-banner warn banner-standalone"
-      >
-        <strong>Some encrypted disks could not be checked.</strong>
-        The LUKS header on {{ encryption.lastAudit.unreadable.map(d => d.path).join(', ') }} would not read, so
-        we cannot say whether the recovery passphrase still opens
-        {{ encryption.lastAudit.unreadable.length === 1 ? 'it' : 'them' }}.
-        That is a disk fault, not a passphrase fault — but it means those volumes' recoverability is unknown.
-      </div>
-
-      <!-- An encrypted disk we cannot identify is one the fleet-passphrase check cannot see -- which is how a
-           fleet ends up split. The audit counts it as unhealthy; the UI must not then say "last checked today"
-           and leave it at that. -->
-      <!-- An audit that could not even ASK a disk cannot say the fleet is recoverable. An unplugged volume is
-           the likeliest one to be wrong, because it is the one a rotation could not reach. -->
-      <div
-        v-else-if="encryption?.lastAudit && encryption.lastAudit.notChecked?.length"
-        class="access-banner warn banner-standalone"
-      >
-        <strong>The passphrase was not checked against every disk.</strong>
-        Volume{{ encryption.lastAudit.notChecked.length === 1 ? '' : 's' }}
-        {{ encryption.lastAudit.notChecked.join(', ') }}
-        {{ encryption.lastAudit.notChecked.length === 1 ? 'was' : 'were' }} not attached, so
-        {{ encryption.lastAudit.notChecked.length === 1 ? 'it' : 'they' }} could not be asked — and an unplugged
-        disk is the one most likely to have missed a passphrase change. Attach every disk and check again.
-      </div>
-
-      <div
-        v-else-if="encryption?.lastAudit && encryption.lastAudit.unidentified.length"
-        class="access-banner warn banner-standalone"
-      >
-        <strong>An encrypted disk here is not identifiable.</strong>
-        {{ encryption.lastAudit.unidentified.join(', ') }}
-        {{ encryption.lastAudit.unidentified.length === 1 ? 'is a LUKS container' : 'are LUKS containers' }}
-        carrying no STRUBS nameplate, so we cannot tell whether
-        {{ encryption.lastAudit.unidentified.length === 1 ? 'it belongs' : 'they belong' }} to this array.
-        Encryption is blocked until {{ encryption.lastAudit.unidentified.length === 1 ? 'it is' : 'they are' }}
-        identified or detached.
-      </div>
-
-      <div v-else-if="auditIsStale" class="access-banner warn banner-standalone">
-        <strong>The recovery passphrase has {{ auditAgeDays === null ? 'never been' : 'not been' }} checked
-        against the disks{{ auditAgeDays === null ? '' : ` in ${auditAgeDays} days` }}.</strong>
-        STRUBS unlocks these disks with the keyfile, so a passphrase that has stopped working would not show up
-        anywhere else — until the day you need it. Check it now.
       </div>
 
       <div class="volumes-view">
@@ -2686,6 +2604,197 @@ onUnmounted(() => {
     </section>
 
     <!-- ===================== BUCKETS ===================== -->
+    <!-- ===================== ENCRYPTION ===================== -->
+    <!-- Its own tab, because it is a property of the FLEET, not of the volume list it used to sit on top of.
+         Deliberately never says "protected" while a single plaintext disk remains: pulling that disk still
+         leaks every slice on it, and a green tick here would be a lie. -->
+    <section v-show="activeTab === 'encryption'" class="section access-panel">
+      <div class="verify-header">
+        <div class="verify-title">
+          <h2>Encryption</h2>
+          <span
+            v-if="encryptionCoverage"
+            class="verify-state"
+            :class="encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext === 0 ? 'running' : 'idle'"
+          >
+            {{ encryptionCoverage.encrypted }} / {{ encryptionCoverage.total }} encrypted
+          </span>
+          <span v-if="encryptionCoverage?.unknown" class="access-hint">
+            {{ encryptionCoverage.unknown }} disk(s) absent — encryption state unknown
+          </span>
+        </div>
+      </div>
+
+      <!-- THE ONE THING WE ACTUALLY WANT FROM THE OPERATOR. Not a nag: nothing here can be encrypted until it
+           exists, and it is the only part of this that a dead OS disk cannot take away from you. -->
+      <div v-if="encryption && !encryption.hasRecoveryPassphrase" class="access-banner secret banner-standalone">
+        <div>
+          <strong>Set a recovery passphrase — encryption starts here.</strong>
+          STRUBS unlocks these disks by itself, with a keyfile on the OS disk, so this is not something you type
+          at boot. It is the <em>only</em> thing that opens your data if that OS disk ever dies — and without it,
+          losing the OS disk would lose every byte on every encrypted platter. That is why STRUBS will not
+          encrypt a single disk until one is set.
+        </div>
+        <div class="secret-row">
+          <button class="access-toggle-btn on" :disabled="encryptionBusy" @click="setRecoveryPassphrase">
+            Set the recovery passphrase
+          </button>
+          <span class="access-hint">Then write it down somewhere that is not this machine. There is no reset.</span>
+        </div>
+      </div>
+
+      <!-- RECORDED, BUT NOT USABLE. The array can recognise the passphrase and cannot produce it, so it cannot
+           write a keyslot -- and nothing else in the UI would ever say so. -->
+      <div
+        v-if="encryption && encryption.hasRecoveryPassphrase && !encryption.passphraseUsable"
+        class="access-banner warn banner-standalone"
+      >
+        <div>
+          <strong>STRUBS cannot use the recovery passphrase it has on record.</strong>
+          It holds a hash — enough to check the passphrase you type, not enough to write it onto a disk (a hash
+          does not run backwards). This happens when the passphrase was set before STRUBS kept a usable copy, or
+          when the keyfile was restored from a different backup. <em>No disk is at risk</em>, and the passphrase
+          you wrote down is still the right one: encryption simply cannot proceed until STRUBS is given it once.
+        </div>
+        <div class="secret-row">
+          <button class="access-toggle-btn on" :disabled="encryptionBusy" @click="sealRecoveryPassphrase">
+            Enter it once
+          </button>
+          <span class="access-hint">Nothing is changed and no keyslot is touched. It is the same passphrase.</span>
+        </div>
+      </div>
+
+      <div class="encryption-bar">
+        <div class="access-enforce-row encryption-default">
+          <div>
+            <div class="access-subtitle">Encrypt new volumes</div>
+            <div class="access-hint">
+              Applies to disks added from now on. <em>It converts nothing that is already in the array</em> —
+              use “Encrypt” on a drained volume for that.
+            </div>
+          </div>
+          <button
+            class="access-toggle-btn"
+            :class="{ on: encryption?.encryptNewVolumes }"
+            :disabled="encryptionBusy || !encryption"
+            @click="setEncryptNewVolumes(!encryption?.encryptNewVolumes)"
+          >
+            {{ encryption?.encryptNewVolumes ? 'On' : 'Off' }}
+          </button>
+        </div>
+
+        <div class="access-enforce-row encryption-default">
+          <div>
+            <div class="access-subtitle">Recovery passphrase</div>
+            <div class="access-hint">
+              The only thing that opens these disks if the OS disk dies. Changing it rewrites the keyslot on
+              every encrypted volume, so <em>attach every disk before you change it</em>.
+            </div>
+          </div>
+          <button class="access-toggle-btn" :disabled="encryptionBusy" @click="setRecoveryPassphrase">
+            {{ encryption?.hasRecoveryPassphrase ? 'Change' : 'Set' }}
+          </button>
+        </div>
+
+        <div v-if="encryptionCoverage && encryptionCoverage.encrypted > 0" class="access-enforce-row encryption-default">
+          <div>
+            <div class="access-subtitle">Prove it against the disks</div>
+            <div class="access-hint">
+              <template v-if="encryption?.lastAudit?.healthy">
+                Last proven against all {{ encryption.lastAudit.total }} encrypted disk(s)
+                {{ auditAgeDays === 0 ? 'today' : `${auditAgeDays} day(s) ago` }}.
+              </template>
+              <template v-else-if="auditAgeDays === null">
+                <em>Never checked.</em> Nobody has confirmed these disks can actually be recovered.
+              </template>
+              <template v-else>Last checked {{ auditAgeDays }} day(s) ago.</template>
+            </div>
+          </div>
+          <button
+            class="access-toggle-btn"
+            :class="{ on: encryption?.lastAudit?.healthy }"
+            :disabled="encryptionBusy"
+            @click="auditRecoveryPassphrase"
+          >
+            Check the disks
+          </button>
+        </div>
+      </div>
+
+      <div
+        v-if="encryptionCoverage && encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext > 0"
+        class="access-banner warn banner-standalone"
+      >
+        <strong>This array is partially encrypted.</strong>
+        {{ encryptionCoverage.plaintext }} volume(s) are still plaintext — pulling any one of them exposes
+        every slice it holds. Encryption protects a disk that leaves the building; it does nothing for the
+        disks that haven't been converted.
+      </div>
+
+      <!-- THE WORST NEWS THIS PAGE CAN CARRY. Every disk mounts, every disk serves, the array looks perfect --
+           and the passphrase in your safe opens only some of them. Nothing else in the system will ever notice,
+           because STRUBS mounts with the keyfile and never touches the passphrase slot. -->
+      <div
+        v-if="encryption?.lastAudit && encryption.lastAudit.refused.length"
+        class="access-banner error banner-standalone"
+      >
+        <strong>THE RECOVERY PASSPHRASE DOES NOT OPEN EVERY DISK.</strong>
+        Volume{{ encryption.lastAudit.refused.length === 1 ? '' : 's' }}
+        {{ encryption.lastAudit.refused.map(d => d.volumeId).join(', ') }}
+        do not open with it — almost certainly because they were unplugged when the passphrase was last changed.
+        If the keyfile is lost, those disks are lost with it.
+        <strong>Set the passphrase again with every disk attached</strong>, and they will be rewritten.
+      </div>
+
+      <div
+        v-else-if="encryption?.lastAudit && encryption.lastAudit.unreadable.length"
+        class="access-banner warn banner-standalone"
+      >
+        <strong>Some encrypted disks could not be checked.</strong>
+        The LUKS header on {{ encryption.lastAudit.unreadable.map(d => d.path).join(', ') }} would not read, so
+        we cannot say whether the recovery passphrase still opens
+        {{ encryption.lastAudit.unreadable.length === 1 ? 'it' : 'them' }}.
+        That is a disk fault, not a passphrase fault — but it means those volumes' recoverability is unknown.
+      </div>
+
+      <!-- An encrypted disk we cannot identify is one the fleet-passphrase check cannot see -- which is how a
+           fleet ends up split. The audit counts it as unhealthy; the UI must not then say "last checked today"
+           and leave it at that. -->
+      <!-- An audit that could not even ASK a disk cannot say the fleet is recoverable. An unplugged volume is
+           the likeliest one to be wrong, because it is the one a rotation could not reach. -->
+      <div
+        v-else-if="encryption?.lastAudit && encryption.lastAudit.notChecked?.length"
+        class="access-banner warn banner-standalone"
+      >
+        <strong>The passphrase was not checked against every disk.</strong>
+        Volume{{ encryption.lastAudit.notChecked.length === 1 ? '' : 's' }}
+        {{ encryption.lastAudit.notChecked.join(', ') }}
+        {{ encryption.lastAudit.notChecked.length === 1 ? 'was' : 'were' }} not attached, so
+        {{ encryption.lastAudit.notChecked.length === 1 ? 'it' : 'they' }} could not be asked — and an unplugged
+        disk is the one most likely to have missed a passphrase change. Attach every disk and check again.
+      </div>
+
+      <div
+        v-else-if="encryption?.lastAudit && encryption.lastAudit.unidentified.length"
+        class="access-banner warn banner-standalone"
+      >
+        <strong>An encrypted disk here is not identifiable.</strong>
+        {{ encryption.lastAudit.unidentified.join(', ') }}
+        {{ encryption.lastAudit.unidentified.length === 1 ? 'is a LUKS container' : 'are LUKS containers' }}
+        carrying no STRUBS nameplate, so we cannot tell whether
+        {{ encryption.lastAudit.unidentified.length === 1 ? 'it belongs' : 'they belong' }} to this array.
+        Encryption is blocked until {{ encryption.lastAudit.unidentified.length === 1 ? 'it is' : 'they are' }}
+        identified or detached.
+      </div>
+
+      <div v-else-if="auditIsStale" class="access-banner warn banner-standalone">
+        <strong>The recovery passphrase has {{ auditAgeDays === null ? 'never been' : 'not been' }} checked
+        against the disks{{ auditAgeDays === null ? '' : ` in ${auditAgeDays} days` }}.</strong>
+        STRUBS unlocks these disks with the keyfile, so a passphrase that has stopped working would not show up
+        anywhere else — until the day you need it. Check it now.
+      </div>
+    </section>
+
     <section v-show="activeTab === 'buckets'" class="section access-panel">
       <div class="verify-header">
         <div class="verify-title">
@@ -2943,16 +3052,13 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <div v-if="error" class="error">
-      Error: {{ error }}
-    </div>
-
-    <div
-      v-else-if="loading && !storageStats && volumes.length === 0 && blockDevices.length === 0"
-      class="loading"
-    >
-      Loading...
-    </div>
+      <div
+        v-if="!error && loading && !storageStats && volumes.length === 0 && blockDevices.length === 0"
+        class="loading"
+      >
+        Loading...
+      </div>
+    </main>
 
     <!-- Add Volume Modal -->
     <div v-if="showModal" class="modal-overlay" @click="closeModal">
@@ -3186,11 +3292,32 @@ onUnmounted(() => {
 .logout-btn:hover { background: #e8e8e8; }
 
 .container {
+  /* The tab bar stays put and the page under it scrolls. dvh, not vh: on a phone the browser chrome slides away
+     and 100vh is then taller than the screen, which hides the bottom of the scroller behind the URL bar. */
+  height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+
   width: 100%;
   margin: 0 auto;
   padding: 20px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   box-sizing: border-box;
+}
+
+/* min-height:0 is the whole trick. A flex item's default min-height is auto -- it refuses to shrink below its
+   content -- so without this the body grows to fit the volume list, pushes the container past the viewport, and
+   the WINDOW scrolls (taking the tabs with it) instead of this box. */
+.tab-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+header, .main-tabs, .container > .error {
+  flex: 0 0 auto;
 }
 
 header {
@@ -3348,11 +3475,32 @@ h2 {
 }
 
 .error {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
   background-color: #ffebee;
   color: #c62828;
   padding: 15px;
   border-radius: 4px;
   margin-bottom: 20px;
+}
+
+/* It is PINNED now -- it does not scroll away like it used to, so it needs a way out. */
+.error-dismiss {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 4px;
+  opacity: 0.6;
+}
+
+.error-dismiss:hover {
+  opacity: 1;
 }
 
 .loading {
@@ -4151,13 +4299,15 @@ h2 {
   display: flex;
   align-items: center;
   gap: 12px;
+  margin-bottom: 12px;
 }
 
 .conversion-spinner {
   flex: 0 0 auto;
   width: 14px;
   height: 14px;
-  border: 2px solid rgba(255, 255, 255, 0.25);
+  /* The track is the banner's own text colour, faded -- a white track would vanish into #fff8e1. */
+  border: 2px solid rgba(122, 91, 0, 0.22);
   border-top-color: currentColor;
   border-radius: 50%;
   animation: conversion-spin 0.9s linear infinite;
@@ -4169,29 +4319,24 @@ h2 {
 
 .encryption-bar {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 24px;
-  flex-wrap: wrap;
-  padding: 12px 16px;
-  margin-bottom: 12px;
-  background-color: #2a2a2a;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px;
+  margin: 0 18px 12px;
+  background-color: #fff;
+  border: 1px solid #e0e0e0;
   border-radius: 6px;
 }
 
-.encryption-state {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+/* Each control is its own full-width row: label and explanation on the left, the switch on the right. They
+   used to wrap side-by-side because this bar sat above the volumes table and had to be short. It no longer does. */
+.encryption-default {
+  justify-content: space-between;
 }
 
-.encryption-default {
-  flex: 1;
-  min-width: 320px;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 16px;
+.encryption-default + .encryption-default {
+  border-top: 1px solid #f0f0f0;
+  padding-top: 18px;
 }
 
 /* Modal Styles */

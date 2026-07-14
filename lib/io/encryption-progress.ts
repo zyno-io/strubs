@@ -34,8 +34,18 @@ let current: ConversionProgress | null = null;
 
 export const conversionInProgress = (): ConversionProgress | null => current;
 
-export function beginConversion(volumeId: number): void {
+// ⚠️ THIS IS THE LOCK, NOT A STATUS LINE. It CLAIMS the conversion slot, and returns false if somebody already
+// holds it.
+//
+// It has to be, because "check that nobody is converting, then convert" is only safe if nothing can happen in
+// between -- and the caller now has to `await` its way through an lsblk to find out which disk it is even
+// talking about. Two requests could both pass a separate `conversionInProgress()` check while the first sat in
+// that await, and then wipe two disks at once. Node is single-threaded, which makes a synchronous test-and-set
+// a real mutex: nothing can interleave between the read and the write below.
+export function beginConversion(volumeId: number): boolean {
+    if (current) return false;
     current = { volumeId, phase: 'checking', startedAt: new Date().toISOString() };
+    return true;
 }
 
 export function conversionPhase(phase: ConversionPhase): void {

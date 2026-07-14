@@ -28,17 +28,19 @@ import { findManifestsOnDevices, recoverFleetFromDisks, type FleetRecoverySummar
 import { bootstrapManifestWriter, type ManifestSnapshotRef } from '../../io/bootstrap-manifest';
 import { deviceProvisioner, ENCRYPT_NEW_VOLUMES_KEY } from '../../io/device-provisioner';
 import {
+    assertFleetRecoveryPassphrase,
     auditRecoveryKey,
     hasRecoveryPassphrase,
     lastRecoveryAudit,
     scanFleet,
+    sealedRecoveryPassphrase,
     setFleetRecoveryPassphrase,
     volumeDiskIsAttached,
     withEncryptionSlot,
     type PassphraseRotation,
     type RecoveryAudit
 } from '../../io/luks-recovery-key';
-import type { CachedDevice } from '../../io/device-discovery';
+import { listRawBlockDevices, type CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
 import { drainVolumeJob } from '../../jobs/drain-volume-job';
@@ -165,6 +167,7 @@ export type StatusResponse = {
     // is non-empty -- that is the entire reason this is a list of ids and not a boolean.
     encryption: {
         encryptNewVolumes: boolean;
+        passphraseUsable: boolean;
         hasRecoveryPassphrase: boolean;
         encryptedVolumeIds: number[];
         plaintextVolumeIds: number[];
@@ -968,6 +971,13 @@ export class HttpMgmt {
             encryption: {
                 encryptNewVolumes: await database.getRuntimeConfig(ENCRYPT_NEW_VOLUMES_KEY) === true,
                 hasRecoveryPassphrase: await hasRecoveryPassphrase(),
+
+                // RECORDED AND USABLE ARE NOT THE SAME THING. We can hold an argon2 hash that proves a
+                // passphrase while being unable to PRODUCE it -- an array whose passphrase was set before we
+                // kept a sealed copy, or whose keyfile was restored from a different backup. That array can
+                // verify what an operator types and cannot encrypt a disk on its own, and saying only
+                // "hasRecoveryPassphrase: true" would leave the UI promising something the machine cannot do.
+                passphraseUsable: await sealedRecoveryPassphrase() !== null,
                 encryptedVolumeIds: encrypted,
                 plaintextVolumeIds: plaintext,
                 unknownVolumeIds: unknownEncryption,
@@ -1301,10 +1311,14 @@ export class HttpMgmt {
     private static async handleVolumeEncryptRequest(req: HttpRequest, params: RouteParams): Promise<VolumeStatus> {
         const id = this.parseVolumeId(params);
         const payload = await this.parseJsonBody<{ recoveryPassphrase?: unknown }>(req);
-        const passphrase = payload.recoveryPassphrase;
 
-        if (typeof passphrase !== 'string' || !passphrase)
-            throw new HttpBadRequestError('recoveryPassphrase is required to encrypt a volume');
+        // OPTIONAL, and normally absent. STRUBS holds the fleet passphrase sealed under the keyfile, so it does
+        // not need to be told what it already knows -- the provisioner falls back to the sealed copy and refuses
+        // if there is none. A caller may still pass one (the very first encryption on an array that set its
+        // passphrase before seals existed), and it is checked against the recorded hash exactly as before.
+        if (payload.recoveryPassphrase !== undefined && typeof payload.recoveryPassphrase !== 'string')
+            throw new HttpBadRequestError('recoveryPassphrase must be a string');
+        const passphrase = payload.recoveryPassphrase || undefined;
 
         const volume = ioManager.getVolume(id);
         if (!volume)
@@ -1313,12 +1327,38 @@ export class HttpMgmt {
         if (volume.isEncrypted)
             throw new HttpBadRequestError(`volume ${id} is already encrypted`);
 
-        if (conversionInProgress())
+        // TAKE THE LOCK BEFORE THE FIRST `await`. Everything from here to the wipe is asynchronous -- resolving
+        // the disk alone shells out to lsblk -- and a check that is separated from its claim by an await is not
+        // a check at all. Claim it, or refuse.
+        if (!beginConversion(id))
             throw new HttpBadRequestError('another volume is already being converted; wait for it to finish');
 
-        const blockPath = volume.blockPath;
-        if (!blockPath || !volume.isPresent)
+        try {
+            return await this.convertVolumeToEncrypted(id, volume, passphrase);
+        }
+        finally {
+            endConversion();
+        }
+    }
+
+    private static async convertVolumeToEncrypted(
+        id: number, volume: Volume, passphrase: string | undefined
+    ): Promise<VolumeStatus> {
+        if (!volume.blockPath || !volume.isPresent)
             throw new HttpBadRequestError(`volume ${id} has no disk present: nothing to convert`);
+
+        // THE PROVISIONER TAKES A DISK. THE VOLUME KNOWS A PARTITION.
+        //
+        // `volume.blockPath` is /dev/sde1 -- the partition the filesystem lives on. The provisioner runs `parted`
+        // on what it is given and then waits for a partition to appear underneath it, so it must be handed the
+        // WHOLE DISK (/dev/sde), and `listRawBlockDevices()` only ever lists whole disks. Passing the partition
+        // matched nothing and came back "block device not found" -- which is why no conversion has ever run.
+        //
+        // Resolve it by the PARTITION UUID, not by chopping the digits off the path. These are USB disks: sde
+        // becomes sdf when somebody breathes on the rack, and a rule that manufactures a disk path out of a
+        // partition path is a rule that will one day `parted` the wrong spindle. The uuid is an identity; the
+        // path is a rumour.
+        const blockPath = await this.resolveDiskHoldingPartition(volume);
 
         // THE DOOR MUST ALREADY BE SHUT. WE DO NOT SHUT IT OURSELVES AND WALK STRAIGHT IN.
         //
@@ -1340,19 +1380,35 @@ export class HttpMgmt {
                 + `the state this needs.`
             );
 
-        // SAY WHAT IS HAPPENING. This takes minutes -- the platter walk alone is 89 seconds on the fullest disk
-        // here -- and an operator watching a disabled button cannot tell a working system from a wedged one.
-        beginConversion(id);
-        try {
-            return await this.doVolumeEncrypt(id, volume, blockPath, passphrase);
-        }
-        finally {
-            endConversion();
-        }
+        // The conversion slot is already held by the caller, and released by it whatever happens here.
+        return await this.doVolumeEncrypt(id, volume, blockPath, passphrase);
+    }
+
+    // Which whole disk currently carries this volume's partition? Asked of the machine, right now, by identity.
+    private static async resolveDiskHoldingPartition(volume: Volume): Promise<string> {
+        const partitionUuid = volume.partitionUuid;
+
+        if (!partitionUuid)
+            throw new HttpBadRequestError(
+                `volume ${volume.id} has no partition uuid on record, so the disk holding it cannot be identified. `
+                + `Refusing to guess which spindle to wipe.`
+            );
+
+        const devices = await listRawBlockDevices();
+        const disk = devices.find(device =>
+            device.children?.some(child => child.uuid === partitionUuid));
+
+        if (!disk)
+            throw new HttpBadRequestError(
+                `no attached disk carries volume ${volume.id}'s partition (${partitionUuid}). It may have been `
+                + `unplugged since the fleet last looked.`
+            );
+
+        return disk.path;
     }
 
     private static async doVolumeEncrypt(
-        id: number, volume: Volume, blockPath: string, passphrase: string
+        id: number, volume: Volume, blockPath: string, passphrase: string | undefined
     ): Promise<VolumeStatus> {
         // The same two checks that gate pulling a disk out of the array -- because this destroys the disk just
         // as thoroughly, and "it grew back" is no comfort to an object that was below quorum when it did.
@@ -1554,14 +1610,54 @@ export class HttpMgmt {
     private static async handleEncryptionAuditRequest(req: HttpRequest): Promise<RecoveryAudit> {
         const payload = await this.parseJsonBody<{ recoveryPassphrase?: unknown }>(req);
 
-        if (typeof payload.recoveryPassphrase !== 'string' || !payload.recoveryPassphrase)
+        // Optional. Left out -- which is what the UI does -- we audit the passphrase THE FLEET RECORDS, taken
+        // from the sealed copy and already proven against the argon2 hash. That is the thing the audit exists to
+        // ask about: "does the passphrase we would tell you to use actually open every disk?"
+        //
+        // A caller may still name one explicitly (curl, testing the copy in your safe against the platters).
+        if (payload.recoveryPassphrase !== undefined && typeof payload.recoveryPassphrase !== 'string')
+            throw new HttpBadRequestError('recoveryPassphrase must be a string');
+
+        const passphrase = payload.recoveryPassphrase || await sealedRecoveryPassphrase();
+
+        if (!passphrase)
             throw new HttpBadRequestError(
-                'recoveryPassphrase is required: the audit puts it against every encrypted disk\'s LUKS header, '
-                + 'which is the only way to know it still opens them. We do not keep it on the machine it is '
-                + 'meant to recover.'
+                'there is no recovery passphrase to check. Set one first (PUT /$/encryption/passphrase).'
             );
 
-        return await auditRecoveryKey(payload.recoveryPassphrase);
+        return await auditRecoveryKey(passphrase);
+    }
+
+    // HAND THE PASSPHRASE BACK, ONCE, SO STRUBS CAN USE IT AGAIN.
+    //
+    // An array can RECORD a passphrase (argon2 hash) and be unable to PRODUCE one -- it was set before we kept a
+    // sealed copy, or the keyfile it was sealed under is not the keyfile we hold now. Such an array can check
+    // what you type and cannot encrypt a disk by itself, and no amount of restarting fixes that: a hash does not
+    // run backwards.
+    //
+    // So the operator supplies it one more time. It is checked against the recorded hash -- a wrong one changes
+    // nothing -- and then sealed. This is NOT a rotation: no keyslot is touched, and the passphrase is the same
+    // one it always was. It is the difference between a machine that knows the passphrase and one that merely
+    // recognises it.
+    private static async handleEncryptionSealRequest(req: HttpRequest): Promise<{ passphraseUsable: boolean }> {
+        const payload = await this.parseJsonBody<{ passphrase?: unknown }>(req);
+
+        if (typeof payload.passphrase !== 'string' || !payload.passphrase)
+            throw new HttpBadRequestError('passphrase is required');
+
+        // Verifies against the recorded hash and seals it on the way through. Throws if it is the wrong one.
+        await assertFleetRecoveryPassphrase(payload.passphrase);
+
+        const usable = await sealedRecoveryPassphrase() !== null;
+
+        if (!usable)
+            throw new HttpBadRequestError(
+                'the passphrase was correct, but it could not be sealed -- most likely the LUKS keyfile is '
+                + 'missing or unreadable. Encryption needs both.'
+            );
+
+        log('the recovery passphrase was re-sealed; STRUBS can encrypt disks unattended again');
+        return { passphraseUsable: true };
     }
 
     // SET OR CHANGE THE FLEET RECOVERY PASSPHRASE.
@@ -2003,6 +2099,11 @@ export class HttpMgmt {
                 method: 'PUT',
                 match: url => url === '/$/encryption/passphrase' ? {} : null,
                 handler: async req => this.handleEncryptionPassphraseRequest(req)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/encryption/seal' ? {} : null,
+                handler: async req => this.handleEncryptionSealRequest(req)
             },
             {
                 method: 'DELETE',

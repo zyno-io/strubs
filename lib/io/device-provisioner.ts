@@ -21,7 +21,12 @@ import {
     testPassphrase as luksTestPassphrase,
     writeNameplate as luksWriteNameplate
 } from './luks';
-import { assertFleetRecoveryPassphrase, withEncryptionSlot } from './luks-recovery-key';
+import {
+    assertFleetRecoveryPassphrase,
+    hasRecoveryPassphrase,
+    sealedRecoveryPassphrase,
+    withEncryptionSlot
+} from './luks-recovery-key';
 import { conversionPhase } from './encryption-progress';
 import type { VolumeConfig, PersistedVolumeConfig } from './volume';
 
@@ -67,6 +72,8 @@ type DeviceProvisionerDeps = {
         mapperPath: typeof luksMapperPath;
     };
     assertFleetRecoveryPassphrase: typeof assertFleetRecoveryPassphrase;
+    sealedRecoveryPassphrase: typeof sealedRecoveryPassphrase;
+    hasRecoveryPassphrase: typeof hasRecoveryPassphrase;
     withEncryptionSlot: typeof withEncryptionSlot;
     database: typeof database;
     ioManager: typeof ioManager;
@@ -92,6 +99,8 @@ const defaultDeps: DeviceProvisionerDeps = {
         mapperPath: luksMapperPath
     },
     assertFleetRecoveryPassphrase,
+    sealedRecoveryPassphrase,
+    hasRecoveryPassphrase,
     withEncryptionSlot,
     database,
     ioManager,
@@ -275,6 +284,15 @@ export class DeviceProvisioner {
         if (!partition.uuid)
             throw new HttpBadRequestError('partition UUID unavailable');
 
+        // ⚠️ READ IT BEFORE YOU DESTROY IT. deleteVolume() is a HARD deleteOne, and createVolumeConfig() below
+        // rebuilds the record from scratch -- so anything we mean to carry across has to be in hand BEFORE this
+        // line, not looked up after it. The first version of this fix read the row afterwards, found nothing,
+        // and preserved nothing; its test passed only because the fake database's getVolumes() had never heard
+        // of deleteVolume().
+        const previousVolume = replacedVolumeId !== undefined
+            ? (await this.deps.database.getVolumes()).find(volume => volume.id === replacedVolumeId)
+            : undefined;
+
         if (replacedVolumeId) {
             await this.deps.database.deleteVolume(replacedVolumeId);
             // Drop the old in-memory Volume too. Without this, registerVolume below pushes a SECOND config with
@@ -285,7 +303,8 @@ export class DeviceProvisioner {
 
         // Work out the volume's identity (id and uuid) WITHOUT writing anything yet: the nameplate needs the id,
         // and on an encrypted volume the nameplate has to be on the disk before the volume may exist at all.
-        const volumeConfig = await this.createVolumeConfig(finalDevice, partition, volumeUuid, replacedVolumeId);
+        const volumeConfig = await this.createVolumeConfig(
+            finalDevice, partition, volumeUuid, replacedVolumeId, previousVolume);
 
         // THE NAMEPLATE GOES ON BEFORE THE RECORD DOES, and it must land.
         //
@@ -336,16 +355,40 @@ export class DeviceProvisioner {
                 + `unreadable. A disk encrypted with a key we do not have is a disk full of noise.`
             );
 
-        if (!passphrase)
-            throw new HttpBadRequestError(
-                'encrypting a volume requires the fleet recovery passphrase. It becomes the volume\'s second '
-                + 'keyslot, and a volume with only the keyfile slot dies with the OS disk.'
+        // NOBODY IS ASKED FOR THE PASSPHRASE HERE, AND THAT IS DELIBERATE.
+        //
+        // STRUBS already holds it, sealed under the keyfile, and the disks were written with it BY US. Making an
+        // operator re-type it to encrypt a disk was not a security control -- it protected nothing that the
+        // keyfile does not already open -- it was just a prompt. Worse, it made `encryptNewVolumes` dishonest:
+        // an automatically provisioned disk has no operator to prompt, so the setting could only ever fail.
+        //
+        // It still cannot be produced from thin air. If nothing is sealed, we stop -- we do not invent one, and
+        // we do not encrypt a disk with the keyfile alone (that disk would die with the OS disk).
+        const known = passphrase ?? await this.deps.sealedRecoveryPassphrase();
+
+        if (!known) {
+            // TWO DIFFERENT FAILURES, AND TELLING THEM APART IS THE WHOLE VALUE OF THE MESSAGE. "You never set
+            // one" and "you set one and I cannot use it" want opposite things from the operator, and an array
+            // that says the first when it means the second is calling its own admin a liar.
+            const recorded = await this.deps.hasRecoveryPassphrase();
+
+            throw new HttpBadRequestError(recorded
+                ? 'refusing to encrypt: a recovery passphrase is recorded, but this array cannot USE it -- it '
+                    + 'was set before STRUBS kept a sealed copy, or the keyfile it was sealed under is not the '
+                    + 'one we hold now. A hash proves a passphrase; it cannot produce one. Enter it once on the '
+                    + 'Encryption tab (POST /$/encryption/seal) and this fixes itself.'
+                : 'refusing to encrypt: this array has no recovery passphrase. It becomes the volume\'s second '
+                    + 'keyslot, and a volume with only the keyfile slot dies with the OS disk. Set one on the '
+                    + 'Encryption tab (PUT /$/encryption/passphrase) and try again.'
             );
+        }
 
         // Sets the verifier on the first encrypted volume; on every one after that, refuses a passphrase that
-        // does not match the rest of the fleet.
-        await this.deps.assertFleetRecoveryPassphrase(passphrase);
-        return passphrase;
+        // does not match the rest of the fleet. The sealed copy has already been proven against the recorded
+        // hash before it got here -- but it is cheap, and this is the one check standing between us and a disk
+        // whose keyslot nobody can open.
+        await this.deps.assertFleetRecoveryPassphrase(known);
+        return known;
     }
 
     // Turn a bare partition into an unlocked LUKS container and hand back the mapper to mkfs.
@@ -584,13 +627,30 @@ export class DeviceProvisioner {
         throw new HttpBadRequestError('partition creation timed out');
     }
 
-    private async createVolumeConfig(device: RawBlockDevice, partition: RawBlockDeviceChild, uuid: string, replaceVolumeId?: number): Promise<PersistedVolumeConfig> {
+    private async createVolumeConfig(
+        device: RawBlockDevice, partition: RawBlockDeviceChild, uuid: string, replaceVolumeId?: number,
+        previous?: { label?: string | null; comment?: string | null }
+    ): Promise<PersistedVolumeConfig> {
         const existing = await this.deps.database.getVolumes();
         const nextId = replaceVolumeId ?? this.getNextVolumeId(existing);
         if (!device.serial)
             throw new HttpBadRequestError('device serial unavailable');
         if (!partition.uuid)
             throw new HttpBadRequestError('partition UUID unavailable');
+
+        // WHAT THE OPERATOR WROTE DOWN SURVIVES THE WIPE.
+        //
+        // This record is built from scratch and stored under the SAME id, so every field not named here is
+        // silently dropped. The label ("2.1") is which shelf and which bay the disk is physically in, and the
+        // comment is whatever the operator needed to remember about it -- neither is derivable from the disk,
+        // neither is recreated by anything, and neither has the faintest thing to do with encryption. Converting
+        // a volume erased them, which is how volume 57 came back from its conversion as an anonymous spindle in
+        // a rack of thirty identical ones.
+        //
+        // The volume is the same volume: same id, same slot, same bay. It only changed clothes.
+        //
+        // `previous` is handed in by the caller, which read it BEFORE the old row was hard-deleted. It cannot be
+        // looked up here: by this point the row is gone.
         return {
             id: nextId,
             uuid,
@@ -599,6 +659,10 @@ export class DeviceProvisioner {
             read_only: false,
             disk_serial: device.serial,
             partition_uuid: partition.uuid,
+
+            // Operator-set, and about the DISK IN THE RACK -- not about the filesystem we just rewrote.
+            label: previous?.label ?? null,
+            comment: previous?.comment ?? null,
 
             // THE RAW PARTITION SIZE, encrypted or not. A LUKS2 header takes ~16MiB off the top, so the usable
             // payload is fractionally smaller -- but this field is checked against the DISCOVERED partition size

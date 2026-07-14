@@ -55,6 +55,18 @@ export class LuksError extends Error {
 }
 
 // Is the keyfile there, and only readable by us? A 0644 key on a shared box is not a key, it is a formality.
+// The keyfile's bytes. It is the key to every disk in the fleet, so it is never logged and never leaves this
+// process -- but the recovery-passphrase seal needs it, and the alternative (a second copy of the "where does
+// the key live" logic) is how the fstype bug got written three times.
+export async function readKeyfile(keyfile = DEFAULT_KEYFILE): Promise<Buffer | null> {
+    try {
+        return await fsp.readFile(keyfile);
+    }
+    catch {
+        return null;
+    }
+}
+
 export async function keyfileReadable(keyfile = DEFAULT_KEYFILE): Promise<boolean> {
     try {
         const st = await fsp.stat(keyfile);

@@ -6,6 +6,7 @@ export default defineConfig({
         environment: 'node',
         pool: 'threads',
         include: ['tests/**/*.test.ts'],
+        setupFiles: ['tests/setup.ts'],
         coverage: {
             provider: 'v8',
             reporter: ['text', 'lcov'],

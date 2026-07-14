@@ -5,10 +5,20 @@ import { DeviceProvisioner } from '../lib/io/device-provisioner';
 
 const createDeps = () => {
     const listRawBlockDevices = vi.fn();
+    // ⚠️ A FAKE DATABASE THAT CANNOT LIE ABOUT DELETION.
+    //
+    // getVolumes() used to be a fixed mockResolvedValue and deleteVolume() a no-op, so the fake happily served
+    // rows that the code under test had already destroyed. That is not a stand-in for Mongo; it is a stand-in
+    // for a Mongo that never deletes anything -- and it let a metadata-preservation fix pass its test while
+    // preserving nothing in production (the real deleteVolume is a hard deleteOne).
+    //
+    // So the rows are STATE, and deleteVolume actually removes one.
+    let rows: Array<Record<string, unknown>> = [{ id: 1 }];
     const database = {
-        getVolumes: vi.fn().mockResolvedValue([{ id: 1 }]),
-        createVolume: vi.fn().mockResolvedValue(undefined),
-        deleteVolume: vi.fn().mockResolvedValue(undefined),
+        setVolumes: (next: Array<Record<string, unknown>>) => { rows = next; },
+        getVolumes: vi.fn(async () => rows.map(row => ({ ...row }))),
+        createVolume: vi.fn(async (volume: Record<string, unknown>) => { rows.push({ ...volume }); }),
+        deleteVolume: vi.fn(async (id: number) => { rows = rows.filter(row => row.id !== id); }),
         // The fleet default. `undefined` is what an untouched array returns from runtimeConfig, and it must
         // mean "no encryption" -- shipping in `off` is the whole plan.
         getRuntimeConfig: vi.fn().mockResolvedValue(undefined)
@@ -32,6 +42,12 @@ const createDeps = () => {
         mapperPath: vi.fn().mockImplementation((uuid: string) => `/dev/mapper/strubs-${uuid}`)
     };
     const assertFleetRecoveryPassphrase = vi.fn().mockResolvedValue(undefined);
+
+    // What STRUBS knows without asking anybody: the fleet passphrase, sealed under the keyfile. (The literal,
+    // not the PASSPHRASE const -- that is declared inside the describe below, and this factory runs first.)
+    const sealedRecoveryPassphrase = vi.fn<() => Promise<string | null>>()
+        .mockResolvedValue('correct horse battery staple');
+    const hasRecoveryPassphrase = vi.fn<() => Promise<boolean>>().mockResolvedValue(true);
     // The gate that stops a passphrase rotation running through the middle of an encrypted provision.
     const withEncryptionSlot = vi.fn(async (fn: () => Promise<unknown>) => fn());
     const spawnHelper = vi.fn().mockResolvedValue({ code: 0, stdout: '' });
@@ -43,7 +59,7 @@ const createDeps = () => {
     // characters. Testing with a tidy 16-hex string is what let the nameplate ship unparseable by its own
     // reader: the test agreed with the code, and both were wrong about the machine.
     const instanceIdentity = vi.fn().mockReturnValue('2fb05f23-1d5e-4c00-bb71-f3109b42476c');
-    return { listRawBlockDevices, database, ioManager, luks, spawnHelper, sleepSecs, probeDeviceForStrubsIdentity, instanceIdentity, assertFleetRecoveryPassphrase, withEncryptionSlot };
+    return { listRawBlockDevices, database, ioManager, luks, spawnHelper, sleepSecs, probeDeviceForStrubsIdentity, instanceIdentity, assertFleetRecoveryPassphrase, sealedRecoveryPassphrase, hasRecoveryPassphrase, withEncryptionSlot };
 };
 
 const baseDevice: RawBlockDevice = {
@@ -396,14 +412,77 @@ describe('DeviceProvisioner', () => {
             expect(deps.luks.assertRecoverable).toHaveBeenCalledWith('/dev/sdb1');
         });
 
-        it('refuses to encrypt with no recovery passphrase at all, before partitioning', async () => {
+        // NOBODY IS PROMPTED. The passphrase is sealed under the keyfile and the provisioner takes it from
+        // there -- which is what makes `encryptNewVolumes` honest, because a disk provisioned automatically has
+        // no operator standing by to type anything.
+        it('takes the passphrase from the seal when the caller does not supply one', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await provisioner.provision({ blockPath: '/dev/sdb', encrypt: true });
+
+            expect(deps.sealedRecoveryPassphrase).toHaveBeenCalled();
+            expect(deps.luks.addPassphrase).toHaveBeenCalledWith('/dev/sdb1', PASSPHRASE);
+            expect(deps.assertFleetRecoveryPassphrase).toHaveBeenCalledWith(PASSPHRASE);
+        });
+
+        // ...BUT IT CANNOT BE INVENTED. A volume with only the keyfile slot dies with the OS disk, so if nothing
+        // holds a passphrase we stop -- and we stop BEFORE `parted`, while the disk is still whole.
+        it('refuses to encrypt when no passphrase exists anywhere, before partitioning', async () => {
+            deps.sealedRecoveryPassphrase.mockResolvedValue(null);
+            deps.hasRecoveryPassphrase.mockResolvedValue(false);
             deps.listRawBlockDevices.mockResolvedValueOnce([baseDevice]);
 
             const provisioner = new DeviceProvisioner(deps);
             await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true }))
-                .rejects.toThrow(/recovery passphrase/);
+                .rejects.toThrow(/has no recovery passphrase/);
 
             expect(deps.spawnHelper).not.toHaveBeenCalledWith('parted', expect.anything());
+            expect(deps.luks.format).not.toHaveBeenCalled();
+        });
+
+        // ⚠️ "YOU NEVER SET ONE" AND "I CANNOT USE THE ONE YOU SET" ARE DIFFERENT SENTENCES.
+        //
+        // An array that recorded a passphrase before STRUBS kept a usable copy holds a hash it can check and
+        // cannot produce. Telling that operator "this array has no recovery passphrase" -- when they set one,
+        // and wrote it down -- would send them looking for a fault that does not exist, and the fix (say it once
+        // more) is nowhere in that sentence.
+        it('says the passphrase is UNUSABLE, not missing, when one is on record', async () => {
+            deps.sealedRecoveryPassphrase.mockResolvedValue(null);
+            deps.hasRecoveryPassphrase.mockResolvedValue(true);
+            deps.listRawBlockDevices.mockResolvedValueOnce([baseDevice]);
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true }))
+                .rejects.toThrow(/cannot USE it/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('parted', expect.anything());
+            expect(deps.luks.format).not.toHaveBeenCalled();
+        });
+
+        // A brand-new disk has no previous record to inherit from, and must not pick one up by accident.
+        it('gives a genuinely new volume no label', async () => {
+            deps.database.setVolumes([{ id: 57, label: '2.1', comment: 'not mine' }]);
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await provisioner.provision({ blockPath: '/dev/sdb', encrypt: true });
+
+            expect(deps.database.createVolume).toHaveBeenCalledWith(expect.objectContaining({
+                id: 58, label: null, comment: null
+            }));
+        });
+
+        // An explicit passphrase still wins -- the API accepts one, and it is checked against the fleet exactly
+        // as it always was.
+        it('prefers an explicitly supplied passphrase over the seal', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await provisioner.provision({ blockPath: '/dev/sdb', encrypt: true, recoveryPassphrase: PASSPHRASE });
+
+            expect(deps.sealedRecoveryPassphrase).not.toHaveBeenCalled();
+            expect(deps.assertFleetRecoveryPassphrase).toHaveBeenCalledWith(PASSPHRASE);
         });
 
         // A passphrase that does not match the rest of the fleet leaves you holding a key that opens SOME of
@@ -527,6 +606,35 @@ describe('DeviceProvisioner', () => {
                     identity: { volumeId, instanceIdentity: identity }
                 });
             };
+
+            // ⚠️ THE LABEL IS WHICH BAY THE DISK IS IN. Encryption rewrites the platter; it does not move the
+            // disk to another shelf. The conversion builds a FRESH record under the same id, so every field not
+            // copied across is simply gone -- and the label ("2.1" = shelf 2, bay 1) and the comment are
+            // operator knowledge that nothing in the system can reconstruct. Volume 57 came back from its first
+            // real conversion as an anonymous spindle in a rack of thirty identical ones.
+            it('keeps the label and comment: the disk did not move, it only changed clothes', async () => {
+                ourDisk(7);
+                deps.database.setVolumes([
+                    { id: 7, label: '2.1', comment: 'replaced under warranty 2025-11' }
+                ]);
+                deps.listRawBlockDevices
+                    .mockResolvedValueOnce([deviceWithPartition('PART-UUID')])
+                    .mockResolvedValueOnce([baseDevice])
+                    .mockResolvedValueOnce([deviceWithPartition(null)])
+                    .mockResolvedValueOnce([luksDevice('LUKS-UUID')]);
+
+                const provisioner = new DeviceProvisioner(deps);
+                await provisioner.provision({
+                    blockPath: '/dev/sdb', wipe: true, replace: true, encrypt: true,
+                    recoveryPassphrase: PASSPHRASE, convertVolumeId: 7
+                });
+
+                expect(deps.database.createVolume).toHaveBeenCalledWith(expect.objectContaining({
+                    id: 7,
+                    label: '2.1',
+                    comment: 'replaced under warranty 2025-11'
+                }));
+            });
 
             it('converts our own drained volume, keeping its id', async () => {
                 ourDisk(7);

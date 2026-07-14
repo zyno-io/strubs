@@ -1,4 +1,4 @@
-import { argon2, randomBytes, timingSafeEqual } from 'crypto';
+import { argon2, createCipheriv, createDecipheriv, hkdfSync, randomBytes, timingSafeEqual } from 'crypto';
 
 import { config } from '../config';
 import { database } from '../database';
@@ -8,6 +8,7 @@ import {
     addPassphrase,
     containerUuid,
     findEncryptedPartitions,
+    readKeyfile,
     removePassphrase,
     testPassphrase,
     type EncryptedDisk
@@ -54,6 +55,119 @@ export const RECOVERY_VERIFIER_KEY = 'luksRecoveryVerifier';
 // The last time the passphrase was PROVEN against the platters (see auditRecoveryKey). Not load-bearing -- the
 // keyfile is -- but it is how an operator knows the disks really do open, before the day they must.
 export const RECOVERY_AUDIT_KEY = 'luksRecoveryAudit';
+
+// ---------------------------------------------------------------------------------------------------------
+// THE SEALED COPY -- why STRUBS keeps a passphrase it could otherwise merely verify.
+//
+// A hash proves a passphrase. It cannot PRODUCE one, and LUKS needs the actual bytes to write a keyslot. So an
+// array whose only record of the passphrase is a hash must ask a human for it every single time it encrypts a
+// disk -- which made `encryptNewVolumes` a lie: the setting says "encrypt disks added from now on", but the
+// provisioner had nobody to ask, so an automatic provision with the setting ON simply failed.
+//
+// So we keep the passphrase, sealed with the keyfile (AES-256-GCM, key derived from the keyfile via HKDF).
+//
+// THIS GIVES AN ATTACKER NOTHING. To open the seal you need the keyfile -- and the keyfile ALREADY OPENS EVERY
+// DISK IN THE FLEET, outright, without troubling the passphrase at all. Anyone who can read this blob can read
+// `/var/lib/strubs/luks.key` sitting next to it, and would not bother with either: they would just mount the
+// disks. The seal is strictly weaker than what it sits beside, so it widens nothing.
+//
+// What it costs is honesty about one thing: the recovery passphrase is now recoverable BY THE MACHINE while the
+// machine is intact. That was already true -- the keyfile could always open everything. The passphrase exists
+// for the case where the machine is NOT intact, and in that case the seal is gone with it, and you type the
+// passphrase from your safe. Nothing about that changes.
+//
+// ⚠️ AND THE SEAL IS NEVER TRUSTED ON ITS OWN. Whatever comes out of it is checked against the argon2 hash --
+// the authority -- before it is allowed near a disk. A seal that disagrees with the hash (a rotation that
+// crashed between the two writes, a keyfile restored from a different backup) is REFUSED, not used. A stale
+// passphrase written into a new disk's keyslot is exactly the split fleet this whole file exists to prevent.
+export const RECOVERY_SEALED_KEY = 'luksRecoverySealed';
+
+type Sealed = { v: 1; salt: string; iv: string; tag: string; ct: string };
+
+const isSealed = (v: unknown): v is Sealed => {
+    const s = v as Sealed | null;
+    return Boolean(s && s.v === 1 && typeof s.salt === 'string' && typeof s.iv === 'string'
+        && typeof s.tag === 'string' && typeof s.ct === 'string');
+};
+
+const sealKey = (keyfile: Buffer, salt: Buffer): Buffer =>
+    Buffer.from(hkdfSync('sha256', keyfile, salt, 'strubs-luks-recovery-passphrase', 32));
+
+function seal(passphrase: string, keyfile: Buffer): Sealed {
+    const salt = randomBytes(16);
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', sealKey(keyfile, salt), iv);
+    const ct = Buffer.concat([cipher.update(passphrase, 'utf8'), cipher.final()]);
+    return {
+        v: 1,
+        salt: salt.toString('base64'),
+        iv: iv.toString('base64'),
+        tag: cipher.getAuthTag().toString('base64'),
+        ct: ct.toString('base64')
+    };
+}
+
+function unseal(sealed: Sealed, keyfile: Buffer): string | null {
+    try {
+        const decipher = createDecipheriv(
+            'aes-256-gcm', sealKey(keyfile, Buffer.from(sealed.salt, 'base64')), Buffer.from(sealed.iv, 'base64'));
+        decipher.setAuthTag(Buffer.from(sealed.tag, 'base64'));
+        return Buffer.concat([decipher.update(Buffer.from(sealed.ct, 'base64')), decipher.final()]).toString('utf8');
+    }
+    catch {
+        // A DIFFERENT KEYFILE. The tag did not verify, so this blob was sealed by a key we no longer hold --
+        // an OS disk restored from a backup older than the last keyfile, most likely. Not an error to throw at
+        // the caller: it means "we do not know the passphrase", which is a thing the caller must handle anyway.
+        return null;
+    }
+}
+
+// THE PASSPHRASE, IF WE HONESTLY KNOW IT. Null means "ask a human" -- never a guess.
+//
+// Every path out of here that returns a string has proven that string against the argon2 hash first.
+export async function sealedRecoveryPassphrase(overrides: Partial<RecoveryKeyDeps> = {}): Promise<string | null> {
+    const deps = { ...defaultDeps, ...overrides };
+
+    const verifier = await getVerifier(deps);
+    if (!verifier) return null;                       // no passphrase has ever been set
+
+    const stored = await deps.database.getRuntimeConfig(RECOVERY_SEALED_KEY);
+    if (!isSealed(stored)) return null;               // set before we kept a sealed copy, or never sealed
+
+    const keyfile = await deps.readKeyfile();
+    if (!keyfile) return null;                        // no keyfile: nothing to encrypt with anyway
+
+    const passphrase = unseal(stored, keyfile);
+    if (passphrase === null) {
+        log.error('the sealed recovery passphrase does not open with this keyfile -- ignoring it. Set the '
+            + 'recovery passphrase again to re-seal it.');
+        return null;
+    }
+
+    // ⚠️ THE AUTHORITY IS THE HASH, NOT THE SEAL. If a rotation crashed between recording the hash and
+    // re-sealing, this blob holds the PREVIOUS passphrase -- and writing that into a new disk's keyslot would
+    // hand us a disk the recorded passphrase does not open. Refuse.
+    if (!await verify(passphrase, verifier)) {
+        log.error('the sealed recovery passphrase does not match the recorded one -- ignoring it. A passphrase '
+            + 'change probably did not finish. Set the recovery passphrase again.');
+        return null;
+    }
+
+    return passphrase;
+}
+
+// Keep the sealed copy in step with the hash. Best-effort by design: failing to seal must never fail the
+// operation that set the passphrase, because the passphrase itself is already safely on the disks.
+async function reseal(passphrase: string, deps: RecoveryKeyDeps): Promise<void> {
+    try {
+        const keyfile = await deps.readKeyfile();
+        if (!keyfile) return;
+        await deps.database.setRuntimeConfig(RECOVERY_SEALED_KEY, seal(passphrase, keyfile));
+    }
+    catch (err) {
+        log.error('failed to seal the recovery passphrase: %s', err instanceof Error ? err.message : String(err));
+    }
+}
 
 
 // argon2id, built into Node 24 -- no native dependency, which this codebase deliberately avoids. 64 MiB and
@@ -117,6 +231,7 @@ export type RecoveryKeyDeps = {
     // The LUKS header's own uuid, read from whatever is at that path RIGHT NOW. A path is not an identity.
     containerUuid: typeof containerUuid;
 
+    readKeyfile: typeof readKeyfile;
 };
 
 export type FleetScan = {
@@ -132,7 +247,8 @@ const defaultDeps: RecoveryKeyDeps = {
     addPassphrase,
     removePassphrase,
     testPassphrase,
-    containerUuid
+    containerUuid,
+    readKeyfile
 };
 
 // IS THIS ONE VOLUME'S DISK IN THE MACHINE? -- asked directly, about a volume that may be soft-deleted.
@@ -343,6 +459,11 @@ export async function assertFleetRecoveryPassphrase(
                 + 'out which until you needed them. (To CHANGE the passphrase, use PUT /$/encryption/passphrase, '
                 + 'which rewrites it on every disk.)'
             );
+
+        // Proven correct against the hash, so it is safe to seal -- and this is the only moment an array that
+        // predates the seal (or whose keyfile was restored under it) can get one without bothering anybody.
+        if (await sealedRecoveryPassphrase(overrides) === null)
+            await reseal(passphrase, deps);
         return;
     }
 
@@ -414,6 +535,10 @@ export async function assertFleetRecoveryPassphrase(
         if (!winner || !await verify(passphrase, winner))
             throw new HttpBadRequestError('that is not this fleet\'s recovery passphrase.');
     }
+
+    // Ours or theirs, this passphrase is now the fleet's and has been proven against the hash. Seal it, so the
+    // NEXT disk does not have to ask a human -- which is the entire point of `encryptNewVolumes`.
+    await reseal(passphrase, deps);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -520,6 +645,7 @@ async function rotate(
         // Nothing is encrypted yet, so there is no keyslot to rewrite: this simply records the passphrase that
         // the next encryption will use.
         await deps.database.setRuntimeConfig(RECOVERY_VERIFIER_KEY, await hash(next));
+        await reseal(next, deps);
         log('the fleet recovery passphrase was set. No volume is encrypted yet, so no keyslot was changed.');
         return { volumes: [], rotatedAt: new Date().toISOString() };
     }
@@ -598,6 +724,11 @@ async function rotate(
 
     // --- 2. Every disk has it. NOW it is the fleet's passphrase. ---
     await deps.database.setRuntimeConfig(RECOVERY_VERIFIER_KEY, await hash(next));
+
+    // Re-seal straight away. Crash in the gap between these two writes and the seal still holds the OLD
+    // passphrase -- which is why nothing is ever allowed to USE the seal without checking it against the hash
+    // first. It fails closed: STRUBS asks a human instead of writing a stale passphrase onto a fresh disk.
+    await reseal(next, deps);
     log('all %d encrypted volume(s) now open with the new recovery passphrase; it is recorded', ours.length);
 
     // --- 3. Retire the old one. Best-effort, deliberately. ---

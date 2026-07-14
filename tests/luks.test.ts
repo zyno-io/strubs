@@ -29,14 +29,17 @@ import {
     auditRecoveryKey,
     hasRecoveryPassphrase,
     lastRecoveryAudit,
+    sealedRecoveryPassphrase,
     setFleetRecoveryPassphrase,
     withEncryptionSlot,
     RECOVERY_AUDIT_KEY,
+    RECOVERY_SEALED_KEY,
     RECOVERY_VERIFIER_KEY
 } from '../lib/io/luks-recovery-key';
 import {
     addPassphrase,
     assertRecoverable,
+    DEFAULT_KEYFILE,
     ensureKeyfile,
     ensureKeyfileSlot,
     findEncryptedPartitions,
@@ -60,6 +63,7 @@ const fakeDeps = (opts: {
     keyIsUnique?: boolean;
     absentVolumes?: number[];
     identity?: string | null;
+    keyfile?: Buffer | null;
 } = {}) => {
     const store = new Map<string, unknown>();
     let encrypted = opts.encrypted ?? [];
@@ -118,7 +122,10 @@ const fakeDeps = (opts: {
         testPassphrase: vi.fn(async (path: string, pass: string) => {
             if (opts.unreadableDisks?.includes(path)) return 'unreadable';
             return slotsOf(path).has(pass) ? 'opens' : 'rejected';
-        })
+        }),
+
+        // The key to every disk in the fleet -- and, therefore, what the sealed passphrase is sealed with.
+        readKeyfile: vi.fn(async () => opts.keyfile === undefined ? Buffer.alloc(512, 7) : opts.keyfile)
     } as any;
 };
 
@@ -142,7 +149,7 @@ describe('luks', () => {
     const stubFs = () => {
         statMock.mockImplementation(async (target: any) => {
             const path = String(target);
-            if (path === '/var/lib/strubs/luks.key')
+            if (path === DEFAULT_KEYFILE)
                 return { mode: 0o400 } as any;
             if (path.startsWith('/dev/mapper/')) {
                 if (!mapperExists) throw new Error('ENOENT');
@@ -274,7 +281,7 @@ describe('luks', () => {
                 '--batch-mode',
                 '--key-file', '-',                  // EXISTING key: the passphrase, on stdin
                 '/dev/sdf1',
-                '/var/lib/strubs/luks.key'          // NEW key: the keyfile being restored
+                DEFAULT_KEYFILE                     // NEW key: the keyfile being restored
             ]);
             expect(options.stdin).toBe('the fleet passphrase');
 
@@ -560,6 +567,111 @@ describe('the fleet recovery passphrase', () => {
 // ---------------------------------------------------------------------------------------------------------
 // CHANGING IT -- which is possible because we hold the keyfile, and is what makes everything else simple.
 // ---------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------
+// THE SEALED PASSPHRASE -- the copy STRUBS can USE, not merely verify.
+//
+// A hash cannot produce a passphrase, and LUKS needs the actual bytes to write a keyslot. Without a usable copy
+// every encryption had to prompt a human -- which made `encryptNewVolumes` a lie, because a disk provisioned
+// automatically has nobody to prompt.
+//
+// It is sealed with the keyfile, and that gives an attacker NOTHING: the keyfile already opens every disk
+// outright. What matters is that the seal is never trusted on its own -- it is proven against the argon2 hash,
+// which is the authority, before it is ever allowed near a disk.
+// ---------------------------------------------------------------------------------------------------------
+describe('the sealed recovery passphrase', () => {
+    const PASS = 'correct horse battery staple';
+
+    it('is not the passphrase in the clear -- it is sealed with the keyfile', async () => {
+        const db = fakeDeps();
+        await setFleetRecoveryPassphrase(PASS, undefined, db);
+
+        const sealed = db.store.get(RECOVERY_SEALED_KEY);
+        expect(JSON.stringify(sealed)).not.toContain('correct horse');
+        expect(await sealedRecoveryPassphrase(db)).toBe(PASS);
+    });
+
+    it('gives STRUBS the passphrase without asking anybody -- which is what lets a new disk encrypt itself', async () => {
+        const db = fakeDeps();
+        await setFleetRecoveryPassphrase(PASS, undefined, db);
+
+        expect(await sealedRecoveryPassphrase(db)).toBe(PASS);
+    });
+
+    it('says nothing when no passphrase was ever set', async () => {
+        expect(await sealedRecoveryPassphrase(fakeDeps())).toBeNull();
+    });
+
+    // The OS disk was restored from a backup older than the last keyfile. The blob is there, and it is noise.
+    it('refuses a seal that this keyfile does not open, rather than returning rubbish', async () => {
+        const db = fakeDeps();
+        await setFleetRecoveryPassphrase(PASS, undefined, db);
+
+        db.readKeyfile.mockResolvedValue(Buffer.alloc(512, 9));   // a DIFFERENT keyfile
+
+        expect(await sealedRecoveryPassphrase(db)).toBeNull();
+    });
+
+    it('says nothing when the keyfile is gone -- there is nothing to unseal with', async () => {
+        const db = fakeDeps();
+        await setFleetRecoveryPassphrase(PASS, undefined, db);
+
+        db.readKeyfile.mockResolvedValue(null);
+
+        expect(await sealedRecoveryPassphrase(db)).toBeNull();
+    });
+
+    // ⚠️ THE ONE THAT MATTERS. A rotation that crashed between recording the new hash and re-sealing leaves a
+    // seal holding the PREVIOUS passphrase. Hand that to a new disk's keyslot and you have built, deliberately,
+    // the split fleet this entire file exists to prevent: a disk the recorded passphrase does not open.
+    //
+    // So the hash is the authority, and a seal that disagrees with it is refused. It fails closed -- STRUBS asks
+    // a human rather than writing a passphrase it cannot prove.
+    it('REFUSES a seal that disagrees with the recorded hash (a rotation that did not finish)', async () => {
+        const db = fakeDeps();
+        await setFleetRecoveryPassphrase(PASS, undefined, db);
+
+        // The hash moves on; the seal does not. Exactly the crash window.
+        const stale = db.store.get(RECOVERY_SEALED_KEY);
+        await setFleetRecoveryPassphrase('an entirely different passphrase', PASS, db);
+        db.store.set(RECOVERY_SEALED_KEY, stale);
+
+        expect(await sealedRecoveryPassphrase(db)).toBeNull();
+    });
+
+    it('follows a rotation, so the next disk encrypts with the CURRENT passphrase', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'] });
+        db.slotsOf('/dev/sdf1').add(PASS);
+        await setFleetRecoveryPassphrase(PASS, undefined, db);
+
+        await setFleetRecoveryPassphrase('the new fleet passphrase', PASS, db);
+
+        expect(await sealedRecoveryPassphrase(db)).toBe('the new fleet passphrase');
+    });
+
+    // An array that set its passphrase before seals existed has a hash and no seal. It cannot encrypt
+    // unattended -- but the moment an operator proves the passphrase for any reason, we can seal it.
+    it('is created when an operator proves the passphrase on an array that has no seal', async () => {
+        const db = fakeDeps();
+        await setFleetRecoveryPassphrase(PASS, undefined, db);
+        db.store.delete(RECOVERY_SEALED_KEY);
+        expect(await sealedRecoveryPassphrase(db)).toBeNull();
+
+        await assertFleetRecoveryPassphrase(PASS, db);
+
+        expect(await sealedRecoveryPassphrase(db)).toBe(PASS);
+    });
+
+    it('is not created by a WRONG passphrase', async () => {
+        const db = fakeDeps();
+        await setFleetRecoveryPassphrase(PASS, undefined, db);
+        db.store.delete(RECOVERY_SEALED_KEY);
+
+        await expect(assertFleetRecoveryPassphrase('not the fleet passphrase', db)).rejects.toThrow();
+
+        expect(db.store.get(RECOVERY_SEALED_KEY)).toBeUndefined();
+    });
+});
+
 describe('changing the fleet recovery passphrase', () => {
     const OLD = 'the old fleet passphrase';
     const NEW = 'the new fleet passphrase';
