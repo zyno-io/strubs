@@ -22,6 +22,7 @@ import {
     writeNameplate as luksWriteNameplate
 } from './luks';
 import { assertFleetRecoveryPassphrase, withEncryptionSlot } from './luks-recovery-key';
+import { conversionPhase } from './encryption-progress';
 import type { VolumeConfig, PersistedVolumeConfig } from './volume';
 
 // Whether a NEWLY PROVISIONED volume is encrypted. Ships `false`: encryption is a capability, not a default we
@@ -252,10 +253,15 @@ export class DeviceProvisioner {
 
         // WHAT WE MKFS IS NOT ALWAYS THE PARTITION. On an encrypted volume the ext4 goes on the mapper; putting
         // it on the partition would overwrite the LUKS header we just wrote.
+        if (passphrase !== null)
+            conversionPhase('encrypting');
+
         const filesystemTarget = passphrase !== null
             ? await this.encryptPartition(partitionPath, volumeUuid, passphrase)
             : partitionPath;
 
+        // mkfs on a 4TB disk is not instant either. Say so.
+        conversionPhase('formatting');
         await this.formatPartition(filesystemTarget);
         await this.deps.sleepSecs(2);
 

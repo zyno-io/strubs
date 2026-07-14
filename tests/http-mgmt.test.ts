@@ -820,6 +820,7 @@ describe('HttpMgmt.handle', () => {
                 // Never audited. Reported as null rather than as healthy -- on an encrypted fleet, "nobody has
                 // ever confirmed these disks can be recovered" is a fact worth stating, not an absence.
                 lastAudit: null,
+                conversion: null,   // nothing being converted right now
                 encryptedVolumeIds: [],
                 // volume2's disk is present and plaintext: pulling it still leaks every slice on it.
                 plaintextVolumeIds: [2],

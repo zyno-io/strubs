@@ -1346,8 +1346,35 @@ const auditIsStale = computed(() => {
   return age === null || age > 90;
 });
 
-// Convert one volume to encrypted. This REBUILDS THE DISK: it is only allowed on a drained volume, and the
-// server refuses it otherwise. The rebalance refills it afterwards.
+// What a conversion is DOING right now, in words an operator can act on. It takes minutes -- the platter walk
+// alone is ~90 seconds on the fullest disk in this array -- and a disabled button for two minutes is
+// indistinguishable from a wedged system. The reasonable response to that (reload, click again, restart the
+// service) is the worst thing you could do to a disk that is mid-wipe.
+const CONVERSION_STEPS: Record<string, string> = {
+  checking:    'Checking the volume is drained and safe to wipe',
+  scanning:    'Scanning the platter for anything we must not destroy',
+  wiping:      'Wiping the disk',
+  encrypting:  'Writing the LUKS header and keyslots',
+  formatting:  'Making the filesystem',
+  registering: 'Bringing the volume back into service'
+};
+
+const conversion = computed(() => encryption.value?.conversion ?? null);
+
+const conversionLabel = computed(() => {
+  const c = conversion.value;
+  if (!c) return '';
+
+  const step = CONVERSION_STEPS[c.phase] ?? c.phase;
+
+  // A COUNT, NOT A PERCENTAGE. We do not know how many files are on the platter until we have finished
+  // walking it, so a percentage would be a number we made up. A rising count says "alive" without lying.
+  return c.phase === 'scanning' && c.filesScanned
+    ? `${step} — ${c.filesScanned.toLocaleString()} files so far`
+    : step;
+});
+
+// Convert one volume to encrypted. This REBUILDS THE DISK:
 async function encryptVolume(): Promise<void> {
   const volume = contextMenuVolume.value;
   if (volume === null) return;
@@ -1374,6 +1401,10 @@ async function encryptVolume(): Promise<void> {
   if (!passphrase) return;
 
   encryptionBusy.value = true;
+
+  // Poll while it runs, so the operator watches it work rather than watching nothing.
+  const ticker = window.setInterval(() => void fetchEncryptionStatus(), 2000);
+
   try {
     const res = await apiFetch(`${apiBaseUrl}/$/volumes/${volumeId}/encrypt`, {
       method: 'POST',
@@ -1389,7 +1420,9 @@ async function encryptVolume(): Promise<void> {
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to encrypt volume';
   } finally {
+    window.clearInterval(ticker);
     encryptionBusy.value = false;
+    await fetchEncryptionStatus();
   }
 }
 
@@ -2271,6 +2304,21 @@ onUnmounted(() => {
           </button>
         </div>
       </div>
+      <!-- A CONVERSION IS RUNNING. It takes minutes and it wipes a disk. Say what it is doing, or a disabled
+           button for two minutes looks exactly like a wedged system -- and the reasonable response to that
+           (reload, click again, restart) is the worst thing you can do to a disk that is mid-wipe. -->
+      <div v-if="conversion" class="access-banner warn banner-standalone conversion-banner">
+        <span class="conversion-spinner" aria-hidden="true"></span>
+        <span>
+          <strong>Encrypting volume {{ conversion.volumeId }}.</strong>
+          {{ conversionLabel }}.
+          <em v-if="conversion.phase === 'scanning'">
+            Nothing has been changed yet — this step exists to make sure nothing on the disk is worth keeping.
+          </em>
+          <em v-else>The disk is being rewritten. Do not pull it, and do not restart STRUBS.</em>
+        </span>
+      </div>
+
       <!-- ENCRYPTION COVERAGE. Deliberately never says "protected" while a single plaintext disk remains:
            pulling that disk still leaks every slice on it, and a green tick here would be a lie. -->
       <div v-if="encryptionCoverage" class="encryption-bar">
@@ -4099,6 +4147,26 @@ h2 {
 }
 
 /* --- encryption coverage bar (Volumes tab) --- */
+.conversion-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.conversion-spinner {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: conversion-spin 0.9s linear infinite;
+}
+
+@keyframes conversion-spin {
+  to { transform: rotate(360deg); }
+}
+
 .encryption-bar {
   display: flex;
   align-items: center;

@@ -317,7 +317,11 @@ export async function buildSliceIndex(
                             // one" would be a poor reason to have made it.
                             if (!slots[sliceIndex]) slots[sliceIndex] = platter.volumeId + 1;
 
-                            if (++files % 1_000_000 === 0) onProgress?.(files);
+                            // Every 50k rather than every million: at ~23,000 files a second (measured on the
+                            // fullest disk in this array) that is a tick roughly every two seconds, which is
+                            // what a UI needs to prove it is not wedged. A million-file interval would tick
+                            // twice in a 90-second scan.
+                            if (++files % 50_000 === 0) onProgress?.(files);
                         }
         }
     };

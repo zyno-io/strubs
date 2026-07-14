@@ -14,6 +14,14 @@ import { snapshotJob } from '../../jobs/snapshot-job';
 import { namespaceRestore, type RestoreSummary } from '../../recovery/restore';
 import { driftScrubJob, type DriftReport } from '../../jobs/drift-scrub-job';
 import { buildSliceIndex } from '../../recovery/recovery';
+import {
+    beginConversion,
+    conversionInProgress,
+    conversionPhase,
+    conversionScanned,
+    endConversion,
+    type ConversionProgress
+} from '../../io/encryption-progress';
 import { readProcMounts } from '../../io/helpers';
 import { mapperPath as luksMapperPath } from '../../io/luks';
 import { findManifestsOnDevices, recoverFleetFromDisks, type FleetRecoverySummary } from '../../recovery/bootstrap';
@@ -167,6 +175,10 @@ export type StatusResponse = {
         // never -- which on an encrypted fleet means nobody has ever confirmed the disks can actually be
         // recovered. That is worth saying out loud rather than leaving as an absence.
         lastAudit: RecoveryAudit | null;
+
+        // A conversion running RIGHT NOW, and which of its several long steps it is on. Null when idle. The UI
+        // polls this so a two-minute operation does not look like a wedged one.
+        conversion: ConversionProgress | null;
     };
 };
 
@@ -959,7 +971,8 @@ export class HttpMgmt {
                 encryptedVolumeIds: encrypted,
                 plaintextVolumeIds: plaintext,
                 unknownVolumeIds: unknownEncryption,
-                lastAudit: await lastRecoveryAudit()
+                lastAudit: await lastRecoveryAudit(),
+                conversion: conversionInProgress()
             }
         };
     }
@@ -1300,6 +1313,9 @@ export class HttpMgmt {
         if (volume.isEncrypted)
             throw new HttpBadRequestError(`volume ${id} is already encrypted`);
 
+        if (conversionInProgress())
+            throw new HttpBadRequestError('another volume is already being converted; wait for it to finish');
+
         const blockPath = volume.blockPath;
         if (!blockPath || !volume.isPresent)
             throw new HttpBadRequestError(`volume ${id} has no disk present: nothing to convert`);
@@ -1324,6 +1340,20 @@ export class HttpMgmt {
                 + `the state this needs.`
             );
 
+        // SAY WHAT IS HAPPENING. This takes minutes -- the platter walk alone is 89 seconds on the fullest disk
+        // here -- and an operator watching a disabled button cannot tell a working system from a wedged one.
+        beginConversion(id);
+        try {
+            return await this.doVolumeEncrypt(id, volume, blockPath, passphrase);
+        }
+        finally {
+            endConversion();
+        }
+    }
+
+    private static async doVolumeEncrypt(
+        id: number, volume: Volume, blockPath: string, passphrase: string
+    ): Promise<VolumeStatus> {
         // The same two checks that gate pulling a disk out of the array -- because this destroys the disk just
         // as thoroughly, and "it grew back" is no comfort to an object that was below quorum when it did.
         // (Live slices, and the last surviving copy of a journal segment.)
@@ -1347,6 +1377,9 @@ export class HttpMgmt {
         // it could not read throws rather than reporting an empty disk -- which is exactly the property a wipe
         // guard needs and exactly the property a Mongo count does not have.
         await this.assertPlatterHoldsNoSlices(volume);
+
+        // Everything past this line changes the disk.
+        conversionPhase('wiping');
 
         // Stop and unbind, keeping the record. The provisioner re-registers under the same id.
         await ioManager.deregisterVolume(id);
@@ -1376,6 +1409,8 @@ export class HttpMgmt {
             log.error('conversion of volume%d failed: %s', id, err);
             throw err;
         }
+
+        conversionPhase('registering');
 
         // Back into service, empty. Clearing draining + read-only is what lets the rebalance refill it -- an
         // encrypted volume left read-only would just sit there looking converted and doing nothing.
@@ -1452,7 +1487,11 @@ export class HttpMgmt {
 
         let index;
         try {
-            index = await buildSliceIndex([{ volumeId: volume.id, mountPoint: volume.mountPoint }]);
+            conversionPhase('scanning');
+            index = await buildSliceIndex(
+                [{ volumeId: volume.id, mountPoint: volume.mountPoint }],
+                files => conversionScanned(files)
+            );
         }
         catch (err) {
             // The scan itself refused (an unreadable directory). Fail closed: that is what it is for.
