@@ -1346,6 +1346,127 @@ describe('recovery: a fleet restore raises its flag before it touches anything',
         // database, that is none of them.
         expect(order).toEqual(['mark', 'identity', 'volumes']);
     });
+
+    // RECOVERING AN ENCRYPTED FLEET, WHICH IS THE ONLY KIND OF RECOVERY ENCRYPTION MAKES HARDER.
+    //
+    // The passphrase keyslot exists for exactly one day: the OS disk is gone, the keyfile with it, and thirty
+    // encrypted disks are still in the rack. If the recovery path cannot USE that passphrase, the keyslot is
+    // decoration and the array is scrap.
+    describe('with an encrypted fleet', () => {
+        const manifest = {
+            instanceIdentity: 'i'.repeat(32),
+            updatedAt: '2026-07-13T00:00:00Z',
+            geometry: { dataSlices: 4, paritySlices: 2 },
+            journalVolumeIds: [1],
+            volumes: [{
+                id: 1, uuid: 'u1', enabled: true, healthy: true, readOnly: false,
+                partitionSize: 1, dataSize: 1, paritySize: 1, isDeleted: false, isDraining: false
+            }],
+            snapshot: null
+        };
+
+        const deps = (overrides: Record<string, unknown> = {}) => ({
+            findManifests: async () => [
+                { device: '/dev/sdf1', manifest: manifest as never },
+                { device: '/dev/sdg1', manifest: manifest as never }
+            ],
+            restoreInterrupted: async () => null,
+            existingVolumes: async () => [],
+            beginRestore: async () => undefined,
+            adoptIdentity: async () => undefined,
+            writeVolumes: async () => undefined,
+            keyfileReadable: async () => true,
+            ...overrides
+        });
+
+        // THE TRAP AT THE END OF A RECOVERY. Having got in with the passphrase, every encrypted volume now
+        // unlocks only when a human types it -- and `Restart=always` has nobody to ask. The array would come
+        // back, serve, and never survive a reboot. So the keyfile goes back into a keyslot on every disk.
+        it('puts the keyfile back into a keyslot on every disk it recovered', async () => {
+            const ensured: string[] = [];
+
+            const summary = await recoverFleetFromDisks(deps({
+                ensureKeyfileSlot: async (partition: string, passphrase: string) => {
+                    expect(passphrase).toBe('the fleet recovery passphrase');
+                    ensured.push(partition);
+                    return 'added' as const;
+                }
+            }) as never, { recoveryPassphrase: 'the fleet recovery passphrase' });
+
+            expect(ensured).toEqual(['/dev/sdf1', '/dev/sdg1']);
+            expect(summary.keyfileRestoredOn).toEqual(['/dev/sdf1', '/dev/sdg1']);
+        });
+
+        // A recovery that did not need the passphrase (the keyfile is still here; only Mongo died) must not go
+        // rewriting LUKS headers it has no reason to touch.
+        it('touches no keyslot when the recovery did not need the passphrase', async () => {
+            const ensure = vi.fn();
+
+            const summary = await recoverFleetFromDisks(deps({ ensureKeyfileSlot: ensure }) as never, {});
+
+            expect(ensure).not.toHaveBeenCalled();
+            expect(summary.keyfileRestoredOn).toEqual([]);
+        });
+
+        // Best-effort, per disk. A slot that could not be restored means that ONE volume needs a hand at the
+        // next boot -- it is not a reason to fail a recovery that has otherwise brought the array back.
+        it('completes the recovery even if a keyslot cannot be restored', async () => {
+            const summary = await recoverFleetFromDisks(deps({
+                ensureKeyfileSlot: async (partition: string) => {
+                    if (partition === '/dev/sdf1') throw new Error('header is read-only');
+                    return 'added' as const;
+                }
+            }) as never, { recoveryPassphrase: 'the fleet recovery passphrase' });
+
+            expect(summary.volumesRestored).toBe(1);
+            expect(summary.keyfileRestoredOn).toEqual(['/dev/sdg1']);
+        });
+
+        // ⚠️ NEVER WRITE OUR KEYFILE ONTO SOMEBODY ELSE'S DISK.
+        //
+        // The scan reports every disk that gave up a manifest, INCLUDING a stranger's array plugged into this
+        // host -- that is why reconcileManifests keeps a `foreign` list at all. Handing all of them to the
+        // keyslot restorer would add THIS host's keyfile to ANOTHER array's LUKS header, provided the
+        // operator's passphrase happened to open it: writing to a disk we have just finished establishing is
+        // not ours, in the one tool whose entire promise is that it does not touch what it has not identified.
+        it('does not touch a keyslot on a FOREIGN array\'s disk', async () => {
+            const foreign = {
+                ...manifest,
+                instanceIdentity: 'f'.repeat(32)   // somebody else's array, plugged into this host
+            };
+            const ensured: string[] = [];
+
+            const summary = await recoverFleetFromDisks(deps({
+                findManifests: async () => [
+                    { device: '/dev/sdf1', manifest: manifest as never },
+                    { device: '/dev/sdg1', manifest: manifest as never },
+                    { device: '/dev/sdz1', manifest: foreign as never }      // <- not ours
+                ],
+                ensureKeyfileSlot: async (partition: string) => {
+                    ensured.push(partition);
+                    return 'added' as const;
+                }
+            }) as never, { recoveryPassphrase: 'the fleet recovery passphrase' });
+
+            expect(ensured).toEqual(['/dev/sdf1', '/dev/sdg1']);
+            expect(ensured).not.toContain('/dev/sdz1');
+            expect(summary.keyfileRestoredOn).not.toContain('/dev/sdz1');
+        });
+
+        // No keyfile on the host to put back. Say so loudly rather than reporting a restored keyslot that does
+        // not exist.
+        it('does not claim to have restored a keyfile it does not have', async () => {
+            const ensure = vi.fn();
+
+            const summary = await recoverFleetFromDisks(deps({
+                keyfileReadable: async () => false,
+                ensureKeyfileSlot: ensure
+            }) as never, { recoveryPassphrase: 'the fleet recovery passphrase' });
+
+            expect(ensure).not.toHaveBeenCalled();
+            expect(summary.keyfileRestoredOn).toEqual([]);
+        });
+    });
 });
 
 

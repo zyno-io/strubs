@@ -673,16 +673,61 @@ This must be fixed *before* the first volume is ever encrypted. Not after.
 
 ### Code surface
 
+**IMPLEMENTED (2026-07-13/14). Shipped in `off`; zero volumes converted.**
+
 | | |
 |---|---|
-| `device-provisioner.ts` | **fix `deviceHasMountedPartitions` to see mapper grandchildren (blocking, data-loss)**; `parted` → `luksFormat` + `luksOpen` → `mkfs.ext4` on the mapper; set the GPT nameplate; hard-refuse any device carrying a STRUBS nameplate/identity |
-| `device-discovery.ts` | keep `crypt` children; resolve holders; expose `PARTLABEL` (the nameplate) and the LUKS container UUID |
-| `volume-fleet.ts` | bind through the mapper; stale-mount detection against the mapper path; `partition_size` vs the LUKS header; `isEncrypted` derived at discovery |
-| `volume.ts` | unlock before mount, close after unmount; **split `verify()` into `verifyIdentity()` (read-only) and `initializeIdentity()`** |
-| `device-reconciler.ts` | unlock a reappearing encrypted disk |
-| `system-log-watcher.ts` | **parse `EXT4-fs (dm-N)` AND resolve `dm-N` → physical device (both — hard prerequisite)** |
-| `mgmt.ts` | `POST /$/volumes/{id}/encrypt`; `isEncrypted` in `VolumeStatus`; fleet coverage in `/$/status` |
-| `ui/` | lock badge per volume, fleet coverage, the encrypt action, and a loud warning about the passphrase |
+| `device-provisioner.ts` | ✅ `deviceHasMountedPartitions` walks the whole subtree; `assertDeviceIsNotOurs` runs on EVERY path; `luksFormat` + passphrase + `luksOpen` → `mkfs.ext4` **on the mapper**; GPT nameplate; the `convertVolumeId` path (see below) |
+| `device-discovery.ts` | ✅ keeps `crypt` grandchildren; exposes `PARTLABEL` (the nameplate). The partition's `uuid` under LUKS is the **container** uuid — deliberate: it is the one id readable while the disk is still locked |
+| `volume-fleet.ts` | ✅ stale-mount detection compares the **mapper** path; `deregisterVolume()` (stop + unbind, delete nothing) |
+| `volume.ts` | ✅ unlock before mount, **lock after unmount**; fsck the mapper, not the ciphertext; a volume that cannot unlock reports `locked: …` in `mountError` and the rest of the fleet serves on |
+| `device-reconciler.ts` | ✅ nothing to do — it remounts via `volume.mount()`, which now unlocks first |
+| `system-log-watcher.ts` | ✅ done as a prerequisite (`bbe8a4d`): parses `EXT4-fs (dm-N)`/`JBD2` and resolves `dm-N` → physical device via `mapperLeaves()` |
+| `helpers/spawn.ts` | ✅ resolves on `close` (not `exit`) so a wipefs whose stdout we dropped can no longer look like a blank disk; `stdin` support so the passphrase never touches argv |
+| `mgmt.ts` | ✅ `POST /$/volumes/{id}/encrypt`; `PUT /$/encryption/settings`; `isEncrypted` in `VolumeStatus`; three-way fleet coverage in `/$/status` |
+| `ui/` | ✅ lock badges, coverage bar, encrypt action, and a partial-encryption warning that refuses to call the array protected |
+
+**The recovery passphrase is enforced, not advised.** `luks.format()` creates only the keyfile slot, so
+`addPassphrase()` + `assertRecoverable()` (which re-reads the header and demands ≥2 keyslots) run before
+the mkfs — a keyfile-only volume is impossible to create, not merely discouraged. A salted-scrypt verifier
+in Mongo (`luks-recovery-key.ts`) refuses a passphrase that disagrees with the rest of the fleet, so the
+fleet cannot silently end up with two different recovery keys. The verifier does not weaken the threat
+model: it lives on the OS disk, not the platters, and anyone holding the OS disk already has the keyfile.
+
+**Conversion wipes one of our own disks on purpose**, so `convertVolumeId` inverts the identity guard: the
+disk must **prove** it is that exact volume, of this instance, before anything touches it. A stranger's
+disk, a blank disk, an unreadable disk, or one of ours bearing a different volume id all still refuse.
+
+It also refuses:
+
+- a volume that is **still writable** — it does not flip the read-only flag and walk straight in. A PUT
+  commits its slice files *before* it inserts the object record, so a write already in flight would leave
+  slices on a platter we are about to wipe and a record arriving afterwards pointing at them. The quiesce is
+  the operator's hours-long drain, not a millisecond of ours;
+- a volume whose **platter still holds slice files**, checked by walking the disk (`buildSliceIndex`) rather
+  than by asking Mongo. **Mongo cannot see orphans**, and an orphan is *recoverable data* — reporting zero
+  live slices for a disk carrying 9,000 of them, and wiping it, inverts *orphans beat phantoms*. The scan
+  fails closed: an unreadable directory throws rather than reporting an empty disk;
+- a volume that is **not mounted**, because then the platter cannot be scanned at all.
+
+### Recovering an encrypted fleet — the day the passphrase earns its keep
+
+The bootstrap scan unlocks `crypto_LUKS` partitions (keyfile first, recovery passphrase otherwise), reads the
+manifest from the mapper, and locks up again. Without this, a fully encrypted fleet whose OS disk has died
+scans as a pile of foreign disks and **the supported DR path is simply dead** — at the exact moment encryption
+has turned "we lost the metadata" into "we lost everything". Disks that will not open are counted against the
+recovery, exactly like disks that will not mount: a recovery planned from a partial view of the array is one
+that can quietly decide a volume never existed.
+
+Recovery then **puts the new keyfile back into a keyslot on every disk it opened**. Skip that and the recovery
+works exactly once: every volume would unlock only when a human types the passphrase, and `Restart=always` has
+nobody to ask.
+
+**The verifier is not the authority; the platters are.** If Mongo is rebuilt, the recovery verifier is gone
+while the encrypted disks are not — and trusting its absence would let the next encryption establish a *brand
+new* passphrase and split the fleet. So when the verifier is missing but encrypted volumes exist, the
+passphrase is checked against a real LUKS header (`cryptsetup --test-passphrase`). Creating the verifier is
+atomic (`$setOnInsert`), so two concurrent first-encryptions cannot each believe they were first.
 
 New binary dependency: `cryptsetup` (already present on the host).
 

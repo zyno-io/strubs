@@ -4,8 +4,17 @@ import path from 'path';
 
 import { createLogger } from '../log';
 import { spawnHelper } from '../helpers/spawn';
+import { normalizeIdentity } from '../config';
 import { newestManifest, type BootstrapManifest } from '../io/bootstrap-manifest';
 import { listRawBlockDevices } from '../io/device-discovery';
+import { classifyPartition } from '../io/signature-probe';
+import {
+    closeByName,
+    ensureKeyfileSlot as luksEnsureKeyfileSlot,
+    isLuksFsType,
+    keyfileReadable,
+    openWithSecret
+} from '../io/luks';
 import { volumeConfigsFromManifest, assertSafeToRestoreFleet } from './fleet-restore';
 import type { PersistedVolumeConfig } from '../io/volume';
 
@@ -34,20 +43,70 @@ export type DiscoveredManifest = {
 
 // Mount each candidate partition read-only, read its manifest, unmount. Returns everything found, so the
 // caller can see disagreement rather than have it resolved for them behind their back.
-export async function findManifestsOnDevices(): Promise<DiscoveredManifest[]> {
+export type ScanOptions = {
+    // The fleet recovery passphrase. Needed when the disks are encrypted AND the keyfile is gone -- which is
+    // the whole scenario the passphrase exists for. Without it, an encrypted fleet is scanned and found to be
+    // a pile of unreadable ciphertext, which is not a recovery.
+    recoveryPassphrase?: string;
+};
+
+export async function findManifestsOnDevices(options: ScanOptions = {}): Promise<DiscoveredManifest[]> {
     const devices = await listRawBlockDevices();
     const found: DiscoveredManifest[] = [];
     const silent: string[] = [];
+    const locked: string[] = [];
 
     for (const device of devices) {
         for (const child of device.children ?? []) {
             if (child.type !== 'part') continue;
 
-            // We only ever mkfs ext. A foreign filesystem is not ours, and trying to mount one is how a
-            // recovery tool starts touching things it should not.
-            if (!child.fstype?.startsWith('ext')) continue;
-
             const partition = child.path ?? `/dev/${child.name}`;
+
+            // WHAT IS ON IT? -- and an lsblk that did not cache the fstype is not a disk with nothing on it.
+            //
+            // This loop used to read `child.fstype` directly, which meant an ENCRYPTED disk of ours whose
+            // fstype lsblk had not cached was skipped as though it were a stranger's: it never got unlocked,
+            // never counted as locked or silent, and so never VOTED on which array this host is. Recovery could
+            // then adopt a volume table from a subset of the fleet and quietly decide the missing volumes never
+            // existed. Same mistake, third guard -- so all three now share one classifier.
+            const kind = await classifyPartition(child.fstype, partition);
+
+            if (kind.kind === 'unreadable') {
+                log.error('%s could not be identified (%s) -- counting it as SILENT. A disk that will not answer '
+                    + 'is not a disk with nothing on it.', partition, kind.reason);
+                silent.push(partition);
+                continue;
+            }
+
+            // AN ENCRYPTED DISK IS NOT AN ABSENT ONE.
+            //
+            // The manifest lives INSIDE the filesystem, so on a LUKS volume it is behind the encryption -- and
+            // the only thing outside it is the nameplate. Skipping these means that on a fully encrypted fleet
+            // the recovery scan finds NOTHING, reports a bare host with a pile of foreign disks, and the
+            // supported disaster-recovery path is simply dead -- at the exact moment encryption has made losing
+            // the metadata unrecoverable rather than merely painful.
+            //
+            // So unlock and read it. The keyfile if we still have one, the operator's passphrase if we do not.
+            if (kind.kind === 'luks') {
+                const probe = await readManifestFromLuks(partition, options.recoveryPassphrase);
+
+                if (probe.kind === 'manifest') {
+                    log('found a bootstrap manifest on %s (encrypted)', partition);
+                    found.push({ device: partition, manifest: probe.manifest });
+                }
+                else if (probe.kind === 'locked')
+                    locked.push(partition);
+                else if (probe.kind === 'silent')
+                    silent.push(partition);
+
+                continue;
+            }
+
+            // We only ever mkfs ext. A foreign filesystem -- or a positively blank partition -- is not ours, and
+            // trying to mount one is how a recovery tool starts touching things it should not.
+            if (kind.kind !== 'ext')
+                continue;
+
             const probe = await readManifestReadOnly(partition);
 
             if (probe.kind === 'manifest') {
@@ -65,10 +124,60 @@ export async function findManifestsOnDevices(): Promise<DiscoveredManifest[]> {
         log.error('%d ext partition(s) would not give up a manifest: %s. If those are STRUBS disks, this recovery '
             + 'is being planned from an INCOMPLETE picture of the array.', silent.length, silent.join(', '));
 
+    if (locked.length)
+        log.error('%d encrypted partition(s) could NOT be unlocked: %s. Without the recovery passphrase they are '
+            + 'ciphertext, and this recovery is being planned from an INCOMPLETE picture of the array.',
+            locked.length, locked.join(', '));
+
     // Attached to the result so the caller can weigh the vote against the disks that did NOT answer, rather
-    // than against only the ones that did.
-    (found as DiscoveredManifest[] & { silent?: string[] }).silent = silent;
+    // than against only the ones that did. A LOCKED disk is a disk that did not answer.
+    const annotated = found as DiscoveredManifest[] & { silent?: string[]; locked?: string[] };
+    annotated.silent = [...silent, ...locked];
+    annotated.locked = locked;
     return found;
+}
+
+// Unlock, read, lock again. Nothing is written -- the mapper is opened, the filesystem mounted `ro,noload`,
+// and both are torn down before we return, whatever happens.
+async function readManifestFromLuks(
+    partition: string, passphrase?: string
+): Promise<ProbeResult | { kind: 'locked' }> {
+    // A name of our own, so we can never collide with (or adopt) a mapper somebody else left lying around.
+    const name = `strubs-probe-${partition.replace(/[^a-zA-Z0-9]/g, '-')}`;
+
+    // The keyfile first -- it is the ordinary case (a Mongo loss with the OS disk intact). The passphrase is
+    // the bad day.
+    const secrets: Array<{ keyfile?: string; passphrase?: string }> = [];
+    if (await keyfileReadable())
+        secrets.push({});
+    if (passphrase)
+        secrets.push({ passphrase });
+
+    if (!secrets.length) {
+        log.error('%s is encrypted, and we have neither the keyfile nor a recovery passphrase to open it with.',
+            partition);
+        return { kind: 'locked' };
+    }
+
+    for (const secret of secrets) {
+        try {
+            await openWithSecret(partition, name, secret);
+        }
+        catch {
+            continue;   // this key did not open it; try the next
+        }
+
+        try {
+            return await readManifestReadOnly(`/dev/mapper/${name}`);
+        }
+        finally {
+            await closeByName(name).catch(() => undefined);
+        }
+    }
+
+    log.error('%s is encrypted and none of the keys we hold opened it. If it is one of ours, this recovery is '
+        + 'incomplete.', partition);
+    return { kind: 'locked' };
 }
 
 // THREE ANSWERS, NOT TWO -- and conflating them let the host's own root filesystem vote on the recovery.
@@ -91,7 +200,25 @@ async function readManifestReadOnly(partition: string): Promise<ProbeResult> {
         // `ro,noload` -- read-only, and do not replay the ext4 journal. Replaying it would be a WRITE, on a
         // disk we have not yet established is ours, in a tool whose entire promise is that it does not touch
         // anything.
-        await spawnHelper('mount', ['-o', 'ro,noload', partition, mountPoint]);
+        // ⚠️ CHECK THE EXIT CODE. spawnHelper RESOLVES on a non-zero exit -- it does not throw -- so this
+        // `catch` only ever fired if the mount binary could not be spawned at all.
+        //
+        // A partition that FAILED TO MOUNT therefore fell straight through to the read below, found an empty
+        // temp directory, got ENOENT, and was recorded as 'none': "it mounted fine and it is not one of ours."
+        // The one answer it must never give. A disk that would not mount is exactly the disk most likely to be
+        // OURS AND BROKEN, possibly carrying the newest volume table -- and it was being counted as a
+        // stranger's, silently, in the vote that decides which array this host belongs to.
+        //
+        // The same costume the bug wears everywhere else in this system: a failure to LOOK, reported as a fact
+        // about the DATA.
+        const { code, stdout, stderr } = await spawnHelper('mount', ['-o', 'ro,noload', partition, mountPoint]);
+
+        if (code !== 0) {
+            log.error('%s would not mount read-only (%s) -- counting it as SILENT, not as a foreign disk',
+                partition, (stderr || stdout || `exit ${code}`).trim());
+            await fsp.rm(mountPoint, { recursive: true, force: true }).catch(() => undefined);
+            return { kind: 'silent' };
+        }
     }
     catch {
         // WILL NOT MOUNT. On a bare host, this is far more likely to be one of ours that has failed than a
@@ -286,22 +413,28 @@ export type FleetRecoverySummary = {
     volumesRestored: number;
     journalVolumeIds: number[];
     snapshotObjectId: string | null;
+
+    // Encrypted disks whose keyfile keyslot we put back, so the fleet can unlock unattended again. Empty on a
+    // plaintext fleet, and empty when the recovery did not need the passphrase.
+    keyfileRestoredOn: string[];
 };
 
 export type FleetRecoveryDeps = {
-    findManifests: () => Promise<DiscoveredManifest[]>;
+    findManifests: (options?: ScanOptions) => Promise<DiscoveredManifest[]>;
     adoptIdentity: (identity: string) => Promise<void>;
     existingVolumes: () => Promise<unknown[]>;
     writeVolumes: (configs: PersistedVolumeConfig[]) => Promise<void>;
     restoreInterrupted: () => Promise<{ expected: number; startedAt: string } | null>;
     beginRestore: (expected: number) => Promise<void>;
+    ensureKeyfileSlot?: (partition: string, passphrase: string) => Promise<'added' | 'already-present'>;
+    keyfileReadable?: () => Promise<boolean>;
 };
 
 export async function recoverFleetFromDisks(
     deps: FleetRecoveryDeps,
-    opts: { force?: boolean } = {}
+    opts: { force?: boolean; recoveryPassphrase?: string } = {}
 ): Promise<FleetRecoverySummary> {
-    const found = await deps.findManifests();
+    const found = await deps.findManifests({ recoveryPassphrase: opts.recoveryPassphrase });
     if (!found.length)
         throw new Error('no bootstrap manifest was found on any disk attached to this host. Either these are not '
             + 'STRUBS disks, or none of them would mount. Nothing has been changed.');
@@ -331,6 +464,27 @@ export async function recoverFleetFromDisks(
 
     await deps.writeVolumes(configs);
 
+    // RE-ARM UNATTENDED BOOT, or this recovery works exactly once.
+    //
+    // If we got in here on the PASSPHRASE, the keyfile is gone -- and every encrypted volume in the fleet will
+    // now unlock only when a human types it. `Restart=always` has nobody to ask. The array would come back,
+    // serve, and then never survive a reboot, which is a trap laid at the end of a recovery.
+    //
+    // So put the new keyfile back into a keyslot on each encrypted disk while we still hold a passphrase that
+    // opens them. Best-effort per disk: a volume whose slot could not be restored is a volume that needs a hand
+    // at the next boot, not a reason to fail a recovery that has otherwise worked.
+    // ONLY THE DISKS OF THE ARRAY WE JUST ADOPTED.
+    //
+    // `found` is every disk that gave up a manifest -- including a stranger's, if one is plugged into this host
+    // (reconcileManifests names them, which is the whole reason it counts a `foreign` list). Handing all of them
+    // to the keyslot restorer would ADD THIS HOST'S KEYFILE TO ANOTHER ARRAY'S DISK, provided the operator's
+    // passphrase happened to open it. That is writing to a disk we have just finished establishing is not ours,
+    // in the one tool whose entire promise is that it does not touch things it has not identified.
+    const ourDisks = found.filter(entry =>
+        normalizeIdentity(entry.manifest.instanceIdentity ?? '') === normalizeIdentity(manifest.instanceIdentity));
+
+    const keyfileRestored = await restoreKeyfileSlots(deps, ourDisks, opts.recoveryPassphrase);
+
     log('restored %d volume(s) from the manifest; restart STRUBS to bring the fleet up', configs.length);
 
     return {
@@ -339,6 +493,43 @@ export async function recoverFleetFromDisks(
         foreignDisks: foreign,
         volumesRestored: configs.length,
         journalVolumeIds: manifest.journalVolumeIds ?? [],
-        snapshotObjectId: manifest.snapshot?.objectId ?? null
+        snapshotObjectId: manifest.snapshot?.objectId ?? null,
+        keyfileRestoredOn: keyfileRestored
     };
+}
+
+async function restoreKeyfileSlots(
+    deps: FleetRecoveryDeps, found: DiscoveredManifest[], passphrase?: string
+): Promise<string[]> {
+    if (!passphrase)
+        return [];
+
+    const ensure = deps.ensureKeyfileSlot ?? luksEnsureKeyfileSlot;
+    const readable = deps.keyfileReadable ?? keyfileReadable;
+
+    if (!await readable()) {
+        log.error('the recovery used the passphrase, but there is no keyfile on this host to put back into the '
+            + 'disks\' keyslots. Create one (see docs/operations.md) and re-run the recovery, or the encrypted '
+            + 'volumes will not unlock unattended and the array will not survive a reboot.');
+        return [];
+    }
+
+    const restored: string[] = [];
+
+    for (const entry of found) {
+        try {
+            const outcome = await ensure(entry.device, passphrase);
+            if (outcome === 'added') {
+                restored.push(entry.device);
+                log('the keyfile keyslot was restored on %s', entry.device);
+            }
+        }
+        catch (err) {
+            // Not fatal. The volume still opens with the passphrase; it just will not do so by itself.
+            log.error('could not restore the keyfile keyslot on %s: %s. That volume will not unlock unattended.',
+                entry.device, err);
+        }
+    }
+
+    return restored;
 }

@@ -90,4 +90,11 @@ typings/
 !.yarn/versions
 
 # The orphan-quarantine plan: 15MB of generated paths, rebuilt on demand by `orphan-quarantine.ts plan`.
+#
+# ⚠️ THE ONE IN tools/ ON THE BOX IS THE REVERSAL RECORD for the 52,480 files that were quarantined, not
+# deleted. It is not in git because it is production object metadata and megabytes of it -- but do not tidy it
+# off the disk either: without it the quarantine cannot be undone.
 tools/orphan-quarantine-manifest.json
+
+# Same: production object metadata, generated, and not something to put in a public history.
+tools/dead-archive-manifest.json

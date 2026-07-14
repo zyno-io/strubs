@@ -6,6 +6,13 @@ vi.mock('../lib/io/helpers', async (importActual) => {
     return { ...actual, readProcMounts: vi.fn().mockResolvedValue(new Map<string, string>()) };
 });
 
+// The mapper's backing device -- the kernel's own answer to "what is this dm-crypt device actually sitting
+// on?". Mocked so the encrypted stale-mount branch is deterministic.
+vi.mock('../lib/io/luks', async (importActual) => {
+    const actual = await importActual<typeof import('../lib/io/luks')>();
+    return { ...actual, mapperBackingDevice: vi.fn().mockResolvedValue(null) };
+});
+
 // A mock Volume that models the parts of the real lifecycle reconcile() touches.
 vi.mock('../lib/io/volume', () => ({
     Volume: vi.fn(function (this: any, config: any) {
@@ -24,6 +31,11 @@ vi.mock('../lib/io/volume', () => ({
         this.fsType = null;
         this.deviceName = null;
         this.deviceGroup = null;
+
+        // Derived from the disk, exactly as the real Volume derives it -- never a stored flag.
+        Object.defineProperty(this, 'isEncrypted', {
+            get: () => (this.fsType ?? '').toLowerCase() === 'crypto_luks'
+        });
 
         this.bindDevice = vi.fn((device: any, partition: any) => {
             this.deviceName = device.name;
@@ -54,8 +66,10 @@ vi.mock('../lib/io/volume', () => ({
 
 import { VolumeFleet } from '../lib/io/volume-fleet';
 import { readProcMounts } from '../lib/io/helpers';
+import { mapperBackingDevice } from '../lib/io/luks';
 
 const readProcMountsMock = vi.mocked(readProcMounts);
+const mapperBackingDeviceMock = vi.mocked(mapperBackingDevice);
 
 const logger = () => {
     const log: any = (..._a: any[]) => undefined;
@@ -115,6 +129,72 @@ describe('VolumeFleet.reconcile', () => {
         expect(volume.deviceName).toBe('sde');
         expect(volume.blockPath).toBe('/dev/sde1');
         expect(volume.isStarted).toBe(true);
+    });
+
+    // --- ENCRYPTED VOLUMES: the stale-mount check one layer down ---------------------------------------
+    //
+    // On an encrypted volume /proc/mounts reads `/dev/mapper/strubs-<uuid>`, not the partition -- so comparing
+    // the source against the raw partition path never matches and every encrypted volume looks PERPETUALLY
+    // stale: unmounted, remounted, unmounted, forever.
+    //
+    // But matching the mapper NAME is not enough either, and that is the trap. These are USB disks: one drops,
+    // the kernel renumbers it, it comes back as a different partition -- and the mapper from its previous life
+    // is still there, still called strubs-<uuid>, still mounted, now sitting on a device that is GONE.
+    describe('an encrypted volume', () => {
+        const luksPart = (uuid: string, name: string, extra?: any) =>
+            part(uuid, name, { fsType: 'crypto_LUKS', ...extra });
+
+        it('is not perpetually stale just because the kernel names the mapper', async () => {
+            const fleet = await makeFleet([{ id: 21, uuid: 'u21', enabled: true, partition_uuid: 'p21', partition_size: 1000 }]);
+            fleet.initializeVolumes([device('sdf', luksPart('p21', 'sdf1', { mountPoint: '/run/strubs/mounts/u21' }))]);
+            const volume = fleet.getVolume(21)!;
+            volume.isStarted = true;
+
+            // The kernel: the mount is the mapper, and the mapper really is on sdf1.
+            readProcMountsMock.mockResolvedValue(new Map([['/run/strubs/mounts/u21', '/dev/mapper/strubs-u21']]));
+            mapperBackingDeviceMock.mockResolvedValue('sdf1');
+
+            const transitions = await fleet.reconcile([device('sdf', luksPart('p21', 'sdf1'))]);
+
+            expect(transitions).toEqual([]);                       // healthy: left alone
+            expect(volume.markMissing).not.toHaveBeenCalled();
+        });
+
+        // THE FAIL-OPEN. The mapper name still matches, so a name-only check calls this healthy -- and leaves
+        // the volume bound to a mapper sitting on a device that no longer exists, serving EIO while reporting
+        // itself perfectly fine.
+        it('IS stale when its mapper is left sitting on a disk that has gone', async () => {
+            const fleet = await makeFleet([{ id: 22, uuid: 'u22', enabled: true, partition_uuid: 'p22', partition_size: 1000 }]);
+            fleet.initializeVolumes([device('sdf', luksPart('p22', 'sdf1', { mountPoint: '/run/strubs/mounts/u22' }))]);
+            const volume = fleet.getVolume(22)!;
+            volume.isStarted = true;
+
+            // The mapper is mounted under the right NAME -- but it is backed by the OLD disk. The volume now
+            // lives on sdg1.
+            readProcMountsMock.mockResolvedValue(new Map([['/run/strubs/mounts/u22', '/dev/mapper/strubs-u22']]));
+            mapperBackingDeviceMock.mockResolvedValue('sdf1');
+
+            const transitions = await fleet.reconcile([device('sdg', luksPart('p22', 'sdg1'))]);
+
+            expect(transitions).toEqual([{ volumeId: 22, kind: 'healed', deviceName: 'sdg' }]);
+            expect(volume.markMissing).toHaveBeenCalledTimes(1);   // the stale mapper is torn down first
+            expect(volume.blockPath).toBe('/dev/sdg1');
+        });
+
+        // Fail CLOSED: a mapper we cannot interrogate is not a mapper we get to call healthy.
+        it('IS stale when the mapper\'s backing device cannot be read', async () => {
+            const fleet = await makeFleet([{ id: 23, uuid: 'u23', enabled: true, partition_uuid: 'p23', partition_size: 1000 }]);
+            fleet.initializeVolumes([device('sdf', luksPart('p23', 'sdf1', { mountPoint: '/run/strubs/mounts/u23' }))]);
+            const volume = fleet.getVolume(23)!;
+            volume.isStarted = true;
+
+            readProcMountsMock.mockResolvedValue(new Map([['/run/strubs/mounts/u23', '/dev/mapper/strubs-u23']]));
+            mapperBackingDeviceMock.mockResolvedValue(null);       // could not tell
+
+            await fleet.reconcile([device('sdf', luksPart('p23', 'sdf1'))]);
+
+            expect(volume.markMissing).toHaveBeenCalledTimes(1);
+        });
     });
 
     it('marks a volume missing when its disk disappears', async () => {

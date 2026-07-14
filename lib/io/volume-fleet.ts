@@ -5,6 +5,7 @@ import { createLogger } from '../log';
 import { formatBytes, readProcMounts } from './helpers';
 import { Volume, type VolumeConfig, type PersistedVolumeConfig } from './volume';
 import type { CachedDevice, CachedPartition } from './device-discovery';
+import { mapperName as luksMapperName, mapperPath as luksMapperPath, mapperBackingDevice as luksMapperBackingDevice } from './luks';
 
 // An edge change detected by a reconcile pass. `missing`: backing disk disappeared. `restored`: an
 // absent/unbound volume's disk is back and the volume was brought online. `healed`: a stale mount
@@ -342,6 +343,23 @@ export class VolumeFleet {
         }
     }
 
+    // STOP A VOLUME AND FORGET IT -- without deleting anything.
+    //
+    // Not softDeleteVolume: that marks the volume dead, which is a statement about the DATA. This says only "we
+    // are about to rebuild this disk from scratch, so drop the live objects that describe the old one". The
+    // caller re-registers it afterwards under the same id (see the encryption conversion, and the `replace`
+    // path in the provisioner, which used to leave the stale Volume and a DUPLICATE config entry behind --
+    // `_volumeConfig.find(cfg => cfg.id === id)` would then hand out the dead one).
+    async deregisterVolume(id: number): Promise<void> {
+        const volume = this._volumes[id];
+        if (volume)
+            await volume.stop().catch(() => undefined);
+
+        delete this._volumes[id];
+        this._volumeConfig = this._volumeConfig.filter(cfg => cfg.id !== id);
+        this.deps.log('volume%d: deregistered (stopped and unbound; nothing deleted)', id);
+    }
+
     async softDeleteVolume(id: number): Promise<void> {
         const volume = this._volumes[id];
         if (!volume)
@@ -394,7 +412,7 @@ export class VolumeFleet {
                     continue;
                 }
 
-                const stale = this.isMountStale(volume, devices, mounts);
+                const stale = await this.isMountStale(volume, devices, mounts);
                 if (volume.isStarted && volume.isPresent && volume.blockPath && !stale)
                     continue; // healthy and bound — nothing to do
 
@@ -425,14 +443,44 @@ export class VolumeFleet {
 
     // A volume we believe is mounted whose /run/strubs mount is missing from the kernel table, or is
     // backed by a device that no longer holds this volume's partition (the vol-57 drop-and-rename case).
-    private isMountStale(volume: Volume, devices: CachedDevice[], mounts: Map<string, string>): boolean {
+    private async isMountStale(volume: Volume, devices: CachedDevice[], mounts: Map<string, string>): Promise<boolean> {
         if (!volume.isMounted || !volume.mountPoint)
             return false;
         const source = mounts.get(volume.mountPoint);
         if (!source)
             return true;
+
         const match = this.findPartitionByUuid(devices, volume.partitionUuid ?? undefined);
         const livePath = match ? (match.partition.path ?? `/dev/${match.partition.name}`) : null;
+
+        // WHAT THE KERNEL SAYS IS MOUNTED THERE IS THE MAPPER, NOT THE PARTITION.
+        //
+        // On an encrypted volume /proc/mounts reads `/dev/mapper/strubs-<uuid>`, because that is what was
+        // mounted -- the partition holds only the LUKS header and ciphertext. Comparing that against the raw
+        // partition path (`/dev/sdf1`) never matches, so every encrypted volume in the fleet would look
+        // PERPETUALLY STALE: unmounted, remounted, unmounted, remounted, forever.
+        //
+        // But the mapper NAME matching is not enough either, and this is the trap. These are USB disks: one
+        // drops, the kernel renumbers it, it comes back as a different partition -- and the mapper from its
+        // previous life is still there, still called strubs-<uuid>, still mounted, now sitting on a device that
+        // is GONE. Name-matching says "not stale" and we would leave the volume bound to a dead mapper,
+        // serving EIO while reporting itself perfectly healthy. That is the fail-open, one layer down from the
+        // one this function was already written to fix.
+        //
+        // So follow the mapper to its backing device and check it is still the disk we think it is.
+        if (volume.isEncrypted) {
+            if (source !== luksMapperPath(volume.uuid))
+                return true;
+
+            if (!livePath)
+                return true;   // the partition is gone; whatever the mapper is on, it is not this volume's disk
+
+            const backing = await luksMapperBackingDevice(luksMapperName(volume.uuid));
+
+            // A mapper we could not interrogate is NOT a mapper we get to call healthy.
+            return backing !== livePath.replace(/^\/dev\//, '');
+        }
+
         return source !== livePath;
     }
 

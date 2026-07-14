@@ -121,6 +121,13 @@ export class IOManager {
         this.refreshBootstrapManifest();
     }
 
+    // Stop a volume and unbind it WITHOUT deleting it -- for a disk that is about to be rebuilt in place and
+    // re-registered under the same id. Deletes nothing, marks nothing dead.
+    async deregisterVolume(id: number): Promise<void> {
+        await this.deps.volumeFleet.deregisterVolume(id);
+        this.refreshBootstrapManifest();
+    }
+
     async updateVolumeFlags(id: number, changes: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isDraining?: boolean; label?: string | null; comment?: string | null }): Promise<void> {
         await this.reloadBlockDevices();
         await this.deps.volumeFleet.updateVolumeFlags(id, changes, this._onlineDevices);

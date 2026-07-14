@@ -1,7 +1,8 @@
 import { EventEmitter } from 'events';
 import { promises as fs } from 'fs';
+import os from 'os';
 import path from 'path';
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HttpRequest, HttpResponse } from '../lib/server/http/server';
 
 const ioManagerMock = {
@@ -17,6 +18,7 @@ const ioManagerMock = {
     }),
     registerVolume: vi.fn(),
     softDeleteVolume: vi.fn(),
+    deregisterVolume: vi.fn(),
     updateVolumeFlags: vi.fn(),
     getCachedDevices: vi.fn(),
     reloadBlockDevices: vi.fn()
@@ -27,6 +29,10 @@ const httpHelpersMock = {
 };
 
 const deviceProvisionerProvisionMock = vi.fn();
+const buildSliceIndexMock = vi.fn(async () => new Map());
+// The kernel's mount table. The platter guard asks THIS, not the volume's in-memory isMounted flag -- a stale
+// flag would otherwise have it scan an empty directory on the root filesystem and call the disk clean.
+const readProcMountsMock = vi.fn(async () => new Map<string, string>());
 const verifyVolumesJobMock = {
     start: vi.fn(),
     stop: vi.fn(),
@@ -54,10 +60,21 @@ vi.mock('../lib/server/http/helpers', () => ({
     HttpHelpers: httpHelpersMock
 }));
 
+vi.mock('../lib/io/helpers', async importOriginal => ({
+    ...await importOriginal<typeof import('../lib/io/helpers')>(),
+    readProcMounts: readProcMountsMock
+}));
+
+vi.mock('../lib/recovery/recovery', async importOriginal => ({
+    ...await importOriginal<typeof import('../lib/recovery/recovery')>(),
+    buildSliceIndex: buildSliceIndexMock
+}));
+
 vi.mock('../lib/io/device-provisioner', () => ({
     deviceProvisioner: {
         provision: deviceProvisionerProvisionMock
-    }
+    },
+    ENCRYPT_NEW_VOLUMES_KEY: 'encryptNewVolumes'
 }));
 
 vi.mock('../lib/jobs/verify-volumes-job', () => ({
@@ -90,11 +107,20 @@ const databaseBucketAuthMock = {
     removeCredential: vi.fn(async () => true)
 };
 
+const databaseGetVolumesMock = vi.fn(async () => [] as any[]);
+
+// NOT redeclared here: `databaseBucketAuthMock` already carries getRuntimeConfig/setRuntimeConfig, and it is
+// spread LAST into the factory below -- so a second pair declared here would be silently overridden and every
+// assertion against them would see zero calls while the code under test worked perfectly.
+const databaseGetRuntimeConfigMock = databaseBucketAuthMock.getRuntimeConfig;
+const databaseSetRuntimeConfigMock = databaseBucketAuthMock.setRuntimeConfig;
+
 vi.mock('../lib/database', () => ({
     database: {
         softDeleteVolume: databaseSoftDeleteMock,
         updateVolumeFlags: databaseUpdateFlagsMock,
         countObjectsOnVolume: databaseCountOnVolumeMock,
+        getVolumes: databaseGetVolumesMock,
         ...databaseBucketAuthMock
     }
 }));
@@ -725,7 +751,11 @@ describe('HttpMgmt.handle', () => {
             bytesUsedParity: 10,
             verifyErrors: { checksum: 1, total: 2 },
             isDeleted: false,
-            mountError: 'failed to mount'
+            mountError: 'failed to mount',
+            // The disk is not there, so we cannot read its filesystem: its encryption state is UNKNOWN, and
+            // "unknown" must never be reported as "plaintext".
+            isPresent: false,
+            isEncrypted: false
         };
         const volume2 = {
             uuid: 'vol-2',
@@ -745,7 +775,9 @@ describe('HttpMgmt.handle', () => {
             bytesUsedParity: 0,
             verifyErrors: null,
             isDeleted: false,
-            mountError: null
+            mountError: null,
+            isPresent: true,
+            isEncrypted: false
         };
         ioManagerMock.getVolumeEntries.mockReturnValue([[1, volume1], [2, volume2]]);
 
@@ -759,7 +791,16 @@ describe('HttpMgmt.handle', () => {
             verifyErrors: { '1': { checksum: 1, total: 2 } },
             gbStored: 80 / (1024 ** 3),
             gbCapacity: 200 / (1024 ** 3),
-            gbFree: 100 / (1024 ** 3)
+            gbFree: 100 / (1024 ** 3),
+            encryption: {
+                encryptNewVolumes: false,
+                hasRecoveryPassphrase: false,
+                encryptedVolumeIds: [],
+                // volume2's disk is present and plaintext: pulling it still leaks every slice on it.
+                plaintextVolumeIds: [2],
+                // volume1's disk is missing, so we do not know -- and we do not guess.
+                unknownVolumeIds: [1]
+            }
         });
     });
 
@@ -1470,3 +1511,204 @@ describe('mgmt: the namespace-recovery allowlist is real', () => {
     });
 });
 
+// ---------------------------------------------------------------------------------------------------------
+// ENCRYPTION (DR-G). Converting a volume WIPES A DISK THAT IS ALREADY OURS -- the most destructive thing this
+// API can be asked to do. These tests exist for the guards, not the happy path.
+// ---------------------------------------------------------------------------------------------------------
+describe('encrypting a volume', () => {
+    // A REAL directory with a REAL strubs/ tree in it, because the guard stats the mount point for real -- it
+    // will not take an empty readdir of a directory it could not read as proof that a disk is empty.
+    let mountPoint: string;
+
+    beforeAll(async () => {
+        mountPoint = await fs.mkdtemp(path.join(os.tmpdir(), 'strubs-encrypt-'));
+        await fs.mkdir(path.join(mountPoint, 'strubs'), { recursive: true });
+    });
+
+    afterAll(async () => {
+        await fs.rm(mountPoint, { recursive: true, force: true }).catch(() => undefined);
+    });
+
+    const plaintextVolume = {
+        id: 15,
+        uuid: 'vol-15',
+        blockPath: '/dev/sde',
+        // Mounted, because the journal guard REFUSES a volume it cannot read: an unmounted disk might be the
+        // last home of a journal segment and there is no way to know. Volume 15 is in the journal mock's fleet.
+        isMounted: true,
+        get mountPoint() { return mountPoint; },
+        isPresent: true,
+        isEncrypted: false,
+        isDeleted: false,
+        isDraining: false,
+        isReadOnly: true,
+        verifyErrors: null,
+        bytesTotal: 1, bytesFree: 1
+    };
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        ioManagerMock.getVolume.mockReturnValue(plaintextVolume);
+        ioManagerMock.getVolumeEntries.mockReturnValue([[15, plaintextVolume]]);
+        ioManagerMock.registerVolume.mockResolvedValue(undefined);
+        ioManagerMock.deregisterVolume.mockResolvedValue(undefined);
+        ioManagerMock.updateVolumeFlags.mockResolvedValue(undefined);
+        databaseCountOnVolumeMock.mockResolvedValue(0);   // drained
+        journalState.replicaVolumeIds = [3, 7, 9];        // not the last journal copy
+        deviceProvisionerProvisionMock.mockResolvedValue({ id: 15, uuid: 'vol-15-new' });
+        buildSliceIndexMock.mockResolvedValue(new Map());   // the platter is genuinely empty
+        // ...and the kernel agrees the disk really is mounted where the volume thinks it is.
+        readProcMountsMock.mockResolvedValue(new Map([[mountPoint, '/dev/sde']]));
+    });
+
+    const encrypt = (body: unknown) =>
+        HttpMgmt.handle(5, createRequest('POST', '/$/volumes/15/encrypt', body), nullResponse);
+
+    // THE ONE THAT MATTERS. A PUT commits its SLICE FILES before it inserts the object record, so a write
+    // already in flight has slices on the platter and nothing in Mongo. If we flipped the volume read-only
+    // ourselves and scanned a moment later, that write would still land -- the scan sees nothing, the wipe
+    // destroys the slices, and the insert arrives afterwards pointing at them. A phantom, which reads as data
+    // loss. So the volume must ALREADY be read-only: the quiesce is the operator's hours-long drain, not a
+    // millisecond of ours.
+    it('refuses a volume that is still writable, and wipes nothing', async () => {
+        ioManagerMock.getVolume.mockReturnValue({ ...plaintextVolume, isReadOnly: false });
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/still writable/);
+
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+        expect(ioManagerMock.deregisterVolume).not.toHaveBeenCalled();
+    });
+
+    // THE DISK IS AUTHORITATIVE; MONGO IS A DERIVED INDEX. `countObjectsOnVolume` returns zero for a disk
+    // carrying 9,000 ORPHANS -- slices with no record, which are RECOVERABLE data (rebuilding them is the
+    // whole of DR-E). Wiping them because Mongo has never heard of them inverts "orphans beat phantoms".
+    it('refuses when slice files remain on the platter, even though the database says it is empty', async () => {
+        databaseCountOnVolumeMock.mockResolvedValue(0);          // Mongo: nothing here
+        buildSliceIndexMock.mockResolvedValue(new Map([          // the platter: nine thousand orphans
+            ['507f1f77bcf86cd799439011', new Uint16Array(32)]
+        ]));
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/ORPHANS/);
+
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+        expect(ioManagerMock.deregisterVolume).not.toHaveBeenCalled();
+    });
+
+    // THE FLAG IS A BELIEF; /proc/mounts IS THE FACT. A USB disk drops, the mount goes, and `isMounted` stays
+    // true until the next reconcile. In that window the mount point is an EMPTY DIRECTORY ON THE ROOT
+    // FILESYSTEM -- scanning it finds no slices, reports the disk clean, and we wipe a platter full of orphans
+    // on the strength of a readdir that never touched the disk.
+    it('refuses when the kernel says nothing is mounted there, whatever the volume believes', async () => {
+        readProcMountsMock.mockResolvedValue(new Map());   // the kernel: nothing is mounted at that path
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/kernel says nothing is mounted/);
+
+        expect(buildSliceIndexMock).not.toHaveBeenCalled();
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+    });
+
+    // Mounted -- but by somebody else's disk. Scanning it tells us nothing about the platter we are wiping.
+    it('refuses when the mount point is backed by a different device', async () => {
+        readProcMountsMock.mockResolvedValue(new Map([[mountPoint, '/dev/sdz9']]));
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/is mounted from \/dev\/sdz9, not from \/dev\/sde/);
+
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+    });
+
+    // Fail CLOSED. A platter we could not scan is not a platter with nothing on it.
+    it('refuses when the platter cannot be scanned', async () => {
+        buildSliceIndexMock.mockRejectedValue(new Error('3 directories could not be read'));
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/could not be scanned/);
+
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses an unmounted volume, whose platter cannot be scanned at all', async () => {
+        ioManagerMock.getVolume.mockReturnValue({ ...plaintextVolume, isMounted: false });
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/not mounted/);
+
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses a volume that still holds live slices, and wipes nothing', async () => {
+        databaseCountOnVolumeMock.mockResolvedValue(1234);
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/still holds 1234 live object slice/);
+
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+        expect(ioManagerMock.deregisterVolume).not.toHaveBeenCalled();
+    });
+
+    // NOTE: the journal guard (refuse to wipe the last surviving copy of a journal segment) is NOT pinned
+    // here. It reads its own fleet view from the Journal, not from ioManager, so this fixture cannot express
+    // "volume 15 holds the last segment" -- a test written against it would pass without asserting anything,
+    // which is worse than no test. The conversion calls the very same `assertVolumeRemovable()` as the delete
+    // path, where the guard IS covered; the live-slices test above proves the call is on this path.
+
+    it('refuses without a recovery passphrase, before touching anything', async () => {
+        await expect(encrypt({})).rejects.toThrow(/recoveryPassphrase is required/);
+        expect(databaseUpdateFlagsMock).not.toHaveBeenCalled();
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses a volume that is already encrypted', async () => {
+        ioManagerMock.getVolume.mockReturnValue({ ...plaintextVolume, isEncrypted: true });
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/already encrypted/);
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses a volume whose disk is not present', async () => {
+        ioManagerMock.getVolume.mockReturnValue({ ...plaintextVolume, isPresent: false, blockPath: null });
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/no disk present/);
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+    });
+
+    it('passes the passphrase and the volume id through to the conversion', async () => {
+        await encrypt({ recoveryPassphrase: 'correct horse battery staple' });
+
+        expect(deviceProvisionerProvisionMock).toHaveBeenCalledWith(expect.objectContaining({
+            blockPath: '/dev/sde',
+            wipe: true,
+            encrypt: true,
+            convertVolumeId: 15,
+            recoveryPassphrase: 'correct horse battery staple'
+        }));
+    });
+
+    // A failed conversion leaves the volume deregistered. A volume that is merely ABSENT is one nobody
+    // investigates -- so it must come back and fail VISIBLY instead of quietly vanishing from the fleet.
+    it('puts the volume back into the fleet if the conversion fails', async () => {
+        deviceProvisionerProvisionMock.mockRejectedValue(new Error('cryptsetup exploded'));
+        databaseGetVolumesMock.mockResolvedValue([{ id: 15, uuid: 'vol-15' }]);
+
+        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
+            .rejects.toThrow(/cryptsetup exploded/);
+
+        expect(ioManagerMock.registerVolume).toHaveBeenCalledWith({ id: 15, uuid: 'vol-15' });
+    });
+
+    // Turning the fleet default on must not convert a single existing disk. "Encryption: on" is exactly what
+    // an operator would expect to encrypt their data, and it does not -- so it had better not pretend to.
+    it('the fleet default setting converts nothing', async () => {
+        await HttpMgmt.handle(
+            5, createRequest('PUT', '/$/encryption/settings', { encryptNewVolumes: true }), nullResponse);
+
+        expect(databaseSetRuntimeConfigMock).toHaveBeenCalledWith('encryptNewVolumes', true);
+        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+        expect(ioManagerMock.deregisterVolume).not.toHaveBeenCalled();
+    });
+});

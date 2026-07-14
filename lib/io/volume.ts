@@ -10,6 +10,12 @@ import { config } from '../config';
 import { ensureDirectoryDurable, formatBytes, fsyncDirectory, mount as mountVolume, unmount as unmountVolume } from './helpers';
 import { buildVolumeIdentityBuffer } from './volume-identity';
 import { ensureExtFilesystemHealthy } from './filesystem-check';
+import {
+    isLuksFsType,
+    mapperPath as luksMapperPath,
+    open as luksOpen,
+    close as luksClose
+} from './luks';
 import type { CachedDevice, CachedPartition } from './device-discovery';
 
 export type VolumeVerifyErrors = {
@@ -220,6 +226,22 @@ export class Volume extends EventEmitter {
         }
     }
 
+    // Is this volume's PARTITION a LUKS container? Derived from what the disk says, never from a stored flag:
+    // a flag can drift, and a disk cannot lie about its own superblock.
+    get isEncrypted(): boolean {
+        return isLuksFsType(this.fsType);
+    }
+
+    // WHAT WE ACTUALLY MOUNT.
+    //
+    // For a plain volume that is the partition. For an encrypted one the partition holds only the LUKS header
+    // and ciphertext -- the ext4 is on the mapper device that dm-crypt presents once it is unlocked. Mounting
+    // the partition would fail; mounting the mapper is the whole trick, and it is ONE branch, at the one layer
+    // that has any business knowing about it.
+    private mountSource(): string | null {
+        return this.isEncrypted ? luksMapperPath(this.uuid) : this.blockPath;
+    }
+
     async mount(): Promise<void> {
         this.mountPoint = '/run/strubs/mounts/' + this.uuid;
         this.mountError = null;
@@ -243,16 +265,44 @@ export class Volume extends EventEmitter {
             this.log('mount point created');
         }
 
-        this.log('attempting to mount %s (%s) to %s', this.blockPath, this.fsType, this.mountPoint);
-
         if (!this.blockPath || !this.mountPoint || !this.fsType)
             throw new Error('volume mount path is not fully configured');
 
+        // UNLOCK BEFORE MOUNT. A locked volume has no filesystem to mount -- only a LUKS header and a very
+        // large amount of ciphertext.
+        //
+        // KEY UNAVAILABLE IS NOT ARRAY DOWN. If this throws, THIS volume fails to start and says why; the rest
+        // of the fleet serves normally. That matters: a keyfile that has gone missing must degrade the array,
+        // not stop it. (Though be clear-eyed -- with 4+2, three locked volumes puts objects below quorum.)
+        if (this.isEncrypted) {
+            this.log('%s is encrypted: unlocking before mount', this.blockPath);
+            try {
+                await luksOpen(this.blockPath, this.uuid);
+            }
+            catch (err) {
+                // Say WHY, on the volume, where the operator will look. A volume that failed to unlock and
+                // reports nothing is indistinguishable from a dead disk -- and the remedy for the two could not
+                // be more different: one wants a keyfile restored, the other wants a drive replaced.
+                const message = `locked: ${err instanceof Error ? err.message : String(err)}`;
+                this.mountError = message;
+                throw new Error(message);
+            }
+        }
+
+        const source = this.mountSource();
+        if (!source)
+            throw new Error('volume mount source is not resolvable');
+
+        this.log('attempting to mount %s (%s) to %s', source, this.mountSourceFsType(), this.mountPoint);
+
+        // fsck the thing that HAS a filesystem. Running e2fsck against a LUKS partition would be running it
+        // against ciphertext, which finds nothing, means nothing, and would be a write to a disk we have not
+        // even unlocked.
         if (this.shouldPerformFilesystemCheck())
-            await ensureExtFilesystemHealthy(this.blockPath, this.log);
+            await ensureExtFilesystemHealthy(source, this.log);
 
         try {
-            await mountVolume(this.blockPath, this.mountPoint, this.fsType, this.mountOptions || {});
+            await mountVolume(source, this.mountPoint, this.mountSourceFsType(), this.mountOptions || {});
         }
         catch (err) {
             const message = 'unable to mount: ' + err;
@@ -281,7 +331,13 @@ export class Volume extends EventEmitter {
         }
 
         this.isMounted = true;
-        this.log('mounted block device %s to %s', this.blockPath, this.mountPoint);
+        this.log('mounted %s to %s%s', this.mountSource(), this.mountPoint, this.isEncrypted ? ' (encrypted)' : '');
+    }
+
+    // The filesystem we are actually mounting. On an encrypted volume `this.fsType` is `crypto_LUKS` -- that is
+    // the PARTITION's type, not the filesystem's. What is on the mapper is ext4.
+    private mountSourceFsType(): string {
+        return this.isEncrypted ? 'ext4' : (this.fsType ?? 'ext4');
     }
 
     private async unmount(): Promise<void> {
@@ -301,9 +357,30 @@ export class Volume extends EventEmitter {
 
         this.isMounted = false;
         this.log('unmounted %s', this.mountPoint);
+
+        // ...AND LOCK IT AGAIN. An unmounted volume whose mapper is still open leaves a fully decrypted block
+        // device sitting in /dev/mapper for anyone on the box to read -- which is the entire thing we encrypted
+        // it to prevent, undone by not tidying up.
+        //
+        // A mapper that will not close (something else is still using it) is logged, not thrown: we have
+        // unmounted successfully, and tearing the mapper out from under an unknown user would be worse than
+        // leaving it.
+        if (this.isEncrypted) {
+            try {
+                await luksClose(this.uuid);
+                this.log('locked %s', this.blockPath);
+            }
+            catch (err) {
+                this.log('WARNING: unmounted %s but could not lock it again: %s', this.blockPath, err);
+            }
+        }
     }
 
     private shouldPerformFilesystemCheck(): boolean {
+        // An encrypted volume's fsType is `crypto_LUKS` and would fail the ext test below -- which would have
+        // quietly meant ENCRYPTED VOLUMES ARE NEVER CHECKED. What we fsck is the mapper, and the mapper is ext4.
+        if (this.isEncrypted)
+            return true;
         if (!this.fsType)
             return false;
         return this.fsType.toLowerCase().startsWith('ext');
@@ -480,6 +557,11 @@ export class Volume extends EventEmitter {
     // device binding so nothing (health watcher, reads) resolves to a dead kernel name. Config is kept.
     async markMissing(): Promise<void> {
         this.log('marking missing: backing device is no longer present');
+
+        // Read this BEFORE the fields below are cleared -- `isEncrypted` is derived from fsType, and fsType is
+        // about to become null.
+        const wasEncrypted = this.isEncrypted;
+
         if (this.isMounted && this.mountPoint) {
             try {
                 await unmountVolume(this.mountPoint, { lazy: true });
@@ -488,6 +570,20 @@ export class Volume extends EventEmitter {
                 this.log.error('lazy unmount during markMissing failed', err);
             }
         }
+
+        // TEAR THE MAPPER DOWN TOO. A disk that has been pulled leaves its dm-crypt mapper behind -- still
+        // named strubs-<uuid>, now backed by nothing. Leave it there and it becomes the stale mapper that the
+        // next unlock trips over when the disk comes back (USB disks come back renumbered), and meanwhile it is
+        // a decrypted device node for a volume that is no longer in the machine.
+        if (wasEncrypted) {
+            try {
+                await luksClose(this.uuid);
+            }
+            catch (err) {
+                this.log.error('could not lock %s while marking it missing: %s', this.uuid, err);
+            }
+        }
+
         this.isStarted = false;
         this.isVerified = false;
         this.isMounted = false;

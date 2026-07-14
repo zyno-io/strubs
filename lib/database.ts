@@ -132,6 +132,7 @@ export class Database {
             };
             await this.ensureContentIndexes();
             await this.ensureFaultIndexes();
+            await this.ensureRuntimeConfigIndexes();
             await this.adminTokenRepository.ensureIndexes();
             await this.credentialRepository.ensureIndexes();
 
@@ -180,6 +181,18 @@ export class Database {
 
     async setRuntimeConfig(key: string, value: unknown): Promise<void> {
         await this.runtimeConfigRepository.set(key, value);
+    }
+
+    // Atomic create-if-absent. True if THIS caller created it. See the repository for why the LUKS recovery
+    // verifier cannot use the read-then-set pattern.
+    async setRuntimeConfigIfAbsent(key: string, value: unknown): Promise<boolean> {
+        return this.runtimeConfigRepository.setIfAbsent(key, value);
+    }
+
+    // Whether setRuntimeConfigIfAbsent() is genuinely exclusive -- i.e. whether the unique index exists. Index
+    // creation is non-fatal, so this is a question, not an assumption.
+    async runtimeConfigKeyIsUnique(): Promise<boolean> {
+        return this.runtimeConfigRepository.keyIsUnique();
     }
 
     async deleteRuntimeConfig(key: string): Promise<void> {
@@ -570,6 +583,38 @@ export class Database {
         for (const name of invalidNames) {
             log('dropping invalid content index %s', name);
             await this.contentCollection.dropIndex(name);
+        }
+    }
+
+    // THE UNIQUE INDEX IS WHAT MAKES setIfAbsent() ATOMIC. Without it, it is not.
+    //
+    // MongoDB's upsert is only safe against concurrent duplicate inserts when a UNIQUE INDEX exists on the
+    // query field. Without one, two concurrent `updateOne({key}, {$setOnInsert}, {upsert:true})` can BOTH miss
+    // the (nonexistent) document, BOTH insert, and BOTH report upsertedCount === 1 -- which is precisely the
+    // race that `setIfAbsent` was written to close.
+    //
+    // That matters for exactly one key, and it matters enormously: `luksRecoveryVerifier`. Two first-time
+    // encryptions racing with different passphrases would each believe they were first, each bake their own
+    // passphrase into a disk's keyslot, and leave the fleet split across two recovery passphrases with only one
+    // of them recorded. The index turns the loser's insert into a duplicate-key error, which setIfAbsent
+    // reports as "you did not create it" -- and the loser then has to match the winner or be refused.
+    private async ensureRuntimeConfigIndexes(): Promise<void> {
+        try {
+            await this.runtimeConfigCollection.createIndexes([
+                { key: { key: 1 }, name: 'runtimeConfigKey', unique: true }
+            ]);
+        }
+        catch (err) {
+            // NOT FATAL. Refusing to start would take 130TB offline over an index that exactly one feature
+            // needs, and a guard that bricks the array it was written to protect is a guard that has failed.
+            // (That has happened here before.)
+            //
+            // Nothing pretends the guarantee is there when it is not: setIfAbsent() is only exclusive BECAUSE
+            // of this index, and the LUKS recovery verifier asks runtimeConfigKeyIsUnique() before recording a
+            // first passphrase -- so what fails is ENCRYPTION, loudly, not the array.
+            log.error('could not create the unique index on runtimeConfig.key (%s). The array is unaffected, but '
+                + 'encryption will refuse to record a first recovery passphrase until this is fixed. A duplicate '
+                + 'key in runtimeConfig would explain it.', err);
         }
     }
 

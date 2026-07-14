@@ -18,6 +18,7 @@ Every setting has a working default. A stock install needs at most `STRUBS_MONGO
 | `STRUBS_MONGO_URL` | `mongodb://strubs:strubs@127.0.0.1:27017/strubs?authSource=admin` | Metadata database. STRUBS keeps *all* object metadata here; see the warning below. |
 | `STRUBS_DATA_SLICES` | `4` | Data slices per object (`k`). |
 | `STRUBS_PARITY_SLICES` | `2` | Parity slices per object (`m`). |
+| `STRUBS_LUKS_KEYFILE` | `/var/lib/strubs/luks.key` | The LUKS keyfile used to unlock encrypted volumes at boot. Only read when a volume is actually encrypted. Mode `0400`. |
 
 > **The EC geometry is not retroactive.** `STRUBS_DATA_SLICES` and `STRUBS_PARITY_SLICES` apply to *new* writes. Existing objects carry their own geometry in their slice headers and their Mongo record, and are read back with it. Changing these on a populated system gives you a fleet with mixed geometry — which works, but you should know you did it.
 
@@ -92,6 +93,8 @@ Stored in the `runtimeConfig` collection, changed through the API or UI, and app
 |---|---|---|
 | `maintenanceFreeze` | `PUT /$/maintenance-freeze` | Pauses **all** automatic maintenance: verify, repair, drain, rebalance. See below. |
 | `rebalanceConcurrency` | `PUT /$/rebalance` | Slices relocated at once, 1–64. Re-read once per batch, so it lands on a *running* rebalance. |
+| `encryptNewVolumes` | `PUT /$/encryption/settings` | Provision every **new** disk as LUKS. Default `false`. Converts nothing that is already in the array — see [Operations → Encryption](operations.md#encryption-luks). |
+| `luksRecoveryVerifier` | *(written on the first encryption)* | Salted scrypt hash of the fleet recovery passphrase, so a second volume cannot be encrypted under a *different* passphrase without anyone noticing. **It is a verifier, not the key** — it opens nothing. Do not hand-edit; deleting it lets the fleet split across two recovery passphrases, which you will discover on the worst day of the array's life. |
 
 Other keys in this collection are **job checkpoints**, not settings — `verifyStartedAt`, `verifyVolumeIds`, `verifyCursorId`, `verifyMode`, `drainVolumeId`, `drainCursorId`, `rebalanceActive`. They exist so a job survives a restart. Don't hand-edit them; use the cancel endpoints, which clear them properly.
 

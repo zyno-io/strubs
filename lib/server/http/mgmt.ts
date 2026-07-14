@@ -13,9 +13,13 @@ import { journal } from '../../io/journal';
 import { snapshotJob } from '../../jobs/snapshot-job';
 import { namespaceRestore, type RestoreSummary } from '../../recovery/restore';
 import { driftScrubJob, type DriftReport } from '../../jobs/drift-scrub-job';
+import { buildSliceIndex } from '../../recovery/recovery';
+import { readProcMounts } from '../../io/helpers';
+import { mapperPath as luksMapperPath } from '../../io/luks';
 import { findManifestsOnDevices, recoverFleetFromDisks, type FleetRecoverySummary } from '../../recovery/bootstrap';
 import { bootstrapManifestWriter, type ManifestSnapshotRef } from '../../io/bootstrap-manifest';
-import { deviceProvisioner } from '../../io/device-provisioner';
+import { deviceProvisioner, ENCRYPT_NEW_VOLUMES_KEY } from '../../io/device-provisioner';
+import { hasRecoveryPassphrase } from '../../io/luks-recovery-key';
 import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
@@ -55,6 +59,11 @@ export type VolumeStatus = {
     // distinctly from disabled or unhealthy.
     isPresent: boolean;
     isMissing: boolean;
+
+    // Derived at DISCOVERY from the partition's fstype, never stored as a flag. A flag can drift; a disk
+    // cannot lie about its own superblock. `false` on a volume whose disk is absent means "we don't know",
+    // not "plaintext" -- which is why the fleet coverage below counts only volumes we can actually see.
+    isEncrypted: boolean;
     deviceSerial: string | null;
     deviceModel: string | null;
     deviceVendor: string | null;
@@ -120,7 +129,7 @@ type RouteDefinition = {
 };
 type RouteMatch = { handler: RouteHandler; params: RouteParams };
 
-type StatusResponse = {
+export type StatusResponse = {
     availableVolumeIds: number[];
     unavailableVolumeIds: number[];
     disabledVolumeIds: number[];
@@ -129,6 +138,21 @@ type StatusResponse = {
     gbStored: number;
     gbCapacity: number;
     gbFree: number;
+
+    // FLEET ENCRYPTION COVERAGE -- reported as three disjoint lists rather than one percentage, because the
+    // honest answer has three states and a percentage would round the dangerous one away.
+    //
+    // PARTIAL ENCRYPTION IS PARTIAL PROTECTION. Until every volume is converted, pulling any PLAINTEXT disk
+    // still leaks every slice on it. The UI must not paint the array "protected" while `plaintextVolumeIds`
+    // is non-empty -- that is the entire reason this is a list of ids and not a boolean.
+    encryption: {
+        encryptNewVolumes: boolean;
+        hasRecoveryPassphrase: boolean;
+        encryptedVolumeIds: number[];
+        plaintextVolumeIds: number[];
+        // Disk absent, so its filesystem cannot be read: we do NOT know, and we do not guess "plaintext".
+        unknownVolumeIds: number[];
+    };
 };
 
 type DebugResponse = {
@@ -868,6 +892,9 @@ export class HttpMgmt {
         const disabled: number[] = [];
         const readOnly: number[] = [];
         const verifyErrors: Record<string, Volume['verifyErrors']> = {};
+        const encrypted: number[] = [];
+        const plaintext: number[] = [];
+        const unknownEncryption: number[] = [];
         let bytesStored = 0;
         let bytesCapacity = 0;
         let bytesFree = 0;
@@ -890,6 +917,16 @@ export class HttpMgmt {
                 readOnly.push(id);
             if (volume.verifyErrors)
                 verifyErrors[String(id)] = volume.verifyErrors;
+
+            if (volume.isDeleted) {
+                // Not part of the fleet, so not part of its coverage either way.
+            }
+            else if (!volume.isPresent)
+                unknownEncryption.push(id);
+            else if (volume.isEncrypted)
+                encrypted.push(id);
+            else
+                plaintext.push(id);
         }
 
         return {
@@ -900,7 +937,14 @@ export class HttpMgmt {
             verifyErrors,
             gbStored: bytesStored / (1024 ** 3),
             gbCapacity: bytesCapacity / (1024 ** 3),
-            gbFree: bytesFree / (1024 ** 3)
+            gbFree: bytesFree / (1024 ** 3),
+            encryption: {
+                encryptNewVolumes: await database.getRuntimeConfig(ENCRYPT_NEW_VOLUMES_KEY) === true,
+                hasRecoveryPassphrase: await hasRecoveryPassphrase(),
+                encryptedVolumeIds: encrypted,
+                plaintextVolumeIds: plaintext,
+                unknownVolumeIds: unknownEncryption
+            }
         };
     }
 
@@ -926,7 +970,9 @@ export class HttpMgmt {
     }
 
     private static async handleVolumeCreationRequest(req: HttpRequest): Promise<VolumeStatus> {
-        const payload = await this.parseJsonBody<{ blockPath?: string; wipe?: unknown; replace?: unknown }>(req);
+        const payload = await this.parseJsonBody<{
+            blockPath?: string; wipe?: unknown; replace?: unknown; encrypt?: unknown; recoveryPassphrase?: unknown;
+        }>(req);
         const blockPath = payload.blockPath;
         const wipe = payload.wipe;
         const replace = payload.replace;
@@ -944,10 +990,18 @@ export class HttpMgmt {
         if (replace !== undefined && typeof replace !== 'boolean')
             throw new HttpBadRequestError('replace must be a boolean');
 
+        if (payload.encrypt !== undefined && typeof payload.encrypt !== 'boolean')
+            throw new HttpBadRequestError('encrypt must be a boolean');
+        if (payload.recoveryPassphrase !== undefined && typeof payload.recoveryPassphrase !== 'string')
+            throw new HttpBadRequestError('recoveryPassphrase must be a string');
+
         const volumeConfig = await deviceProvisioner.provision({
             blockPath,
             wipe: wipeFlag,
-            replace: replace as boolean | undefined
+            replace: replace as boolean | undefined,
+            // Left undefined, the provisioner falls back to the fleet default (encryptNewVolumes).
+            encrypt: payload.encrypt as boolean | undefined,
+            recoveryPassphrase: payload.recoveryPassphrase as string | undefined
         });
 
         const volume = ioManager.getVolume(volumeConfig.id);
@@ -999,17 +1053,22 @@ export class HttpMgmt {
     // deliberately so: mounting thirty drives on a host that has just decided who it is deserves a look
     // before the next thing starts writing to them.
     private static async handleRecoverFleetRequest(req: HttpRequest): Promise<FleetRecoverySummary> {
-        const body = await this.parseJsonBody<{ force?: boolean }>(req).catch(() => ({} as { force?: boolean }));
+        type Body = { force?: boolean; recoveryPassphrase?: string };
+        const body = await this.parseJsonBody<Body>(req).catch(() => ({} as Body));
+
+        const recoveryPassphrase = typeof body?.recoveryPassphrase === 'string' && body.recoveryPassphrase
+            ? body.recoveryPassphrase
+            : undefined;
 
         try {
             return await recoverFleetFromDisks({
-                findManifests: () => findManifestsOnDevices(),
+                findManifests: (options) => findManifestsOnDevices(options),
                 adoptIdentity: (identity: string) => config.adoptIdentity(identity),
                 existingVolumes: () => database.getVolumes(),
                 writeVolumes: (configs) => database.restoreVolumes(configs as never),
                 restoreInterrupted: () => database.fleetRestoreIncomplete(),
                 beginRestore: (expected: number) => database.beginFleetRestore(expected)
-            }, { force: body?.force === true });
+            }, { force: body?.force === true, recoveryPassphrase });
         }
         catch (err) {
             throw new HttpBadRequestError(err instanceof Error ? err.message : String(err));
@@ -1125,6 +1184,219 @@ export class HttpMgmt {
                 + `disk you are about to remove.`
             );
         }
+    }
+
+    // ENCRYPT AN EXISTING VOLUME -- the on-demand conversion, and the same operation the fleet backfill runs
+    // one disk at a time.
+    //
+    // You cannot encrypt a disk in place. Every honest path is drain -> rebuild -> refill, so this is a wrapper
+    // over machinery that already exists and is already proven: the operator (or the drain queue) empties the
+    // volume, this rebuilds the empty disk as a LUKS container under the SAME volume id, and the rebalance
+    // refills it from the rest of the fleet.
+    //
+    // IT REFUSES A VOLUME THAT STILL HOLDS DATA. It does not drain for you. A single endpoint that silently
+    // drained 4.4TB and then wiped the disk is exactly the kind of thing that gets fired off at 2am against the
+    // wrong id -- so the destructive half demands that the disk already be empty, and the emptiness is checked
+    // against Mongo (live slices) and the journal, not taken on trust.
+    private static async handleVolumeEncryptRequest(req: HttpRequest, params: RouteParams): Promise<VolumeStatus> {
+        const id = this.parseVolumeId(params);
+        const payload = await this.parseJsonBody<{ recoveryPassphrase?: unknown }>(req);
+        const passphrase = payload.recoveryPassphrase;
+
+        if (typeof passphrase !== 'string' || !passphrase)
+            throw new HttpBadRequestError('recoveryPassphrase is required to encrypt a volume');
+
+        const volume = ioManager.getVolume(id);
+        if (!volume)
+            throw new HttpNotFoundError();
+
+        if (volume.isEncrypted)
+            throw new HttpBadRequestError(`volume ${id} is already encrypted`);
+
+        const blockPath = volume.blockPath;
+        if (!blockPath || !volume.isPresent)
+            throw new HttpBadRequestError(`volume ${id} has no disk present: nothing to convert`);
+
+        // THE DOOR MUST ALREADY BE SHUT. WE DO NOT SHUT IT OURSELVES AND WALK STRAIGHT IN.
+        //
+        // "It holds no slices" is a statement about the PAST the instant it returns, and a PUT commits its
+        // slice files BEFORE it inserts the object record. So a write that had already chosen this volume can
+        // still be laying slices down while we scan -- and if we flipped the volume read-only ourselves a
+        // moment ago, that window is wide open: the placer let the write in before the flag, the scan sees
+        // nothing, the wipe destroys the slices, and the insert lands afterwards pointing at them. A PHANTOM,
+        // which reads as data loss.
+        //
+        // There is no in-flight-write counter to wait on, so we do not pretend to quiesce. We DEMAND that the
+        // volume is ALREADY read-only -- which is precisely what a completed drain leaves behind, and a drain
+        // takes hours. The quiesce is the operator's drain, not a millisecond of ours.
+        if (!volume.isReadOnly)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${id}: it is still writable. Encrypting a volume WIPES it, and a `
+                + `writable volume can be taking new slices this very moment. Drain it first `
+                + `(POST /$/volumes/${id}/drain) -- a completed drain leaves it read-only and empty, which is `
+                + `the state this needs.`
+            );
+
+        // The same two checks that gate pulling a disk out of the array -- because this destroys the disk just
+        // as thoroughly, and "it grew back" is no comfort to an object that was below quorum when it did.
+        // (Live slices, and the last surviving copy of a journal segment.)
+        await this.assertVolumeRemovable(id);
+
+        // ...AND THEN ASK THE DISK, BECAUSE THE DISK IS AUTHORITATIVE AND MONGO IS A DERIVED INDEX.
+        //
+        // Everything above this line asks MONGO whether the volume is empty, and Mongo does not know:
+        //
+        //   - A PUT commits its SLICE FILES FIRST and inserts the object record afterwards. A write already in
+        //     flight when we started has its slices on the platter and nothing in `content` yet -- so the count
+        //     says zero, we wipe, and the insert lands moments later pointing at slices that no longer exist.
+        //     That is a PHANTOM: a record whose data is gone, which reads as data loss.
+        //
+        //   - ORPHAN SLICES ARE RECOVERABLE DATA. A slice with no record can be rebuilt into one (that is what
+        //     the whole of DR-E does). Mongo has never heard of it, so `countObjectsOnVolume` returns zero for
+        //     a disk with 9,000 recoverable orphans on it, and we would wipe every one. ORPHANS BEAT PHANTOMS
+        //     is the rule, and destroying orphans on the strength of Mongo's silence inverts it.
+        //
+        // So walk the platter. Zero slice FILES, or no conversion. buildSliceIndex fails closed -- a directory
+        // it could not read throws rather than reporting an empty disk -- which is exactly the property a wipe
+        // guard needs and exactly the property a Mongo count does not have.
+        await this.assertPlatterHoldsNoSlices(volume);
+
+        // Stop and unbind, keeping the record. The provisioner re-registers under the same id.
+        await ioManager.deregisterVolume(id);
+
+        let volumeConfig;
+        try {
+            volumeConfig = await deviceProvisioner.provision({
+                blockPath,
+                wipe: true,
+                replace: true,
+                encrypt: true,
+                recoveryPassphrase: passphrase,
+                convertVolumeId: id
+            });
+        }
+        catch (err) {
+            // The volume is deregistered but its record still exists, so nothing has been lost -- but it has
+            // also silently vanished from the fleet, and a volume that is merely ABSENT is one nobody
+            // investigates. Put it back so it fails VISIBLY: if the disk was already wiped it will now show up
+            // as a volume that cannot mount, which is exactly what it is.
+            const existing = (await database.getVolumes()).find(v => v.id === id);
+            if (existing)
+                await ioManager.registerVolume(existing).catch(reregisterErr =>
+                    log.error('volume%d could not be put back into the fleet after a failed conversion: %s',
+                        id, reregisterErr));
+
+            log.error('conversion of volume%d failed: %s', id, err);
+            throw err;
+        }
+
+        // Back into service, empty. Clearing draining + read-only is what lets the rebalance refill it -- an
+        // encrypted volume left read-only would just sit there looking converted and doing nothing.
+        await database.updateVolumeFlags(id, { isDraining: false, isReadOnly: false });
+        await ioManager.updateVolumeFlags(id, { isDraining: false, isReadOnly: false });
+
+        const converted = ioManager.getVolume(volumeConfig.id);
+        if (!converted)
+            throw new Error('failed to re-register the converted volume');
+
+        log('volume%d converted to an encrypted volume; the rebalance will refill it', id);
+        return this._serializeVolume(volumeConfig.id, converted);
+    }
+
+    // Walk the volume's own platter and refuse if a single slice file is left on it. See the call site: this
+    // is the only check in the conversion that consults the authoritative copy rather than the index of it.
+    private static async assertPlatterHoldsNoSlices(volume: Volume): Promise<void> {
+        if (!volume.isMounted || !volume.mountPoint)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: it is not mounted, so its platter cannot be scanned. `
+                + `A disk we cannot read is not a disk with nothing on it.`
+            );
+
+        // ASK THE KERNEL, NOT OUR OWN FLAG.
+        //
+        // `volume.isMounted` is a belief held in memory, and the whole reason isMountStale() exists is that it
+        // can be WRONG -- a USB disk drops, the mount goes, and the flag stays true until the next reconcile.
+        // In that window `volume.mountPoint` is an empty directory on the ROOT FILESYSTEM, and a scan of it
+        // finds no slices, and reports the disk clean, and we wipe a platter full of orphans on the strength of
+        // a readdir of /run/strubs/mounts/<uuid> that never touched the disk at all.
+        //
+        // So confirm with /proc/mounts that something really is mounted there -- and on an encrypted volume,
+        // that it is OUR mapper -- before believing a single thing the scan says.
+        const mounts = await readProcMounts();
+        const source = mounts.get(volume.mountPoint);
+
+        if (!source)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: the kernel says nothing is mounted at `
+                + `${volume.mountPoint}, even though the volume believes it is mounted. Its platter cannot be `
+                + `scanned, so it cannot be shown to be empty.`
+            );
+
+        // `if (expected && ...)` would SKIP the check when we could not work out what to expect -- a
+        // fail-open shape in a guard whose whole job is to fail closed. Unreachable today (the caller has
+        // already refused a volume with no blockPath), and written so that it stays safe if that ever changes.
+        const expected = volume.isEncrypted ? luksMapperPath(volume.uuid) : volume.blockPath;
+        if (!expected)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: we cannot say which device ought to be mounted at `
+                + `${volume.mountPoint}, so we cannot confirm the platter we are about to wipe is the right one.`
+            );
+
+        if (source !== expected)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: ${volume.mountPoint} is mounted from ${source}, not `
+                + `from ${expected}. That is not this volume's disk, and scanning it would tell us nothing about `
+                + `the platter we are about to wipe.`
+            );
+
+        // And the tree itself has to be there. buildSliceIndex reads a missing directory as an empty one --
+        // right for a fleet-wide scan (a volume legitimately has no `strubs/` until its first write), wrong
+        // for a guard whose entire job is to prove a specific disk is empty.
+        try {
+            await fs.stat(`${volume.mountPoint}/strubs`);
+        }
+        catch (err) {
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: ${volume.mountPoint}/strubs could not be read `
+                + `(${err instanceof Error ? err.message : String(err)}). An empty answer from a directory we `
+                + `cannot read is not evidence that the disk is empty.`
+            );
+        }
+
+        let index;
+        try {
+            index = await buildSliceIndex([{ volumeId: volume.id, mountPoint: volume.mountPoint }]);
+        }
+        catch (err) {
+            // The scan itself refused (an unreadable directory). Fail closed: that is what it is for.
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: its platter could not be scanned `
+                + `(${err instanceof Error ? err.message : String(err)}).`
+            );
+        }
+
+        if (index.size > 0)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: ${index.size} slice file(s) are still on the disk, `
+                + `even though the database lists none. Those are ORPHANS -- slices with no record -- and they `
+                + `are RECOVERABLE data that this wipe would destroy. Run the drift scrub, resolve them, and `
+                + `try again. (If a write was in flight when the drain finished, simply re-draining may clear `
+                + `them.)`
+            );
+    }
+
+    // The fleet default for NEW disks. Deliberately does not touch a single existing volume -- turning this on
+    // converts nothing, it only decides what the next disk to be added looks like.
+    private static async handleEncryptionSettingsSetRequest(req: HttpRequest): Promise<{ encryptNewVolumes: boolean }> {
+        const payload = await this.parseJsonBody<{ encryptNewVolumes?: unknown }>(req);
+        const value = payload.encryptNewVolumes;
+
+        if (typeof value !== 'boolean')
+            throw new HttpBadRequestError('encryptNewVolumes must be a boolean');
+
+        await database.setRuntimeConfig(ENCRYPT_NEW_VOLUMES_KEY, value);
+        log('encryptNewVolumes set to %s (no existing volume was changed)', value);
+        return { encryptNewVolumes: value };
     }
 
     private static async handleVolumeDrainRequest(params: RouteParams): Promise<{ draining: boolean; volumeId: number }> {
@@ -1331,6 +1603,7 @@ export class HttpMgmt {
             isReadOnly: volume.isReadOnly,
             isPresent: volume.isPresent,
             isMissing: volume.isMissing,
+            isEncrypted: volume.isEncrypted,
             deviceSerial: volume.deviceSerial,
             deviceModel: volume.deviceModel ?? null,
             deviceVendor: volume.deviceVendor ?? null,
@@ -1477,6 +1750,16 @@ export class HttpMgmt {
                 method: 'POST',
                 match: url => this.matchVolumeDrainRoute(url),
                 handler: async (_req, params) => this.handleVolumeDrainRequest(params)
+            },
+            {
+                method: 'POST',
+                match: url => this.matchVolumeEncryptRoute(url),
+                handler: async (req, params) => this.handleVolumeEncryptRequest(req, params)
+            },
+            {
+                method: 'PUT',
+                match: url => url === '/$/encryption/settings' ? {} : null,
+                handler: async req => this.handleEncryptionSettingsSetRequest(req)
             },
             {
                 method: 'DELETE',
@@ -1805,6 +2088,13 @@ export class HttpMgmt {
 
     private static matchVolumeIdRoute(url: string): RouteParams | null {
         const match = /^\/\$\/volumes\/(\d+)$/.exec(url);
+        if (!match)
+            return null;
+        return { id: match[1] };
+    }
+
+    private static matchVolumeEncryptRoute(url: string): RouteParams | null {
+        const match = /^\/\$\/volumes\/(\d+)\/encrypt$/.exec(url);
         if (!match)
             return null;
         return { id: match[1] };

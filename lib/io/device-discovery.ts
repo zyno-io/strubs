@@ -15,6 +15,22 @@ export type RawBlockDeviceChild = {
     size: string | number;
     fstype?: string;
     mountpoint?: string | null;
+
+    // The GPT partition name -- the "nameplate". Written by the provisioner, readable with no mount, no unlock
+    // and no cryptsetup, because it lives in the partition table OUTSIDE the LUKS container. It is how a locked
+    // encrypted disk says who it is. Advisory only: `.identity` inside the filesystem remains the real check.
+    partlabel?: string | null;
+
+    // A LUKS PARTITION'S FILESYSTEM IS NOT ON THE PARTITION. IT IS ON A MAPPER CHILD.
+    //
+    //     sdf          disk
+    //     └─sdf1       part   fstype=crypto_LUKS  mountpoint=null      <- what we used to keep
+    //       └─luks-..  crypt  fstype=ext4         mountpoint=/run/..   <- what we used to THROW AWAY
+    //
+    // Dropping the crypt child did not merely hide the filesystem. It hid the MOUNTPOINT -- and the wipe guard
+    // asks a partition whether it is mounted. A mounted, in-service, encrypted disk full of live data would
+    // have answered "no", and been repartitioned.
+    children?: RawBlockDeviceChild[];
 };
 
 export type RawBlockDevice = {
@@ -31,6 +47,20 @@ export type RawBlockDevice = {
     children?: RawBlockDeviceChild[];
     [key: string]: unknown;
 };
+
+// The mountpoint of a partition's dm-crypt child, if it has one. Mappers can stack, so this walks down rather
+// than looking exactly one level.
+function mountPointOfCryptChild(partition: RawBlockDeviceChild): string | null {
+    for (const child of partition.children ?? []) {
+        if (typeof child.mountpoint === 'string' && child.mountpoint.length > 0)
+            return child.mountpoint;
+
+        const deeper = mountPointOfCryptChild(child);
+        if (deeper)
+            return deeper;
+    }
+    return null;
+}
 
 export interface CachedPartition {
     name: string;
@@ -193,8 +223,22 @@ export class DeviceDiscovery {
                 path: child.path,
                 uuid: child.uuid,
                 size: Number(child.size),
+
+                // fsType stays the PARTITION's -- `crypto_LUKS` on an encrypted volume. That is what
+                // `Volume.isEncrypted` is derived from, and it must keep saying so.
                 fsType: child.fstype,
-                mountPoint: child.mountpoint
+
+                // ...but the MOUNTPOINT is not on the partition. It never is, on an encrypted volume: the
+                // partition holds the LUKS header and ciphertext, and the ext4 -- and therefore the mount --
+                // lives on the `crypt` mapper CHILD.
+                //
+                // Reading `child.mountpoint` here returns null for a LUKS partition that is mounted, in
+                // service, and holding live data. On the next restart with encrypted volumes still mounted,
+                // every one of them would bind as UNMOUNTED, and start() would try to mount a mapper that is
+                // already mounted. Enough of those and reads go below quorum -- an outage caused entirely by
+                // asking the wrong layer where the mount is. (Raw discovery was already fixed to KEEP the crypt
+                // child for exactly this reason; this is the same bug, one function later.)
+                mountPoint: child.mountpoint ?? mountPointOfCryptChild(child)
             });
         }
 
@@ -342,18 +386,32 @@ export async function listRawBlockDevices(): Promise<RawBlockDevice[]> {
     }
 }
 
+// A child of a partition -- under LUKS this is the `crypt` mapper node that actually carries the filesystem.
+// Recursive because device-mapper stacks, and because a rule that only looks one level down is a rule that a
+// second layer walks straight past.
+function sanitizeChild(child: any): RawBlockDeviceChild {
+    return {
+        type: child.type,
+        name: child.name,
+        path: child.path ?? (child.name ? `/dev/${child.name}` : undefined),
+        uuid: child.uuid,
+        size: Number(child.size),
+        fstype: child.fstype,
+        mountpoint: child.mountpoint ?? null,
+        partlabel: child.partlabel ?? null,
+        children: (child.children || []).map(sanitizeChild)
+    };
+}
+
 function sanitizeRawBlockDevice(device: any): RawBlockDevice {
+    // KEEP THE PARTITIONS *AND* WHAT HANGS OFF THEM.
+    //
+    // This used to filter to `type === 'part'` and flatten the rest away. On a LUKS volume the ext4 -- and,
+    // fatally, the MOUNTPOINT -- lives on a `crypt` grandchild, so an encrypted disk arrived here looking like
+    // a partition with no filesystem and nothing mounted on it. The wipe guard believed it.
     const children = (device.children || [])
         .filter((child: any) => child?.type === 'part')
-        .map((child: any): RawBlockDeviceChild => ({
-            type: child.type,
-            name: child.name,
-            path: child.path ?? (child.name ? `/dev/${child.name}` : undefined),
-            uuid: child.uuid,
-            size: Number(child.size),
-            fstype: child.fstype,
-            mountpoint: child.mountpoint ?? null
-        }));
+        .map(sanitizeChild);
 
     return {
         name: device.name,

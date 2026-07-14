@@ -130,6 +130,121 @@ curl -X POST localhost/\$/volumes -H 'Content-Type: application/json' \
 
 The new volume is mounted, started, and writable immediately, and new writes start landing on it (it has the most free space). Existing data doesn't move by itself — **[rebalance](#rebalancing) if you want it levelled.**
 
+## Encryption (LUKS)
+
+**Off by default, and off on this array today.** No volume is encrypted; nothing below has been run in
+anger. It exists so that it can be.
+
+What it defends against: **a disk leaving the building** — RMA'd, sold, discarded, stolen. That is a real
+risk here; failing drives get pulled from this rack routinely and they hold customers' photographs, video
+and call recordings. What it does **not** defend against: a compromised host. The key has to be online to
+serve reads, so a root shell on this box reads everything regardless. Defence in depth, not a foundation.
+
+### Before you can encrypt anything
+
+Two secrets, and they do different jobs.
+
+```bash
+# 1. The KEYFILE. Unattended boot: `Restart=always` means a passphrase prompt at boot is a non-starter.
+install -d -m 0700 /var/lib/strubs
+dd if=/dev/urandom of=/var/lib/strubs/luks.key bs=512 count=1
+chmod 0400 /var/lib/strubs/luks.key
+```
+
+The second is the **recovery passphrase**, which you do not store on this machine. It becomes each volume's
+second LUKS keyslot, and it is the only thing that opens these disks if the OS disk dies. STRUBS will not
+create a volume with only the keyfile slot — a keyfile-only fleet dies with the OS disk, taking every byte
+with it — so it demands the passphrase on every encryption and refuses one that disagrees with the rest of
+the fleet.
+
+> **Write the passphrase down somewhere that is not this machine.** There is no undo, no reset, and no
+> support line. Lose both it and the OS disk and 130TB becomes noise.
+
+### Turning it on
+
+```bash
+# New disks only. Converts NOTHING already in the array -- it decides what the next disk looks like.
+curl -X PUT localhost/\$/encryption/settings -H 'Content-Type: application/json' \
+  -d '{"encryptNewVolumes":true}'
+```
+
+Or per-disk at provision time: add `"encrypt":true,"recoveryPassphrase":"…"` to the `POST /$/volumes` body.
+
+### Converting a drive that already holds data
+
+**You cannot encrypt a disk in place.** Every honest path is *drain → rebuild → refill*, so conversion is a
+wrapper over machinery that already exists:
+
+```bash
+curl -X POST localhost/\$/volumes/57/drain          # empties it; takes a while; watch it finish
+curl -X POST localhost/\$/volumes/57/encrypt \
+  -H 'Content-Type: application/json' -d '{"recoveryPassphrase":"…"}'
+curl -X POST localhost/\$/rebalance                 # refills it
+```
+
+> **Every encryption re-checks the passphrase against every encrypted disk already in the fleet.** The LUKS
+> headers on the platters are the only record of the fleet passphrase that cannot be rebuilt or restored from
+> last week, so they are the authority — not the verifier in Mongo. It costs ~3 seconds per encrypted volume
+> (argon2id is memory-hard on purpose), so a fully converted fleet takes ~90 seconds of preflight before it
+> starts. That is deliberate: it is the check that catches a fleet drifting onto two different passphrases,
+> which you would otherwise discover on the day the OS disk dies.
+
+The encrypt step **refuses a volume that still holds live slices** — it does not drain for you. It wipes and
+rebuilds the disk under the same volume id, and before it touches anything the disk must *prove* it is that
+exact volume of this instance. A mistyped id destroys nothing.
+
+Costs ~2× that disk's contents in relocation (~4.4 TB off, ~4.4 TB back). Converting the whole fleet is a
+complete rewrite of the array — **~264 TB, ~2 months.** The cheap path is to leave `encryptNewVolumes` on
+and let the fleet convert over its normal drive-replacement cycle.
+
+### While the fleet is mixed
+
+`GET /$/status` reports coverage as three lists — encrypted, plaintext, and *unknown* (disk absent, so we
+cannot read its filesystem and will not guess). **Partial encryption is partial protection**: until every
+volume is converted, pulling any plaintext disk still exposes every slice on it. The UI says so, loudly,
+and will not call the array protected while one remains.
+
+A locked volume is **not** an array outage: it starts unavailable with `locked: …` in its `mountError`, and
+the rest of the fleet serves normally. Be clear-eyed, though — with 4+2, three locked volumes puts objects
+below quorum.
+
+### Recovering an encrypted fleet
+
+The scenario the passphrase exists for: **the OS disk is gone.** Mongo, the volume table, the instance identity
+and the keyfile went with it. Thirty encrypted disks are still in the rack.
+
+```bash
+# Ask the disks who they are -- and hand them the passphrase, because everything they have to say is
+# behind the encryption.
+curl -X POST localhost/\$/recover-fleet -H 'Content-Type: application/json' \
+  -d '{"recoveryPassphrase":"…"}'
+```
+
+The scan unlocks each `crypto_LUKS` partition (keyfile first if it still exists, passphrase otherwise), reads
+the bootstrap manifest from inside, and locks it again. Nothing is written to a disk to read it.
+
+**Create the new keyfile first** (see above). The recovery puts it back into a keyslot on every disk it opened
+— and if it can't, it says so. Skip that and the fleet unlocks only when a human types the passphrase, which
+means it will not survive a reboot: `Restart=always` has nobody to ask. The response lists the disks whose
+keyslot was restored in `keyfileRestoredOn`.
+
+Then restart STRUBS, let the fleet come up, and rebuild the namespace with `POST /$/restore` as usual.
+
+> An encrypted disk that will not open is reported as **locked**, and counted against the recovery — the same
+> as a disk that would not mount. A recovery planned from a partial view of the array is one that can silently
+> decide a volume does not exist.
+
+### Back up the LUKS headers
+
+~16 MB each. A corrupt header costs one disk, which 4+2 already survives, so this is insurance rather than a
+critical path — but it is cheap insurance:
+
+```bash
+cryptsetup luksHeaderBackup /dev/sdx1 --header-backup-file /root/luks-header-vol57.img
+```
+
+Store them **off-box**. A header backup plus the passphrase is a complete recovery kit for that disk.
+
 ## Replacing or removing a drive
 
 The sequence is: **drain → confirm empty → identify → pull.**

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue';
-import type { VolumeStatus, BlockDevice } from '@strubs/server/http/mgmt';
+import type { VolumeStatus, BlockDevice, StatusResponse } from '@strubs/server/http/mgmt';
 
 const volumes = ref<VolumeStatus[]>([]);
 const blockDevices = ref<BlockDevice[]>([]);
@@ -737,6 +737,7 @@ async function fetchData(): Promise<void> {
     loading.value = false;
   }
   void fetchStorageStats();
+  void fetchEncryptionStatus();
 }
 
 // Refresh block devices by calling the reload endpoint
@@ -1171,6 +1172,101 @@ async function toggleVolumeDrain(): Promise<void> {
     await fetchData();
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to update drain';
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// ENCRYPTION (LUKS)
+//
+// PARTIAL ENCRYPTION IS PARTIAL PROTECTION. The one thing this UI must never do is imply the array is
+// protected while any plaintext disk is still in it -- pulling that disk still leaks every slice on it.
+// So we show the three states the API reports (encrypted / plaintext / unknown) and say plainly which
+// disks would still leak.
+// ---------------------------------------------------------------------------------------------------
+const encryption = ref<StatusResponse['encryption'] | null>(null);
+const encryptionBusy = ref(false);
+
+const encryptionCoverage = computed(() => {
+  const e = encryption.value;
+  if (!e) return null;
+  const total = e.encryptedVolumeIds.length + e.plaintextVolumeIds.length + e.unknownVolumeIds.length;
+  return { total, encrypted: e.encryptedVolumeIds.length, plaintext: e.plaintextVolumeIds.length, unknown: e.unknownVolumeIds.length };
+});
+
+async function fetchEncryptionStatus(): Promise<void> {
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/status`);
+    if (!res.ok) return;
+    encryption.value = (await res.json() as StatusResponse).encryption;
+  } catch {
+    // The banner simply doesn't render. Not worth failing the page over.
+  }
+}
+
+// The fleet default for NEW disks. Changes NOTHING about the disks already in the array -- said out loud,
+// because "turn on encryption" is exactly what an operator would expect to encrypt their data, and it does
+// not.
+async function setEncryptNewVolumes(value: boolean): Promise<void> {
+  encryptionBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/encryption/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ encryptNewVolumes: value })
+    });
+    if (!res.ok) throw new Error(`Failed to update (HTTP ${res.status})`);
+    await fetchEncryptionStatus();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to update encryption setting';
+  } finally {
+    encryptionBusy.value = false;
+  }
+}
+
+// Convert one volume to encrypted. This REBUILDS THE DISK: it is only allowed on a drained volume, and the
+// server refuses it otherwise. The rebalance refills it afterwards.
+async function encryptVolume(): Promise<void> {
+  const volume = contextMenuVolume.value;
+  if (volume === null) return;
+
+  const volumeId = volume.id;
+  hideContextMenu();
+
+  if (!confirm(
+    `Encrypt volume ${volumeId}?\n\n`
+    + `This WIPES AND REBUILDS the disk as an encrypted volume. It only works on a volume that has already `
+    + `been drained; the rebalance will refill it afterwards.\n\n`
+    + `You will need the fleet recovery passphrase.`
+  )) return;
+
+  // Never defaulted, never remembered, never sent anywhere but this one request.
+  const passphrase = prompt(
+    `Recovery passphrase for volume ${volumeId}.\n\n`
+    + (encryption.value?.hasRecoveryPassphrase
+      ? 'Enter the SAME passphrase the rest of the fleet was encrypted with.'
+      : 'This is the FIRST encrypted volume, so this passphrase becomes the fleet recovery passphrase. '
+        + 'If the OS disk dies, it is the only thing that can open these disks. WRITE IT DOWN SOMEWHERE '
+        + 'THAT IS NOT THIS MACHINE. There is no undo.')
+  );
+  if (!passphrase) return;
+
+  encryptionBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/volumes/${volumeId}/encrypt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recoveryPassphrase: passphrase })
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Failed to encrypt volume ${volumeId} (HTTP ${res.status})${text ? `: ${text}` : ''}`);
+    }
+    await fetchData();
+    await fetchEncryptionStatus();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to encrypt volume';
+  } finally {
+    encryptionBusy.value = false;
   }
 }
 
@@ -2045,6 +2141,50 @@ onUnmounted(() => {
           </button>
         </div>
       </div>
+      <!-- ENCRYPTION COVERAGE. Deliberately never says "protected" while a single plaintext disk remains:
+           pulling that disk still leaks every slice on it, and a green tick here would be a lie. -->
+      <div v-if="encryptionCoverage" class="encryption-bar">
+        <div class="encryption-state">
+          <span
+            class="verify-state"
+            :class="encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext === 0 ? 'running' : 'idle'"
+          >
+            {{ encryptionCoverage.encrypted }} / {{ encryptionCoverage.total }} encrypted
+          </span>
+          <span v-if="encryptionCoverage.unknown" class="access-hint">
+            {{ encryptionCoverage.unknown }} disk(s) absent — encryption state unknown
+          </span>
+        </div>
+
+        <div class="access-enforce-row encryption-default">
+          <div>
+            <div class="access-subtitle">Encrypt new volumes</div>
+            <div class="access-hint">
+              Applies to disks added from now on. <em>It converts nothing that is already in the array</em> —
+              use “Encrypt” on a drained volume for that.
+            </div>
+          </div>
+          <button
+            class="access-toggle-btn"
+            :class="{ on: encryption?.encryptNewVolumes }"
+            :disabled="encryptionBusy || !encryption"
+            @click="setEncryptNewVolumes(!encryption?.encryptNewVolumes)"
+          >
+            {{ encryption?.encryptNewVolumes ? 'On' : 'Off' }}
+          </button>
+        </div>
+      </div>
+
+      <div
+        v-if="encryptionCoverage && encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext > 0"
+        class="access-banner warn banner-standalone"
+      >
+        <strong>This array is partially encrypted.</strong>
+        {{ encryptionCoverage.plaintext }} volume(s) are still plaintext — pulling any one of them exposes
+        every slice it holds. Encryption protects a disk that leaves the building; it does nothing for the
+        disks that haven't been converted.
+      </div>
+
       <div class="volumes-view">
         <div class="volumes-toolbar">
           <div class="view-toggle" role="group" aria-label="Volumes view">
@@ -2134,6 +2274,7 @@ onUnmounted(() => {
                 <td>
                   <div class="status-cell">
                     <span v-if="entry.volume?.isReadOnly" class="state-badge ro" title="Read-only">RO</span>
+                    <span v-if="entry.volume?.isEncrypted" class="state-badge encrypted" title="LUKS encrypted">🔒</span>
                     <span v-if="entry.volume?.isDraining" class="state-badge draining" title="Draining (draining slices to other drives)">Draining</span>
                     <span v-if="entry.volume && !entry.volume.isEnabled" class="state-badge disabled" title="Disabled">Disabled</span>
                     <span
@@ -2200,6 +2341,7 @@ onUnmounted(() => {
                   <div v-if="entry.busGroup !== null" class="badge">Bus {{ entry.busGroup }}</div>
                   <div class="badge">{{ formatBytes(entry.bytesTotal) }}</div>
                   <div v-if="entry.volume?.isReadOnly" class="badge ro-badge">READ-ONLY</div>
+                  <div v-if="entry.volume?.isEncrypted" class="badge encrypted-badge" title="LUKS encrypted">🔒 ENCRYPTED</div>
                   <div v-if="entry.volume?.isDraining" class="badge draining-badge">DRAINING</div>
                   <div v-if="entry.volume && !entry.volume.isEnabled" class="badge offline-badge">DISABLED</div>
                   <div v-else-if="entry.volume && !entry.blockDevice" class="badge offline-badge">OFFLINE</div>
@@ -2629,6 +2771,16 @@ onUnmounted(() => {
         @click="toggleVolumeDrain"
       >
         {{ contextMenuVolume.isDraining ? 'Cancel Drain' : 'Drain (read-only + offload)' }}
+      </div>
+      <!-- Only offered on a plaintext volume: encrypting REBUILDS the disk, so the server refuses unless it
+           has already been drained. Shown regardless, so the refusal explains itself rather than the action
+           simply not being there. -->
+      <div
+        v-if="contextMenuVolume && !contextMenuVolume.isEncrypted"
+        class="context-menu-item"
+        @click="encryptVolume"
+      >
+        Encrypt (wipe + rebuild, drained only)
       </div>
       <div
         v-if="contextMenuVolume"
@@ -3652,6 +3804,10 @@ h2 {
   background-color: #26a69a;
 }
 
+.state-badge.encrypted {
+  background-color: #5c6bc0;
+}
+
 .state-badge.err {
   background-color: #ff9800;
 }
@@ -3706,6 +3862,38 @@ h2 {
 
 .draining-badge {
   background-color: rgba(38, 166, 154, 0.85);
+}
+
+.encrypted-badge {
+  background-color: rgba(92, 107, 192, 0.85);
+}
+
+/* --- encryption coverage bar (Volumes tab) --- */
+.encryption-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  background-color: #2a2a2a;
+  border-radius: 6px;
+}
+
+.encryption-state {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.encryption-default {
+  flex: 1;
+  min-width: 320px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
 }
 
 /* Modal Styles */

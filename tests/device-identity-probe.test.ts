@@ -112,12 +112,87 @@ describe('device identity probe', () => {
         expect((result as { reason: string }).reason).toMatch(/superblock cannot be READ/);
     });
 
+    // ⚠️ WHICH SIGNATURE WIPEFS HAPPENED TO LIST FIRST MUST NOT DECIDE WHETHER WE DESTROY 4.4TB.
+    //
+    // wipefs reports EVERY signature it finds, and a real STRUBS disk can carry a stale one alongside its ext4
+    // (an old mdraid superblock, a leftover LVM header). Returning `types[0]` meant such a disk could come back
+    // as "mdraid" -- and the guard only goes and READS a partition it believes is ext. Anything else it calls
+    // positively-not-ours and waves through to be repartitioned.
+    it('finds the ext signature even when a stale one is listed first', async () => {
+        spawnHelperMock.mockResolvedValueOnce({
+            code: 0,
+            stdout: JSON.stringify({ signatures: [{ type: 'linux_raid_member' }, { type: 'ext4' }] })
+        });
+        // ...and then it MOUNTS it, because that is what it does with anything that might be ours.
+        spawnHelperMock.mockResolvedValueOnce({ code: 0, stdout: '' });
+
+        const result = await probeStrubsIdentity(blank);
+
+        // It went and read the disk rather than dismissing it as a foreign filesystem.
+        expect(spawnHelperMock.mock.calls[1][0]).toBe('mount');
+        expect(result.status).not.toBe('clean');
+    });
+
+    // A SIGNATURE WE COULD NOT NAME IS NOT A SIGNATURE WE MAY IGNORE. wipefs said there is SOMETHING on this
+    // disk; dropping the only evidence of it and then calling the disk "not ext, therefore clean" would
+    // repartition a disk that told us it had something on it.
+    it('refuses a disk carrying a signature it cannot name', async () => {
+        spawnHelperMock.mockResolvedValueOnce({
+            code: 0,
+            stdout: JSON.stringify({ signatures: [{ device: 'sdb1' }] })   // present, but no type
+        });
+
+        const result = await probeStrubsIdentity(blank);
+
+        expect(result.status).toBe('unknown');
+        expect((result as { reason: string }).reason).toMatch(/cannot name|no type/i);
+    });
+
     it('catches a LUKS partition that lsblk did not cache an fstype for', async () => {
         spawnHelperMock.mockResolvedValueOnce(WIPEFS_LUKS);
 
         const result = await probeStrubsIdentity(blank);
         expect(result.status).toBe('unknown');
         expect((result as { reason: string }).reason).toMatch(/LUKS/);
+    });
+
+    // THE NAMEPLATE: how a LOCKED disk says who it is. It lives in the GPT partition entry, outside the
+    // container, so it is readable with no key at all -- and reading it is what stops the wipe guard from
+    // saying "I cannot tell" about a disk that is plainly ours.
+    it('identifies a LOCKED STRUBS disk from its nameplate, without the key', async () => {
+        const locked = {
+            type: 'part', name: 'sdb1', path: '/dev/sdb1', size: 100,
+            fstype: 'crypto_LUKS', partlabel: 'strubs-3f9a1b2c5d6e7f80-12'
+        } as any;
+
+        const result = await probeStrubsIdentity(locked);
+
+        expect(result.status).toBe('strubs');
+        expect((result as any).identity).toEqual({ instanceIdentity: '3f9a1b2c5d6e7f80', volumeId: 12 });
+        // Not one process spawned: no unlock, no mount, no cryptsetup. The partition table said it all.
+        expect(spawnHelperMock).not.toHaveBeenCalled();
+    });
+
+    // ...and an encrypted disk WITHOUT a nameplate is still a refusal. It is either a stranger's or ours with
+    // a lost key, and neither is a disk to reformat on a hunch. 'unknown' must never collapse into 'clean'.
+    it('still refuses a LUKS disk carrying no nameplate', async () => {
+        const anon = {
+            type: 'part', name: 'sdb1', path: '/dev/sdb1', size: 100,
+            fstype: 'crypto_LUKS', partlabel: null
+        } as any;
+
+        const result = await probeStrubsIdentity(anon);
+        expect(result.status).toBe('unknown');
+    });
+
+    // parted writes "primary" into that field by default. It is not a nameplate, and must not be read as one.
+    it('does not mistake parted\'s default partition name for a nameplate', async () => {
+        const parted = {
+            type: 'part', name: 'sdb1', path: '/dev/sdb1', size: 100,
+            fstype: 'crypto_LUKS', partlabel: 'primary'
+        } as any;
+
+        expect((await probeStrubsIdentity(parted)).status).toBe('unknown');
     });
 
     it('MOUNTS AND READS a partition whose ext4 the probe found but lsblk did not cache', async () => {

@@ -5,6 +5,8 @@ import path from 'path';
 import { spawnHelper } from '../helpers/spawn';
 import { createLogger } from '../log';
 import type { RawBlockDeviceChild } from './device-discovery';
+import { parseNameplate } from './luks';
+import { probeSignature, type Signature } from './signature-probe';
 
 const log = createLogger('device-identity-probe');
 
@@ -55,18 +57,35 @@ export async function probeStrubsIdentity(partition: RawBlockDeviceChild): Promi
     // encrypted. Shipping the feature with this in place would arm the bug: the first encrypted disk in the
     // rack becomes a 4TB disk that the wipe guard is happy to destroy.
     //
-    // We cannot read a LUKS container without the key. So we do not pretend to: 'unknown', which means REFUSE.
-    // (DR-G will extend this to attempt a read-only unlock with the array's own key and probe the mapper child
-    // beneath -- unlocked and ours => 'strubs'; unlocked and empty => 'clean'; will not unlock => still
-    // 'unknown', because a LUKS disk we hold no key for is either somebody else's or ours with a lost key, and
-    // neither is a disk to reformat on a hunch.)
-    if (fs === 'crypto_luks')
+    // We cannot read a LUKS container without the key -- but we can read the NAMEPLATE, which is why it exists.
+    //
+    // The nameplate lives in the GPT partition entry, OUTSIDE the container: `strubs-<identity>-<volumeId>`,
+    // readable with no mount, no unlock and no cryptsetup. A locked disk bearing one is telling us it is ours,
+    // and that is enough to REFUSE -- which is the only decision this function makes.
+    //
+    // Using an advisory field to refuse is always safe: the worst a forged or stale nameplate can do is stop us
+    // destroying a disk. (It would be a different matter to AUTHORISE a wipe on one, and we never do -- the
+    // conversion path requires a disk to prove itself from INSIDE the filesystem, which a locked disk cannot.)
+    //
+    // No nameplate, or one we do not recognise, still means 'unknown': a LUKS disk we hold no key for is either
+    // somebody else's or ours with a lost key, and neither is a disk to reformat on a hunch.
+    if (fs === 'crypto_luks') {
+        const plate = parseNameplate(partition.partlabel);
+
+        if (plate)
+            return {
+                status: 'strubs',
+                identity: { instanceIdentity: plate.identity, volumeId: plate.volumeId }
+            };
+
         return {
             status: 'unknown',
-            reason: `${partitionPath} is a LUKS container. Its contents cannot be read without the key, so this `
-                + `guard cannot establish whether it is blank or holds a STRUBS volume -- and "I could not tell" `
-                + `is not a licence to repartition 4TB. Unlock it, or take it out of the machine.`
+            reason: `${partitionPath} is a LUKS container carrying no STRUBS nameplate. Its contents cannot be `
+                + `read without the key, so this guard cannot establish whether it is blank or holds a STRUBS `
+                + `volume -- and "I could not tell" is not a licence to repartition 4TB. Unlock it, or take it `
+                + `out of the machine.`
         };
+    }
 
     // NO FSTYPE IS NOT PROOF OF BLANKNESS -- IT IS THE ABSENCE OF PROOF, AND THAT IS THE OTHER FAIL-OPEN.
     //
@@ -160,75 +179,6 @@ export async function probeStrubsIdentity(partition: RawBlockDeviceChild): Promi
     return result;
 }
 
-// ASK THE DEVICE WHAT IS ON IT -- WITH A TOOL WHOSE "NOTHING" MEANS NOTHING.
-//
-// The first version of this used `blkid -p` and read exit 2 as "positively blank". blkid(8) documents exit 2
-// for BOTH "no signature found" AND "impossible to gather any information about the device". Those are the two
-// things this entire guard exists to distinguish, and I had collapsed them into one -- in the function written
-// to stop exactly that. A failing STRUBS disk that blkid could not read would have come back CLEAN, and been
-// repartitioned.
-//
-// `wipefs -n --json` does not have that ambiguity. It is read-only (-n), and its answers are distinct:
-//
-//   exit 0, "signatures": [ {...} ]   -- there IS something here, and this is what it is
-//   exit 0, "signatures": [ ]         -- it probed the device successfully and there is genuinely NOTHING
-//   non-zero                          -- it could not probe the device at all. We do not know.
-//
-// An empty list is a POSITIVE finding. A failure is a failure. They no longer look alike.
-type Signature =
-    | { kind: 'none' }                    // probed successfully, and there is genuinely nothing there
-    | { kind: 'type'; type: string }      // there IS a signature, and this is it
-    | { kind: 'unreadable'; reason: string };
-
-export async function probeSignature(devicePath: string): Promise<Signature> {
-    try {
-        const { code, stdout } = await spawnHelper('wipefs', ['-n', '--json', devicePath]);
-
-        if (code !== 0)
-            return {
-                kind: 'unreadable',
-                reason: `could not probe ${devicePath} for a filesystem signature (wipefs exit ${code}: `
-                    + `${(stdout ?? '').trim().slice(0, 120)}). A disk whose superblock cannot be READ looks exactly `
-                    + `like a blank one -- and this guard decides whether to repartition it.`
-            };
-
-        // AND AN ANSWER WE DID NOT UNDERSTAND IS NOT AN ANSWER OF "NOTHING".
-        //
-        // `JSON.parse(stdout || '{}')` with a `?? []` fallback quietly turns empty stdout, `{}`, or a malformed
-        // `signatures` field into "no signatures" -- which is to say, into CLEAN. That is the same fail-open one
-        // level further down, in the function written to close it. Only a well-formed answer counts.
-        let sigs: Array<{ type?: string }>;
-        try {
-            const parsed = JSON.parse(stdout) as { signatures?: unknown };
-            if (!Array.isArray(parsed.signatures)) throw new Error('no signatures array');
-            sigs = parsed.signatures as Array<{ type?: string }>;
-        }
-        catch {
-            return {
-                kind: 'unreadable',
-                reason: `wipefs exited 0 for ${devicePath} but did not return a signature list this understands `
-                    + `(${(stdout ?? '').trim().slice(0, 80) || 'empty output'}). An answer we cannot read is not an `
-                    + `answer of "the disk is blank".`
-            };
-        }
-
-        // An EMPTY list here is a positive finding, not an absent one: wipefs probed the device and found no
-        // signature at all. That -- and only that -- is a blank disk.
-        if (!sigs.length)
-            return { kind: 'none' };
-
-        // LUKS anywhere in the list wins: it is the one signature that means "there may be an entire array in
-        // here and you cannot see it".
-        const types = sigs.map(sig => (sig.type ?? '').toLowerCase()).filter(Boolean);
-        if (types.includes('crypto_luks'))
-            return { kind: 'type', type: 'crypto_luks' };
-
-        return { kind: 'type', type: types[0] ?? 'unknown' };
-    }
-    catch (err) {
-        return { kind: 'unreadable', reason: `probing ${devicePath} for a signature failed: ${err}` };
-    }
-}
 
 async function readIdentity(dir: string, partitionPath: string): Promise<ProbeResult> {
     let data: Buffer;

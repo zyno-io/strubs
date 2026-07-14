@@ -135,9 +135,11 @@ anybody should delete. The tool found its own snapshot in the list on the first 
 **Post-quarantine verification:** three random real objects read end-to-end through the object API, MD5s
 matched. The array is healthy.
 
-## 5. DR-G (LUKS) has two blocking prerequisites, both fail-open
+## 5. DR-G (LUKS) had three blocking prerequisites, all fail-open
 
-**Status: NOT started. Both must be fixed before full-disk encryption ships in any mode.**
+**Status: ALL THREE FIXED (`bbe8a4d`), and DR-G itself is now implemented and shipped in `off` — no volume
+is encrypted. The original finding is kept below because the fail-open pattern it describes is the one this
+codebase keeps repeating, and it is worth being able to recognise on sight.**
 
 1. **The wipe guard reports an encrypted disk as `'clean'`.** A `crypto_LUKS` disk looks empty to the
    probe, so the guard that exists specifically to stop us destroying a disk with data on it would wave
