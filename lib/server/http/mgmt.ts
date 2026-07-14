@@ -19,7 +19,17 @@ import { mapperPath as luksMapperPath } from '../../io/luks';
 import { findManifestsOnDevices, recoverFleetFromDisks, type FleetRecoverySummary } from '../../recovery/bootstrap';
 import { bootstrapManifestWriter, type ManifestSnapshotRef } from '../../io/bootstrap-manifest';
 import { deviceProvisioner, ENCRYPT_NEW_VOLUMES_KEY } from '../../io/device-provisioner';
-import { hasRecoveryPassphrase } from '../../io/luks-recovery-key';
+import {
+    auditRecoveryKey,
+    hasRecoveryPassphrase,
+    lastRecoveryAudit,
+    scanFleet,
+    setFleetRecoveryPassphrase,
+    volumeDiskIsAttached,
+    withEncryptionSlot,
+    type PassphraseRotation,
+    type RecoveryAudit
+} from '../../io/luks-recovery-key';
 import type { CachedDevice } from '../../io/device-discovery';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
@@ -152,6 +162,11 @@ export type StatusResponse = {
         plaintextVolumeIds: number[];
         // Disk absent, so its filesystem cannot be read: we do NOT know, and we do not guess "plaintext".
         unknownVolumeIds: number[];
+
+        // When the recovery passphrase was last PROVEN against the platters, and what it found. Null means
+        // never -- which on an encrypted fleet means nobody has ever confirmed the disks can actually be
+        // recovered. That is worth saying out loud rather than leaving as an absence.
+        lastAudit: RecoveryAudit | null;
     };
 };
 
@@ -943,7 +958,8 @@ export class HttpMgmt {
                 hasRecoveryPassphrase: await hasRecoveryPassphrase(),
                 encryptedVolumeIds: encrypted,
                 plaintextVolumeIds: plaintext,
-                unknownVolumeIds: unknownEncryption
+                unknownVolumeIds: unknownEncryption,
+                lastAudit: await lastRecoveryAudit()
             }
         };
     }
@@ -956,6 +972,25 @@ export class HttpMgmt {
             priorityStats,
             verifyStatus
         };
+    }
+
+    // RECOMPUTE THE STATISTICS FROM THE OBJECT RECORDS.
+    //
+    // The per-volume counters are a CACHE kept up to date by incremental deltas, and under live traffic those
+    // deltas can drift. A full reconcile runs on a timer -- but there was no way to ASK for one, so an operator
+    // watching a volume report "-16 files" had no move except to wait six hours for the scheduler.
+    //
+    // It touches no disk and no object: it recomputes derived numbers from `content`. Takes ~50 seconds on this
+    // array, so it is awaited rather than fired and forgotten -- an operator asking for a recount wants to know
+    // it happened.
+    private static async handleStorageStatsReconcileRequest(): Promise<StorageStatsSnapshot> {
+        log('recomputing the storage statistics on request');
+        await storageStatsTracker.reconcile();
+
+        const snapshot = await storageStatsTracker.getSnapshot();
+        if (!snapshot)
+            throw new Error('storage stats unavailable');
+        return snapshot;
     }
 
     private static async handleStorageStatsRequest(): Promise<StorageStatsSnapshot> {
@@ -1128,11 +1163,63 @@ export class HttpMgmt {
         };
     }
 
+    // A retired encrypted volume coming back into service. While it was deleted, rotations passed it by -- so it
+    // may be carrying a passphrase the fleet has since abandoned, and nothing in normal service would notice,
+    // because STRUBS mounts with the keyfile and never touches the passphrase slot.
+    //
+    // Require its disk to be here (so the next rotation can reach it), and make the operator's next move obvious.
+    private static async assertVolumeMayReturn(id: number): Promise<void> {
+        // NO DISK, NO UNDELETE -- for ANY volume, encrypted or not.
+        //
+        // The earlier version asked `luksEncryptedVolumes` first and returned early if the id was not in it. That
+        // record lives in the same database you may have just restored, so "not in the record" does not mean
+        // "not encrypted" -- it can equally mean "the record is gone". The check that was supposed to be
+        // unconditional was conditional on the one thing least worth trusting.
+        //
+        // So do not ask the database at all. If the disk is not here we cannot tell what is on it, and a volume
+        // whose disk is absent has nothing to offer by being restored anyway. The same coarse rule as rotation:
+        // when the answer matters and the disk is the only thing that knows it, the disk has to be present.
+        const volume = ioManager.getVolume(id);
+
+        if (!await volumeDiskIsAttached(volume?.partitionUuid ?? null))
+            throw new HttpBadRequestError(
+                `refusing to restore volume ${id}: its disk is not attached, so we cannot tell what is on it. If `
+                + `it is encrypted, rotations that happened while it was deleted did not reach it -- it could be `
+                + `carrying a recovery passphrase nobody has, and nothing in normal service would tell you, `
+                + `because STRUBS unlocks with the keyfile. Attach the disk and try again.`
+            );
+
+        // The disk is here, so the PLATTER can tell us whether it is encrypted -- no database required.
+        const { ours } = await scanFleet();
+
+        if (ours.some(disk => disk.volumeId === id))
+            log.error('volume%d is ENCRYPTED and is being restored after being deleted. Any passphrase rotation '
+                + 'that happened while it was retired did not reach it, so it may still hold an OLD recovery '
+                + 'passphrase. Run POST /$/encryption/audit to find out, and PUT /$/encryption/passphrase (with '
+                + 'every disk attached) to rewrite it.', id);
+    }
+
     private static async handleVolumeDeleteRequest(params: RouteParams): Promise<{ deleted: boolean }> {
         const id = this.parseVolumeId(params);
+        // Under the same gate as an encrypted provision: a rotation walks only the volumes that are not deleted,
+        // so a volume changing deleted-ness mid-rotation is one the rotation may reach or may skip depending on
+        // nothing but timing. See withEncryptionSlot().
+        return withEncryptionSlot(() => this.doVolumeDelete(id));
+    }
+
+    private static async doVolumeDelete(id: number): Promise<{ deleted: boolean }> {
         await this.assertVolumeRemovable(id);
         await database.softDeleteVolume(id);
         await ioManager.softDeleteVolume(id).catch(() => undefined);
+
+        // NOTE: nothing about encryption is recorded here, and nothing needs to be.
+        //
+        // A soft delete is REVERSIBLE, and there used to be an anxious dance around that: remember whether the
+        // retired volume was encrypted, so a later rotation would know to refuse while its disk was away. Every
+        // version of that was wrong, because the memory lived in the database a restore can take away.
+        //
+        // The volume cannot come back without its disk (see assertVolumeMayReturn), and a rotation refuses while
+        // ANY volume is absent. Both rules ask the platters. Neither needs to remember anything.
         return { deleted: true };
     }
 
@@ -1385,6 +1472,47 @@ export class HttpMgmt {
             );
     }
 
+    // DOES THE RECOVERY PASSPHRASE STILL OPEN EVERY ENCRYPTED DISK?
+    //
+    // The one question about an encrypted fleet that nothing else in the system will ever ask. STRUBS mounts
+    // with the KEYFILE, so a disk whose passphrase slot has rotted, been changed by hand, or was never the
+    // fleet's to begin with serves flawlessly for years -- and announces itself on the single day it matters,
+    // when the OS disk is dead and the passphrase from the safe opens eleven of thirty disks.
+    //
+    // ~3 seconds per encrypted volume (argon2id is memory-hard on purpose). Slow, thorough, and exactly the
+    // kind of check that belongs on a schedule rather than bolted onto the front of a provision.
+    private static async handleEncryptionAuditRequest(req: HttpRequest): Promise<RecoveryAudit> {
+        const payload = await this.parseJsonBody<{ recoveryPassphrase?: unknown }>(req);
+
+        if (typeof payload.recoveryPassphrase !== 'string' || !payload.recoveryPassphrase)
+            throw new HttpBadRequestError(
+                'recoveryPassphrase is required: the audit puts it against every encrypted disk\'s LUKS header, '
+                + 'which is the only way to know it still opens them. We do not keep it on the machine it is '
+                + 'meant to recover.'
+            );
+
+        return await auditRecoveryKey(payload.recoveryPassphrase);
+    }
+
+    // SET OR CHANGE THE FLEET RECOVERY PASSPHRASE.
+    //
+    // This works -- and it is the reason the rest of the encryption code can be as simple as it is -- because we
+    // hold the KEYFILE, and the keyfile opens every disk. So the passphrase is not something we have to discover
+    // from the platters and defend against drifting: it is something we WRITE, to every disk, whenever we like.
+    //
+    // Changing it rewrites the second keyslot on every encrypted volume. See setFleetRecoveryPassphrase() for
+    // the ordering, which is chosen so that a crash can never leave a disk that no known passphrase opens.
+    private static async handleEncryptionPassphraseRequest(req: HttpRequest): Promise<PassphraseRotation> {
+        const payload = await this.parseJsonBody<{ passphrase?: unknown; currentPassphrase?: unknown }>(req);
+
+        if (typeof payload.passphrase !== 'string' || !payload.passphrase)
+            throw new HttpBadRequestError('passphrase is required');
+        if (payload.currentPassphrase !== undefined && typeof payload.currentPassphrase !== 'string')
+            throw new HttpBadRequestError('currentPassphrase must be a string');
+
+        return await setFleetRecoveryPassphrase(payload.passphrase, payload.currentPassphrase as string | undefined);
+    }
+
     // The fleet default for NEW disks. Deliberately does not touch a single existing volume -- turning this on
     // converts nothing, it only decides what the next disk to be added looks like.
     private static async handleEncryptionSettingsSetRequest(req: HttpRequest): Promise<{ encryptNewVolumes: boolean }> {
@@ -1502,6 +1630,26 @@ export class HttpMgmt {
         const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; isDraining?: unknown; label?: unknown; comment?: unknown }>(req);
         const id = this.parseVolumeId(params);
 
+        // A change to deleted-ness changes WHICH VOLUMES A ROTATION WALKS -- rotation considers only the ones
+        // that are not deleted. So it must not straddle one: `scanFleet()` snapshots the volume list and then
+        // enumerates the disks, and an undelete landing in that window makes a volume active again while the
+        // rotation's snapshot still calls it deleted. The rotation skips it, records the new passphrase, and the
+        // disk comes back into service holding a key nobody has.
+        //
+        // Same gate as an encrypted provision. Everything else about a volume (label, read-only, enabled) is
+        // irrelevant to the passphrase and needs no gate.
+        if (payload.isDeleted !== undefined)
+            return withEncryptionSlot(() => this.doVolumeUpdate(req, id, payload));
+
+        return this.doVolumeUpdate(req, id, payload);
+    }
+
+    private static async doVolumeUpdate(
+        req: HttpRequest,
+        id: number,
+        payload: { isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown; isHealthy?: unknown; isDraining?: unknown; label?: unknown; comment?: unknown }
+    ): Promise<{ updated: boolean }> {
+
         const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean; isHealthy?: boolean; isDraining?: boolean; label?: string | null; comment?: string | null } = {};
         let shouldSoftDelete = false;
 
@@ -1534,8 +1682,18 @@ export class HttpMgmt {
                 throw new HttpBadRequestError('isDeleted must be a boolean');
             if (payload.isDeleted)
                 shouldSoftDelete = true;
-            else
+            else {
+                // ⚠️ UNDELETING AN ENCRYPTED VOLUME BRINGS BACK A DISK THAT MAY HAVE MISSED A ROTATION.
+                //
+                // Rotation only walks volumes that are NOT deleted, so while this one was retired the fleet
+                // passphrase may have been changed without it. Bring it back and it holds a key nobody has --
+                // and nothing in normal service would ever notice, because STRUBS mounts with the keyfile.
+                //
+                // Its disk must be attached, so that the next rotation can actually reach it, and the operator
+                // is told to prove the passphrase against it.
+                await this.assertVolumeMayReturn(id);
                 updates.isDeleted = false;
+            }
         }
 
         if (payload.label !== undefined) {
@@ -1722,6 +1880,11 @@ export class HttpMgmt {
                 handler: async () => this.handleStorageStatsRequest()
             },
             {
+                method: 'POST',
+                match: url => url === '/$/storage-stats' ? {} : null,
+                handler: async () => this.handleStorageStatsReconcileRequest()
+            },
+            {
                 method: 'GET',
                 match: url => url === '/$/blockDevices' ? {} : null,
                 handler: async req => this.handleBlockDevicesRequest(req)
@@ -1760,6 +1923,16 @@ export class HttpMgmt {
                 method: 'PUT',
                 match: url => url === '/$/encryption/settings' ? {} : null,
                 handler: async req => this.handleEncryptionSettingsSetRequest(req)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/encryption/audit' ? {} : null,
+                handler: async req => this.handleEncryptionAuditRequest(req)
+            },
+            {
+                method: 'PUT',
+                match: url => url === '/$/encryption/passphrase' ? {} : null,
+                handler: async req => this.handleEncryptionPassphraseRequest(req)
             },
             {
                 method: 'DELETE',

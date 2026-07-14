@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { promises as fsp } from 'fs';
 
 import { spawnHelper } from '../helpers/spawn';
@@ -348,6 +349,40 @@ export async function testPassphrase(partitionPath: string, passphrase: string):
     return 'unreadable';
 }
 
+// REMOVE A PASSPHRASE FROM A CONTAINER. Identified BY the passphrase -- `luksRemoveKey` kills the slot that the
+// key you supply opens, so we never have to work out slot numbers (and never risk killing the wrong one).
+//
+// Used only when rotating: the new passphrase is already in place and proven on every disk before this runs, so
+// the worst a failure here can do is leave a second, older, still-valid passphrase behind. Untidy; not dangerous.
+export async function removePassphrase(partitionPath: string, passphrase: string): Promise<void> {
+    const { code, stdout } = await spawnHelper('cryptsetup', [
+        'luksRemoveKey',
+        '--batch-mode',
+        partitionPath,
+        '-'                     // the key to remove, read from stdin -- never from argv
+    ], { stdin: passphrase });
+
+    if (code !== 0)
+        throw new LuksError(
+            `could not remove the old passphrase from ${partitionPath}: ${(stdout ?? '').trim() || `exit ${code}`}`,
+            'failed');
+}
+
+// WHOSE HEADER IS THIS, RIGHT NOW? -- asked immediately before we write to it.
+//
+// A device PATH is not an identity. These are USB disks: /dev/sdf1 is whatever the kernel most recently decided
+// to call the thing in that slot, and it gets reused. A rotation enumerates the disks, then spends seconds per
+// disk deriving keys -- and in that window the disk it scanned can drop and a DIFFERENT one of ours can land on
+// the same path. `cryptsetup luksAddKey /dev/sdf1` would then succeed, against the wrong header, and the volume
+// we meant to rotate would never be reached at all.
+//
+// The container uuid is minted by luksFormat and is the identity of the HEADER. Ask for it, and refuse to touch
+// a disk that is not the one we scanned.
+export async function containerUuid(partitionPath: string): Promise<string | null> {
+    const { code, stdout } = await spawnHelper('cryptsetup', ['luksUUID', partitionPath]);
+    return code === 0 && stdout.trim() ? stdout.trim() : null;
+}
+
 // HOW MANY KEYSLOTS ARE IN USE.
 //
 // A LUKS keyslot IS a password-wrapped copy of the master key -- which is why no separate escrow partition is
@@ -500,8 +535,31 @@ export async function nameplateIsPresent(
 //               So it is surfaced, and the caller refuses. (Encrypted provisioning REQUIRES the nameplate to
 //               land, so one of ours should never be in this state.)
 // ---------------------------------------------------------------------------------------------------------
+// PATHS RENUMBER. VOLUME IDS DO NOT.
+//
+// These are USB disks: /dev/sdf1 becomes /dev/sdg1 when one drops and the bus re-enumerates -- that is the
+// vol-57 case, and it has already bitten this system once. So anything we RECORD about a disk (an audit result,
+// say, that a later encryption will rely on) must be keyed by something stable. The nameplate carries the
+// volume id, so we carry it too.
+export type EncryptedDisk = {
+    path: string;
+    volumeId: number;
+
+
+    // THE LUKS CONTAINER'S OWN UUID -- and it is a different thing from the volume id, on purpose.
+    //
+    // The volume id survives a CONVERSION: drain volume 12, wipe it, re-encrypt it, and it is volume 12 again,
+    // with a brand-new LUKS header and potentially a different passphrase. An audit keyed only on the id would
+    // still claim to have "proven volume 12" -- vouching for a header it has never seen, and handing out the
+    // one-disk shortcut on the strength of it.
+    //
+    // luksFormat mints a fresh container uuid every time, so this identifies the HEADER, which is the thing the
+    // passphrase actually opens. (lsblk reports it as the partition's uuid on a crypto_LUKS partition.)
+    luksUuid: string | null;
+};
+
 export type EncryptedDisks = {
-    ours: string[];
+    ours: EncryptedDisk[];
     unknown: string[];
 };
 
@@ -509,7 +567,7 @@ export async function findEncryptedPartitions(
     instanceIdentity: string | null,
     list: typeof listRawBlockDevices = listRawBlockDevices
 ): Promise<EncryptedDisks> {
-    const ours: string[] = [];
+    const ours: EncryptedDisk[] = [];
     const unknown: string[] = [];
     const mine = normaliseIdentity(instanceIdentity ?? '');
 
@@ -529,7 +587,7 @@ export async function findEncryptedPartitions(
 
             // The plate carries only the first 16 hex characters of the identity, so compare on that.
             if (mine && plate.identity === mine.slice(0, 16))
-                ours.push(path);
+                ours.push({ path, volumeId: plate.volumeId, luksUuid: child.uuid ?? null });
             // else: it names another STRUBS instance. Positively not ours.
         }
     }

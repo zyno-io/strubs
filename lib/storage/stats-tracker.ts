@@ -32,6 +32,7 @@ export class StorageStatsTracker {
     private started = false;
     private flushInFlight: Promise<void> | null = null;
     private reconcileInFlight: Promise<void> | null = null;
+    private healing = false;
     private unavailableRefreshInFlight: Promise<StorageStatsSnapshot | null> | null = null;
     private mutationSerial = 0;
 
@@ -102,7 +103,54 @@ export class StorageStatsTracker {
         const snapshot = await this.deps.database.getStorageStats();
         if (!snapshot)
             return null;
+
+        // AN IMPOSSIBLE NUMBER IS A BUG REPORT. TREAT IT AS ONE.
+        //
+        // These counters are a CACHE, maintained by incremental deltas: a create adds, a delete subtracts, a
+        // relocation moves one slice from one volume to another. Under live traffic those deltas can drift from
+        // the truth -- and drift is survivable, because a full reconcile recomputes from `content` every few
+        // hours and puts it right.
+        //
+        // What is NOT survivable is drift that goes NEGATIVE. A volume holding -16 objects is not a number that
+        // exists. It happened here: volume 57's cached count was ~16 short of the truth, and draining it
+        // subtracted a perfectly correct 4,963 straight through zero. The UI then rendered "-16 files" and
+        // "NaN undefined" for as long as it took the next scheduled reconcile to come round -- six hours of an
+        // operator staring at nonsense and reasonably wondering whether their disk had eaten itself.
+        //
+        // The data was never in danger; only the arithmetic was. So: an impossible value means the cache is
+        // provably wrong, and the fix already exists -- run it. Fire the reconcile in the background (it takes
+        // ~50 seconds on this array, and this is a read path serving the UI) and hand back what we have for now.
+        // The next poll, seconds later, gets the truth.
+        if (this.hasImpossibleCounters(snapshot))
+            this.healInBackground();
+
         return this.refreshUnavailableIfNeeded(snapshot);
+    }
+
+    // Any counter below zero. There is no such thing as negative bytes, negative slices, or a volume that holds
+    // minus sixteen objects -- so one of them appearing is proof, not suspicion.
+    private hasImpossibleCounters(snapshot: StorageStatsSnapshot): boolean {
+        const negative = (counters: object): boolean =>
+            Object.values(counters).some(value => typeof value === 'number' && value < 0);
+
+        if (negative(snapshot.system))
+            return true;
+
+        return Object.values(snapshot.volumes ?? {}).some(negative);
+    }
+
+    private healInBackground(): void {
+        if (this.reconcileInFlight || this.healing)
+            return;
+
+        this.healing = true;
+        this.log.error('the storage statistics cache has gone NEGATIVE, which is impossible -- so it is wrong. '
+            + 'Recomputing it from the object records now. (The objects and the disks are unaffected: these are '
+            + 'derived counters, and this is what the reconcile exists for.)');
+
+        void this.reconcile()
+            .catch(err => this.log.error('could not recompute the storage statistics: %s', err))
+            .finally(() => { this.healing = false; });
     }
 
     private async ensureSnapshot(): Promise<void> {

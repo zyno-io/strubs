@@ -231,4 +231,72 @@ describe('StorageStatsTracker', () => {
         expect(database.replaceStorageStats).not.toHaveBeenCalled();
         expect(database.refreshStorageStatsUnavailable).toHaveBeenCalledWith([1, 3], expect.any(Date));
     });
+
+    // ⚠️ AN IMPOSSIBLE NUMBER IS A BUG REPORT. TREAT IT AS ONE.
+    //
+    // These counters are a cache kept by incremental deltas, and drift is survivable -- a scheduled reconcile
+    // recomputes them from the object records. Drift that goes NEGATIVE is not: a volume holding -16 objects is
+    // not a number that exists.
+    //
+    // It happened. Volume 57's cached count was ~16 short of the truth, draining it subtracted a perfectly
+    // correct 4,963 straight through zero, and the UI showed "-16 files" and "NaN undefined" for as long as it
+    // took the next scheduled reconcile to come round. Six hours of an operator reasonably wondering whether
+    // their disk had eaten itself, when the data was never in any danger at all.
+    describe('when the cache goes negative', () => {
+        const trackerWith = (snapshot: unknown) => {
+            const database = {
+                applyStorageStatsDelta: vi.fn().mockResolvedValue(undefined),
+                getStorageStats: vi.fn().mockResolvedValue(snapshot),
+                backfillContentSliceSizes: vi.fn().mockResolvedValue(0),
+                computeStorageStats: vi.fn().mockResolvedValue({ system: {}, volumes: {} }),
+                replaceStorageStats: vi.fn().mockResolvedValue(undefined),
+                refreshStorageStatsUnavailable: vi.fn().mockResolvedValue(snapshot)
+            };
+            const tracker = new StorageStatsTracker({
+                database: database as any,
+                ioManager: { getVolumeEntries: vi.fn(() => []) } as any,
+                createLogger: createLogger() as any
+            });
+            return { tracker, database };
+        };
+
+        const healthy = { system: { objectCount: 10 }, volumes: { '1': { objectCount: 10, physicalBytes: 100 } } };
+        const negative = { system: { objectCount: 10 }, volumes: { '57': { objectCount: -16, physicalBytes: -1015940053 } } };
+
+        it('recomputes itself when a volume reports an impossible count', async () => {
+            const { tracker, database } = trackerWith(negative);
+
+            await tracker.getSnapshot();
+            await new Promise(resolve => setImmediate(resolve));   // the heal runs in the background
+
+            // It went and recounted from the object records rather than serving nonsense for six hours.
+            expect(database.computeStorageStats).toHaveBeenCalled();
+            expect(database.replaceStorageStats).toHaveBeenCalled();
+        });
+
+        it('leaves a healthy cache alone', async () => {
+            const { tracker, database } = trackerWith(healthy);
+
+            await tracker.getSnapshot();
+            await new Promise(resolve => setImmediate(resolve));
+
+            expect(database.computeStorageStats).not.toHaveBeenCalled();
+        });
+
+        it('still serves the numbers it has while it heals -- a read path must not block on a recount', async () => {
+            const { tracker } = trackerWith(negative);
+
+            // ~50 seconds on the real array. The UI polls this; it cannot wait.
+            await expect(tracker.getSnapshot()).resolves.toBeTruthy();
+        });
+
+        it('does not stampede: many reads trigger one recount, not one each', async () => {
+            const { tracker, database } = trackerWith(negative);
+
+            await Promise.all([tracker.getSnapshot(), tracker.getSnapshot(), tracker.getSnapshot()]);
+            await new Promise(resolve => setImmediate(resolve));
+
+            expect(database.replaceStorageStats).toHaveBeenCalledTimes(1);
+        });
+    });
 });

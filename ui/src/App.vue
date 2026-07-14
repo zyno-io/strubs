@@ -330,6 +330,26 @@ async function fetchStorageStats(): Promise<void> {
   }
 }
 
+// RECOUNT. The per-volume statistics are a cache maintained by incremental deltas, and under live traffic those
+// deltas drift. A full reconcile runs on a timer -- but until now there was no way to ASK for one, so an operator
+// looking at a volume reporting "-16 files" had no move but to wait for the scheduler.
+//
+// It reads the object records and rewrites the derived counters. No disk is touched and no object is changed.
+const statsBusy = ref(false);
+
+async function recomputeStorageStats(): Promise<void> {
+  statsBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/storage-stats`, { method: 'POST' });
+    if (!res.ok) throw new Error(`Failed to recompute storage statistics (HTTP ${res.status})`);
+    storageStats.value = await res.json();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to recompute storage statistics';
+  } finally {
+    statsBusy.value = false;
+  }
+}
+
 // Poll the maintenance-freeze state; tolerant of transient errors so polling continues.
 async function fetchFreezeStatus(): Promise<void> {
   try {
@@ -838,12 +858,23 @@ function formatSmartStatus(volume: VolumeStatus | null): string {
 }
 
 // Format bytes to human readable
+// `Math.log` of a negative number is NaN, and `sizes[NaN]` is undefined -- so a negative byte count used to
+// render, literally, as "NaN undefined". Which is exactly what a drained volume showed, because the stats cache
+// had drifted below zero (see StorageStatsTracker: an impossible count now heals itself).
+//
+// Handled here too, because a display that cannot render a number it is given is a display that hides the bug
+// instead of showing it. A negative count is nonsense, but "-16 B" is nonsense you can READ.
 function formatBytes(bytes: number): string {
+  if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) return '—';
   if (bytes === 0) return '0 B';
+
+  const sign = bytes < 0 ? '-' : '';
+  const magnitude = Math.abs(bytes);
+
   const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const i = Math.min(Math.floor(Math.log(magnitude) / Math.log(k)), sizes.length - 1);
+  return sign + (Math.round(magnitude / Math.pow(k, i) * 100) / 100) + ' ' + sizes[i];
 }
 
 // Toggle device selection
@@ -1222,6 +1253,98 @@ async function setEncryptNewVolumes(value: boolean): Promise<void> {
     encryptionBusy.value = false;
   }
 }
+
+// SET OR CHANGE THE FLEET RECOVERY PASSPHRASE.
+//
+// This works because we hold the KEYFILE, and the keyfile opens every disk -- so the passphrase is not something
+// we have to discover from the platters, it is something we WRITE to them. Changing it rewrites the second
+// keyslot on every encrypted volume.
+async function setRecoveryPassphrase(): Promise<void> {
+  const existing = encryption.value?.hasRecoveryPassphrase;
+
+  const current = existing
+    ? prompt('Enter the CURRENT recovery passphrase.\n\nWithout it we will not change anything — an operator who '
+      + 'cannot produce it is about to discover that the one in the safe is worthless, and better now than later.')
+    : null;
+  if (existing && !current) return;
+
+  const next = prompt(
+    existing
+      ? `Enter the NEW recovery passphrase.\n\nIt will be written to all ${encryptionCoverage.value?.encrypted ?? 0} `
+        + `encrypted disk(s). WRITE IT DOWN SOMEWHERE THAT IS NOT THIS MACHINE.`
+      : 'Set the fleet recovery passphrase.\n\nIf the OS disk dies, this is the ONLY thing that can open these '
+        + 'disks. WRITE IT DOWN SOMEWHERE THAT IS NOT THIS MACHINE. There is no undo.'
+  );
+  if (!next) return;
+
+  encryptionBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/encryption/passphrase`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ passphrase: next, currentPassphrase: current ?? undefined })
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Failed to set the recovery passphrase (HTTP ${res.status})${text ? `: ${text}` : ''}`);
+    }
+    await fetchEncryptionStatus();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to set the recovery passphrase';
+  } finally {
+    encryptionBusy.value = false;
+  }
+}
+
+// PROVE THE RECOVERY PASSPHRASE STILL OPENS EVERY ENCRYPTED DISK.
+//
+// The keyfile makes the passphrase enforceable, so this is not the authority it once was -- but there is exactly
+// one way for a disk to end up on the wrong passphrase that enforcement cannot prevent: it was ABSENT when the
+// passphrase was last changed, and came back afterwards. Nothing else will ever notice, because STRUBS mounts
+// with the keyfile and never touches that slot.
+async function auditRecoveryPassphrase(): Promise<void> {
+  const total = encryptionCoverage.value?.encrypted ?? 0;
+  if (!total) return;
+
+  const passphrase = prompt(
+    `Check the recovery passphrase against all ${total} encrypted volume(s).\n\n`
+    + `This opens nothing and changes nothing — it asks each disk's LUKS header whether the passphrase still `
+    + `fits. Takes about ${Math.ceil(total * 3)} seconds.`
+  );
+  if (!passphrase) return;
+
+  encryptionBusy.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/encryption/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recoveryPassphrase: passphrase })
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Audit failed (HTTP ${res.status})${text ? `: ${text}` : ''}`);
+    }
+    await fetchEncryptionStatus();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to audit the recovery passphrase';
+  } finally {
+    encryptionBusy.value = false;
+  }
+}
+
+// How long since the recovery passphrase was last PROVEN against the platters. Null = never, which on an
+// encrypted fleet is the thing most worth saying.
+const auditAgeDays = computed(() => {
+  const at = encryption.value?.lastAudit?.checkedAt;
+  if (!at) return null;
+  return Math.floor((Date.now() - new Date(at).getTime()) / 86_400_000);
+});
+
+const auditIsStale = computed(() => {
+  if (!encryptionCoverage.value?.encrypted) return false;   // nothing encrypted: nothing to prove
+  const age = auditAgeDays.value;
+  return age === null || age > 90;
+});
 
 // Convert one volume to encrypted. This REBUILDS THE DISK: it is only allowed on a drained volume, and the
 // server refuses it otherwise. The rebalance refills it afterwards.
@@ -1890,6 +2013,13 @@ onUnmounted(() => {
           <span class="storage-stat-label">Physical Total</span>
           <span class="storage-stat-value">{{ formatBytes(systemStats.physicalBytes) }}</span>
         </div>
+        <button
+          type="button"
+          class="access-mini-btn"
+          :disabled="statsBusy"
+          title="Recount from the object records. Reads only — no disk is touched, no object is changed."
+          @click="recomputeStorageStats"
+        >{{ statsBusy ? 'Recounting…' : 'Recount' }}</button>
         <div class="storage-stat">
           <span class="storage-stat-label">Total Capacity</span>
           <span class="storage-stat-value">{{ formatBytes(onlineAssignedCapacity) }}</span>
@@ -2173,6 +2303,43 @@ onUnmounted(() => {
             {{ encryption?.encryptNewVolumes ? 'On' : 'Off' }}
           </button>
         </div>
+
+        <div class="access-enforce-row encryption-default">
+          <div>
+            <div class="access-subtitle">Recovery passphrase</div>
+            <div class="access-hint">
+              The only thing that opens these disks if the OS disk dies. Changing it rewrites the keyslot on
+              every encrypted volume — <em>which works because STRUBS holds the keyfile</em>.
+            </div>
+          </div>
+          <button class="access-toggle-btn" :disabled="encryptionBusy" @click="setRecoveryPassphrase">
+            {{ encryption?.hasRecoveryPassphrase ? 'Change' : 'Set' }}
+          </button>
+        </div>
+
+        <div v-if="encryptionCoverage && encryptionCoverage.encrypted > 0" class="access-enforce-row encryption-default">
+          <div>
+            <div class="access-subtitle">Prove it against the disks</div>
+            <div class="access-hint">
+              <template v-if="encryption?.lastAudit?.healthy">
+                Last proven against all {{ encryption.lastAudit.total }} encrypted disk(s)
+                {{ auditAgeDays === 0 ? 'today' : `${auditAgeDays} day(s) ago` }}.
+              </template>
+              <template v-else-if="auditAgeDays === null">
+                <em>Never checked.</em> Nobody has confirmed these disks can actually be recovered.
+              </template>
+              <template v-else>Last checked {{ auditAgeDays }} day(s) ago.</template>
+            </div>
+          </div>
+          <button
+            class="access-toggle-btn"
+            :class="{ on: encryption?.lastAudit?.healthy }"
+            :disabled="encryptionBusy"
+            @click="auditRecoveryPassphrase"
+          >
+            Check the disks
+          </button>
+        </div>
       </div>
 
       <div
@@ -2183,6 +2350,69 @@ onUnmounted(() => {
         {{ encryptionCoverage.plaintext }} volume(s) are still plaintext — pulling any one of them exposes
         every slice it holds. Encryption protects a disk that leaves the building; it does nothing for the
         disks that haven't been converted.
+      </div>
+
+      <!-- THE WORST NEWS THIS PAGE CAN CARRY. Every disk mounts, every disk serves, the array looks perfect --
+           and the passphrase in your safe opens only some of them. Nothing else in the system will ever notice,
+           because STRUBS mounts with the keyfile and never touches the passphrase slot. -->
+      <div
+        v-if="encryption?.lastAudit && encryption.lastAudit.refused.length"
+        class="access-banner error banner-standalone"
+      >
+        <strong>THE RECOVERY PASSPHRASE DOES NOT OPEN EVERY DISK.</strong>
+        Volume{{ encryption.lastAudit.refused.length === 1 ? '' : 's' }}
+        {{ encryption.lastAudit.refused.map(d => d.volumeId).join(', ') }}
+        do not open with it — almost certainly because they were unplugged when the passphrase was last changed.
+        If the keyfile is lost, those disks are lost with it.
+        <strong>Set the passphrase again with every disk attached</strong>, and they will be rewritten.
+      </div>
+
+      <div
+        v-else-if="encryption?.lastAudit && encryption.lastAudit.unreadable.length"
+        class="access-banner warn banner-standalone"
+      >
+        <strong>Some encrypted disks could not be checked.</strong>
+        The LUKS header on {{ encryption.lastAudit.unreadable.map(d => d.path).join(', ') }} would not read, so
+        we cannot say whether the recovery passphrase still opens
+        {{ encryption.lastAudit.unreadable.length === 1 ? 'it' : 'them' }}.
+        That is a disk fault, not a passphrase fault — but it means those volumes' recoverability is unknown.
+      </div>
+
+      <!-- An encrypted disk we cannot identify is one the fleet-passphrase check cannot see -- which is how a
+           fleet ends up split. The audit counts it as unhealthy; the UI must not then say "last checked today"
+           and leave it at that. -->
+      <!-- An audit that could not even ASK a disk cannot say the fleet is recoverable. An unplugged volume is
+           the likeliest one to be wrong, because it is the one a rotation could not reach. -->
+      <div
+        v-else-if="encryption?.lastAudit && encryption.lastAudit.notChecked?.length"
+        class="access-banner warn banner-standalone"
+      >
+        <strong>The passphrase was not checked against every disk.</strong>
+        Volume{{ encryption.lastAudit.notChecked.length === 1 ? '' : 's' }}
+        {{ encryption.lastAudit.notChecked.join(', ') }}
+        {{ encryption.lastAudit.notChecked.length === 1 ? 'was' : 'were' }} not attached, so
+        {{ encryption.lastAudit.notChecked.length === 1 ? 'it' : 'they' }} could not be asked — and an unplugged
+        disk is the one most likely to have missed a passphrase change. Attach every disk and check again.
+      </div>
+
+      <div
+        v-else-if="encryption?.lastAudit && encryption.lastAudit.unidentified.length"
+        class="access-banner warn banner-standalone"
+      >
+        <strong>An encrypted disk here is not identifiable.</strong>
+        {{ encryption.lastAudit.unidentified.join(', ') }}
+        {{ encryption.lastAudit.unidentified.length === 1 ? 'is a LUKS container' : 'are LUKS containers' }}
+        carrying no STRUBS nameplate, so we cannot tell whether
+        {{ encryption.lastAudit.unidentified.length === 1 ? 'it belongs' : 'they belong' }} to this array.
+        Encryption is blocked until {{ encryption.lastAudit.unidentified.length === 1 ? 'it is' : 'they are' }}
+        identified or detached.
+      </div>
+
+      <div v-else-if="auditIsStale" class="access-banner warn banner-standalone">
+        <strong>The recovery passphrase has {{ auditAgeDays === null ? 'never been' : 'not been' }} checked
+        against the disks{{ auditAgeDays === null ? '' : ` in ${auditAgeDays} days` }}.</strong>
+        STRUBS unlocks these disks with the keyfile, so a passphrase that has stopped working would not show up
+        anywhere else — until the day you need it. Check it now.
       </div>
 
       <div class="volumes-view">

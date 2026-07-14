@@ -24,6 +24,7 @@ const createDeps = () => {
         addPassphrase: vi.fn().mockResolvedValue(undefined),
         open: vi.fn().mockImplementation(async (_path: string, uuid: string) => `/dev/mapper/strubs-${uuid}`),
         assertRecoverable: vi.fn().mockResolvedValue(undefined),
+        testPassphrase: vi.fn().mockResolvedValue('opens'),
         writeNameplate: vi.fn().mockResolvedValue(undefined),
         // The nameplate is LOAD-BEARING on an encrypted volume: it is how a locked disk says it is ours, and
         // the fleet-passphrase guard enumerates encrypted disks by it. So the provisioner reads it back.
@@ -31,6 +32,8 @@ const createDeps = () => {
         mapperPath: vi.fn().mockImplementation((uuid: string) => `/dev/mapper/strubs-${uuid}`)
     };
     const assertFleetRecoveryPassphrase = vi.fn().mockResolvedValue(undefined);
+    // The gate that stops a passphrase rotation running through the middle of an encrypted provision.
+    const withEncryptionSlot = vi.fn(async (fn: () => Promise<unknown>) => fn());
     const spawnHelper = vi.fn().mockResolvedValue({ code: 0, stdout: '' });
     const sleepSecs = vi.fn().mockResolvedValue(undefined);
     // By default: we have an identity (not in recovery), and the target disk is positively established
@@ -40,7 +43,7 @@ const createDeps = () => {
     // characters. Testing with a tidy 16-hex string is what let the nameplate ship unparseable by its own
     // reader: the test agreed with the code, and both were wrong about the machine.
     const instanceIdentity = vi.fn().mockReturnValue('2fb05f23-1d5e-4c00-bb71-f3109b42476c');
-    return { listRawBlockDevices, database, ioManager, luks, spawnHelper, sleepSecs, probeDeviceForStrubsIdentity, instanceIdentity, assertFleetRecoveryPassphrase };
+    return { listRawBlockDevices, database, ioManager, luks, spawnHelper, sleepSecs, probeDeviceForStrubsIdentity, instanceIdentity, assertFleetRecoveryPassphrase, withEncryptionSlot };
 };
 
 const baseDevice: RawBlockDevice = {
@@ -318,6 +321,28 @@ describe('DeviceProvisioner', () => {
                 .mockResolvedValueOnce([final]);
         };
 
+        // THE GATE IS FOR ENCRYPTED PROVISIONS ONLY. A plaintext disk has no keyslot to get wrong, and blocking
+        // a passphrase rotation for the ten minutes it takes to mkfs a 4TB disk would be a needless refusal.
+        // (An earlier version wrapped EVERY provision while its comment claimed it did not -- worse than either
+        // behaviour on its own.)
+        it('does not take the encryption gate for a plaintext provision', async () => {
+            stageDiscovery(deviceWithPartition('PART-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await provisioner.provision({ blockPath: '/dev/sdb' });
+
+            expect(deps.withEncryptionSlot).not.toHaveBeenCalled();
+        });
+
+        it('DOES take it for an encrypted one -- a rotation must not run through the middle of that', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await provisioner.provision({ blockPath: '/dev/sdb', encrypt: true, recoveryPassphrase: PASSPHRASE });
+
+            expect(deps.withEncryptionSlot).toHaveBeenCalled();
+        });
+
         it('does not encrypt by default: an untouched array provisions plaintext', async () => {
             stageDiscovery(deviceWithPartition('PART-UUID'));
 
@@ -340,6 +365,27 @@ describe('DeviceProvisioner', () => {
 
         // TWO KEYSLOTS OR NOTHING. A volume holding only the keyfile slot is a volume that dies with the OS
         // disk -- every slice on it, unreadable, forever.
+        // THE BASE CASE OF THE INDUCTION. Every LATER encryption checks the passphrase against just ONE
+        // existing disk, on the grounds that every encrypted volume was verified when it was made. If that is
+        // ever false at the moment of creation, every subsequent single-disk check inherits the lie -- and the
+        // audit would only find it months later, if at all.
+        //
+        // assertRecoverable only COUNTS keyslots; it cannot tell you what is IN them. So prove the passphrase
+        // actually opens the header we just wrote.
+        it('proves the recovery passphrase opens the disk it just encrypted', async () => {
+            deps.luks.testPassphrase.mockResolvedValue('rejected');
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({
+                blockPath: '/dev/sdb', encrypt: true, recoveryPassphrase: PASSPHRASE
+            })).rejects.toThrow(/does not open it/);
+
+            // Never went into service, and nothing was recorded. Nothing of value was on it yet.
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('mkfs.ext4', expect.anything());
+            expect(deps.database.createVolume).not.toHaveBeenCalled();
+        });
+
         it('adds the recovery passphrase as a second keyslot', async () => {
             stageDiscovery(luksDevice('LUKS-UUID'));
 

@@ -70,6 +70,24 @@ vi.mock('../lib/recovery/recovery', async importOriginal => ({
     buildSliceIndex: buildSliceIndexMock
 }));
 
+// The encrypted-volume record and the fleet scan. Real in production; injected here so the undelete guard can
+// be driven without a rack of disks.
+const scanFleetMock = vi.fn(async () => ({ ours: [] as unknown[], unknown: [] as string[], absent: [] as number[] }));
+// ⚠️ Asked of THIS volume's disk. `scanFleet().absent` CANNOT answer it -- that list excludes deleted volumes,
+// so it can never report the very volume being undeleted. An earlier guard asked it anyway (dead code), and the
+// test mocked `absent: [15]` -- a state the real code cannot produce. The test agreed with me, not the machine.
+const volumeDiskIsAttachedMock = vi.fn(async () => true);
+// The gate that stops a passphrase rotation straddling a change to WHICH VOLUMES the fleet expects to be
+// encrypted -- an encrypted provision, or a volume delete/undelete.
+const withEncryptionSlotMock = vi.fn(async (fn: () => Promise<unknown>) => fn());
+
+vi.mock('../lib/io/luks-recovery-key', async importOriginal => ({
+    ...await importOriginal<typeof import('../lib/io/luks-recovery-key')>(),
+    scanFleet: scanFleetMock,
+    volumeDiskIsAttached: volumeDiskIsAttachedMock,
+    withEncryptionSlot: withEncryptionSlotMock
+}));
+
 vi.mock('../lib/io/device-provisioner', () => ({
     deviceProvisioner: {
         provision: deviceProvisionerProvisionMock
@@ -795,6 +813,9 @@ describe('HttpMgmt.handle', () => {
             encryption: {
                 encryptNewVolumes: false,
                 hasRecoveryPassphrase: false,
+                // Never audited. Reported as null rather than as healthy -- on an encrypted fleet, "nobody has
+                // ever confirmed these disks can be recovered" is a fact worth stating, not an absence.
+                lastAudit: null,
                 encryptedVolumeIds: [],
                 // volume2's disk is present and plaintext: pulling it still leaks every slice on it.
                 plaintextVolumeIds: [2],
@@ -836,6 +857,21 @@ describe('HttpMgmt.handle', () => {
 
         expect(response).toBe(snapshot);
         expect(storageStatsTrackerMock.reconcile).not.toHaveBeenCalled();
+    });
+
+    // The counters are a CACHE. Under live traffic the incremental deltas drift, and a volume once reported
+    // "-16 files" -- an impossible number that sat there because a scheduled reconcile was six hours away and
+    // there was no way to ASK for one.
+    it('recomputes the storage statistics on request', async () => {
+        const snapshot = { system: { objectCount: 5 }, volumes: {} };
+        storageStatsTrackerMock.reconcile.mockResolvedValue(undefined);
+        storageStatsTrackerMock.getSnapshot.mockResolvedValue(snapshot);
+
+        const response = await HttpMgmt.handle(
+            5, createRequest('POST', '/$/storage-stats'), nullResponse);
+
+        expect(storageStatsTrackerMock.reconcile).toHaveBeenCalled();
+        expect(response).toEqual(snapshot);
     });
 
     it('reconciles storage stats on demand when the cache is missing', async () => {
@@ -1699,6 +1735,88 @@ describe('encrypting a volume', () => {
             .rejects.toThrow(/cryptsetup exploded/);
 
         expect(ioManagerMock.registerVolume).toHaveBeenCalledWith({ id: 15, uuid: 'vol-15' });
+    });
+
+    // ⚠️ UNDELETING AN ENCRYPTED VOLUME BRINGS BACK A DISK THAT MAY HAVE MISSED A ROTATION.
+    //
+    // Rotation only walks volumes that are NOT deleted, so while this one was retired the fleet passphrase may
+    // have been changed without it. Bring it back and it holds a key nobody has -- and nothing in normal service
+    // would ever notice, because STRUBS mounts with the keyfile and never touches the passphrase slot.
+    describe('restoring a deleted ENCRYPTED volume', () => {
+        beforeEach(() => {
+            ioManagerMock.getVolume.mockReturnValue({ id: 15, isDeleted: true });
+        });
+
+        it('refuses while its disk is not attached -- a rotation could not have reached it', async () => {
+            volumeDiskIsAttachedMock.mockResolvedValue(false);
+
+            await expect(HttpMgmt.handle(
+                5, createRequest('PUT', '/$/volumes/15', { isDeleted: false }), nullResponse
+            )).rejects.toThrow(/its disk is not attached/);
+
+            expect(databaseUpdateFlagsMock).not.toHaveBeenCalled();
+        });
+
+        it('allows it once the disk is back', async () => {
+            volumeDiskIsAttachedMock.mockResolvedValue(true);
+
+            await HttpMgmt.handle(
+                5, createRequest('PUT', '/$/volumes/15', { isDeleted: false }), nullResponse);
+
+            expect(databaseUpdateFlagsMock).toHaveBeenCalledWith(15, expect.objectContaining({ isDeleted: false }));
+        });
+
+        // A rotation walks only the volumes that are NOT deleted -- so a volume changing deleted-ness mid-rotation
+        // is one the rotation may reach, or may skip, depending on nothing but timing. Both routes take the gate.
+        it('takes the rotation gate for a delete and for an undelete', async () => {
+            volumeDiskIsAttachedMock.mockResolvedValue(true);
+            databaseCountOnVolumeMock.mockResolvedValue(0);
+            journalState.replicaVolumeIds = [3, 7, 9];
+
+            withEncryptionSlotMock.mockClear();
+            await HttpMgmt.handle(5, createRequest('PUT', '/$/volumes/15', { isDeleted: false }), nullResponse);
+            expect(withEncryptionSlotMock).toHaveBeenCalledTimes(1);
+
+            ioManagerMock.softDeleteVolume.mockResolvedValue(undefined);
+            withEncryptionSlotMock.mockClear();
+            await HttpMgmt.handle(5, createRequest('DELETE', '/$/volumes/15'), nullResponse);
+            expect(withEncryptionSlotMock).toHaveBeenCalledTimes(1);
+        });
+
+        // ...but nothing else about a volume touches the passphrase, so nothing else should block a rotation.
+        it('does NOT take the gate for a label change', async () => {
+            withEncryptionSlotMock.mockClear();
+
+            await HttpMgmt.handle(5, createRequest('PUT', '/$/volumes/15', { label: 'bay 3' }), nullResponse);
+
+            expect(withEncryptionSlotMock).not.toHaveBeenCalled();
+        });
+
+        // ⚠️ NO DISK, NO UNDELETE -- for ANY volume, encrypted or not.
+        //
+        // An earlier guard asked a database record ("which volumes are encrypted?") first, and returned early if
+        // the id was not in it. But that record lived in the same database a restore can take away: "not in the
+        // record" does not mean "not encrypted", it can equally mean "the record is gone". The check meant to be
+        // unconditional was conditional on the one thing least worth trusting. The record has since been deleted
+        // outright, and this rule needs nothing but the disk.
+        it('refuses to restore ANY volume whose disk is not attached', async () => {
+            volumeDiskIsAttachedMock.mockResolvedValue(false);
+
+            await expect(HttpMgmt.handle(
+                5, createRequest('PUT', '/$/volumes/15', { isDeleted: false }), nullResponse
+            )).rejects.toThrow(/we cannot tell what is on it/);
+
+            expect(databaseUpdateFlagsMock).not.toHaveBeenCalled();
+        });
+    });
+
+    // The audit is the only thing in the system that ever asks whether the recovery passphrase still works.
+    // It needs the passphrase, and we will not keep that on the machine it exists to recover -- so the endpoint
+    // demands it and refuses without one.
+    it('refuses to audit without the recovery passphrase', async () => {
+        await expect(HttpMgmt.handle(
+            5, createRequest('POST', '/$/encryption/audit', {}), nullResponse
+        )).rejects.toThrow(/recoveryPassphrase is required/);
     });
 
     // Turning the fleet default on must not convert a single existing disk. "Encryption: on" is exactly what

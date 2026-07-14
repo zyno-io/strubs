@@ -151,14 +151,36 @@ dd if=/dev/urandom of=/var/lib/strubs/luks.key bs=512 count=1
 chmod 0400 /var/lib/strubs/luks.key
 ```
 
-The second is the **recovery passphrase**, which you do not store on this machine. It becomes each volume's
-second LUKS keyslot, and it is the only thing that opens these disks if the OS disk dies. STRUBS will not
-create a volume with only the keyfile slot — a keyfile-only fleet dies with the OS disk, taking every byte
-with it — so it demands the passphrase on every encryption and refuses one that disagrees with the rest of
-the fleet.
+The second is the **recovery passphrase**:
 
-> **Write the passphrase down somewhere that is not this machine.** There is no undo, no reset, and no
-> support line. Lose both it and the OS disk and 130TB becomes noise.
+```bash
+curl -X PUT localhost/\$/encryption/passphrase -H 'Content-Type: application/json' \
+  -d '{"passphrase":"…"}'
+```
+
+It becomes each volume's second LUKS keyslot, and it is the only thing that opens these disks if the OS disk
+dies. STRUBS will not create a volume with only the keyfile slot — a keyfile-only fleet dies with the OS disk,
+taking every byte with it.
+
+> **Write it down somewhere that is not this machine.** There is no undo, no reset, and no support line. Lose
+> both it and the OS disk and 130TB becomes noise.
+
+**Changing it rewrites the keyslot on every encrypted disk** — and it can, because STRUBS holds the keyfile and
+the keyfile opens every disk. Pass the current one too:
+
+```bash
+curl -X PUT localhost/\$/encryption/passphrase -H 'Content-Type: application/json' \
+  -d '{"passphrase":"the new one","currentPassphrase":"the old one"}'
+```
+
+The new passphrase is written to **every** disk and proven to open it *before* the change is recorded, and only
+then is the old one retired. Crash half-way and at least one known passphrase still opens everything; re-run it
+and it finishes the job.
+
+> **It refuses to run while ANY disk is unplugged** — not just the ones we think are encrypted. A disk that
+> misses a rotation keeps the *old* passphrase, silently, and you discover it on the single day it matters. We
+> deliberately do **not** try to guess which absent disks are encrypted: that guess lives in the same database
+> you may have just restored, and every version of it turned out to be wrong. Attach everything, then rotate.
 
 ### Turning it on
 
@@ -182,12 +204,10 @@ curl -X POST localhost/\$/volumes/57/encrypt \
 curl -X POST localhost/\$/rebalance                 # refills it
 ```
 
-> **Every encryption re-checks the passphrase against every encrypted disk already in the fleet.** The LUKS
-> headers on the platters are the only record of the fleet passphrase that cannot be rebuilt or restored from
-> last week, so they are the authority — not the verifier in Mongo. It costs ~3 seconds per encrypted volume
-> (argon2id is memory-hard on purpose), so a fully converted fleet takes ~90 seconds of preflight before it
-> starts. That is deliberate: it is the check that catches a fleet drifting onto two different passphrases,
-> which you would otherwise discover on the day the OS disk dies.
+> **Encrypting a volume checks the passphrase locally** — against an argon2id hash in `runtimeConfig`, in about
+> 350 ms, touching no disk at all. It does not need to interrogate the platters, because the platters carry what
+> *we wrote to them* with the keyfile. (An earlier design tried to derive the fleet passphrase *from* the disks
+> and defend it against drifting; holding the keyfile makes all of that unnecessary.)
 
 The encrypt step **refuses a volume that still holds live slices** — it does not drain for you. It wipes and
 rebuilds the disk under the same volume id, and before it touches anything the disk must *prove* it is that
@@ -233,6 +253,38 @@ Then restart STRUBS, let the fleet come up, and rebuild the namespace with `POST
 > An encrypted disk that will not open is reported as **locked**, and counted against the recovery — the same
 > as a disk that would not mount. A recovery planned from a partial view of the array is one that can silently
 > decide a volume does not exist.
+
+### Check that the recovery passphrase still works — the one thing nothing else will tell you
+
+```bash
+curl -X POST localhost/\$/encryption/audit -H 'Content-Type: application/json' \
+  -d '{"recoveryPassphrase":"…"}'
+```
+
+**Run this regularly. Put it in the calendar.** The UI nags after 90 days and shows the result on the Volumes
+tab — and a healthy audit is also what keeps *encrypting* a disk fast (see above), so it pays for itself.
+
+Here is why it matters more than it looks. STRUBS unlocks disks with the **keyfile**. The recovery passphrase
+keyslot is *never touched* in normal service — not at boot, not at mount, not on any read or write. So a disk
+that is on the **wrong** passphrase will **mount and serve flawlessly, for years**. Every health check passes.
+Every scrub passes. And then the OS disk dies, you take the passphrase out of the safe, and it opens eleven of
+your thirty disks.
+
+There is exactly one way for that to happen — **a disk that was unplugged when the passphrase was last
+changed**, and came back afterwards. (Rotation refuses to run with a disk missing precisely to prevent it, but a
+disk can always be reattached later.) Nothing else in this system will ever notice. This is the only thing that
+looks — and the fix is simply to set the passphrase again with every disk attached.
+
+The audit opens nothing and writes nothing — it asks each LUKS header whether the passphrase still fits
+(`cryptsetup --test-passphrase`). ~3 seconds per encrypted volume, so ~90 seconds on a fully converted fleet.
+It reports three things, and they are different:
+
+| | Meaning |
+|---|---|
+| `refused` | ⚠️ These disks are on a **different passphrase** — almost certainly they missed a rotation. Lose the keyfile and you lose them. **Set the passphrase again with every disk attached** and they will be rewritten. |
+| `notChecked` | Volumes whose disks were **not attached**, so they were never asked. The audit cannot call the fleet healthy without them — and they are the volumes most likely to be wrong, being the ones a rotation could not reach. |
+| `unreadable` | The LUKS header would not read. A *disk* fault, not a passphrase fault — but it means those volumes' recoverability is **unknown**. |
+| `unidentified` | A LUKS container carrying no STRUBS nameplate. We cannot tell whose it is. |
 
 ### Back up the LUKS headers
 

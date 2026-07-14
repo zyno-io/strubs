@@ -15,11 +15,13 @@ import {
     format as luksFormat,
     keyfileReadable as luksKeyfileReadable,
     mapperPath as luksMapperPath,
+    LuksError,
     nameplateIsPresent as luksNameplateIsPresent,
     open as luksOpen,
+    testPassphrase as luksTestPassphrase,
     writeNameplate as luksWriteNameplate
 } from './luks';
-import { assertFleetRecoveryPassphrase } from './luks-recovery-key';
+import { assertFleetRecoveryPassphrase, withEncryptionSlot } from './luks-recovery-key';
 import type { VolumeConfig, PersistedVolumeConfig } from './volume';
 
 // Whether a NEWLY PROVISIONED volume is encrypted. Ships `false`: encryption is a capability, not a default we
@@ -58,11 +60,13 @@ type DeviceProvisionerDeps = {
         addPassphrase: typeof luksAddPassphrase;
         open: typeof luksOpen;
         assertRecoverable: typeof luksAssertRecoverable;
+        testPassphrase: typeof luksTestPassphrase;
         writeNameplate: typeof luksWriteNameplate;
         nameplateIsPresent: typeof luksNameplateIsPresent;
         mapperPath: typeof luksMapperPath;
     };
     assertFleetRecoveryPassphrase: typeof assertFleetRecoveryPassphrase;
+    withEncryptionSlot: typeof withEncryptionSlot;
     database: typeof database;
     ioManager: typeof ioManager;
     spawnHelper: typeof spawnHelper;
@@ -81,11 +85,13 @@ const defaultDeps: DeviceProvisionerDeps = {
         addPassphrase: luksAddPassphrase,
         open: luksOpen,
         assertRecoverable: luksAssertRecoverable,
+        testPassphrase: luksTestPassphrase,
         writeNameplate: luksWriteNameplate,
         nameplateIsPresent: luksNameplateIsPresent,
         mapperPath: luksMapperPath
     },
     assertFleetRecoveryPassphrase,
+    withEncryptionSlot,
     database,
     ioManager,
     spawnHelper,
@@ -126,6 +132,25 @@ export class DeviceProvisioner {
     constructor(private readonly deps: DeviceProvisionerDeps = defaultDeps) {}
 
     async provision(options: ProvisionOptions): Promise<PersistedVolumeConfig> {
+        // A ROTATION MUST NOT RUN THROUGH THE MIDDLE OF AN ENCRYPTED PROVISION.
+        //
+        // The passphrase is checked early and written into the new disk's keyslot minutes later -- after the
+        // wipe, the partition, the luksFormat. If a rotation slipped into that gap it would record the NEW
+        // passphrase while this disk was still being built with the OLD one, and the new volume simply would not
+        // open with the passphrase in the safe. So the gate covers the WHOLE operation, not just the check.
+        //
+        // ONLY for encrypted provisions, and the decision is made HERE rather than inside -- a plaintext disk has
+        // no keyslot to get wrong, and blocking a passphrase rotation for the ten minutes it takes to mkfs an 4TB
+        // disk would be a needless refusal. (An earlier version wrapped every provision and claimed in a comment
+        // that it did not, which is worse than either behaviour on its own.)
+        const encrypt = await this.shouldEncrypt(options.encrypt);
+
+        return encrypt
+            ? this.deps.withEncryptionSlot(() => this.doProvision(options, encrypt))
+            : this.doProvision(options, encrypt);
+    }
+
+    private async doProvision(options: ProvisionOptions, encrypt: boolean): Promise<PersistedVolumeConfig> {
         const { blockPath, wipe, replace } = options;
         this.validateWipeOption(wipe);
 
@@ -210,8 +235,6 @@ export class DeviceProvisioner {
             targetDevice, devices, replace || options.convertVolumeId !== undefined);
         const replacedVolumeId = options.convertVolumeId ?? registeredVolumeId;
 
-        const encrypt = await this.shouldEncrypt(options.encrypt);
-
         // PREFLIGHT BEFORE WE TOUCH THE PARTITION TABLE. If the key is missing, or the operator cannot produce
         // the fleet recovery passphrase, we want to find out NOW, while the disk is still whole -- not after
         // `parted` has run, leaving a wiped disk and no way to encrypt it.
@@ -272,6 +295,17 @@ export class DeviceProvisioner {
         if (encrypt)
             await this.stampNameplate(blockPath, partition, volumeConfig.id);
 
+        // NOTE: nothing is recorded in the database about WHICH volumes are encrypted -- deliberately.
+        //
+        // There used to be a `luksEncryptedVolumes` list here, so that a passphrase rotation could refuse while
+        // an encrypted disk was unplugged. It produced a defect in EVERY review round: the record lives in the
+        // same database that a restore or a rebuild can take away, so "volume 12 is not in the list" can mean
+        // "12 is plaintext" OR "the list is gone" -- and the code kept betting on the first.
+        //
+        // The rule that replaced it needs no record: A ROTATION REFUSES WHILE ANY VOLUME IS ABSENT. It asks the
+        // platters what is in front of it and will not rewrite the fleet's keys behind a disk it cannot see.
+        // Nothing to lose, nothing to restore, nothing to get subtly wrong.
+
         await this.deps.database.createVolume(volumeConfig);
 
         // The ONLY caller that may stamp our identity onto a disk: this one just formatted it.
@@ -317,6 +351,23 @@ export class DeviceProvisioner {
         // trusting that the call above did what it said. If the passphrase somehow did not land, we find out
         // here -- BEFORE the mkfs, while walking away costs us nothing but a blank partition.
         await this.deps.luks.assertRecoverable(partitionPath);
+
+        // ...BUT TWO KEYSLOTS IS NOT THE SAME AS "THE PASSPHRASE OPENS IT".
+        //
+        // assertRecoverable only COUNTS slots. It cannot tell you what is in them. And this disk is the base
+        // case of the whole inductive argument that lets every LATER encryption check just one disk: we assert
+        // that every encrypted volume opens with the fleet passphrase because each one was checked when it was
+        // made. If that assertion is ever false at the moment of creation, every subsequent single-disk check
+        // inherits the lie -- and the audit would find it months later, if at all.
+        //
+        // So prove it. Open nothing, write nothing: just ask this brand-new header whether the passphrase we
+        // were given actually fits it.
+        if (await this.deps.luks.testPassphrase(partitionPath, passphrase) !== 'opens')
+            throw new LuksError(
+                `${partitionPath} was encrypted, but the recovery passphrase does not open it. Refusing to put it `
+                + `into service: it would be a disk that only the keyfile can open, and it would silently break `
+                + `the guarantee that the fleet passphrase opens every disk. Nothing of value is on it yet.`,
+                'failed');
 
         return await this.deps.luks.open(partitionPath, volumeUuid);
     }

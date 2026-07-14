@@ -687,12 +687,70 @@ This must be fixed *before* the first volume is ever encrypted. Not after.
 | `mgmt.ts` | ✅ `POST /$/volumes/{id}/encrypt`; `PUT /$/encryption/settings`; `isEncrypted` in `VolumeStatus`; three-way fleet coverage in `/$/status` |
 | `ui/` | ✅ lock badges, coverage bar, encrypt action, and a partial-encryption warning that refuses to call the array protected |
 
+### The keyfile is the authority — and that collapses the problem
+
+The passphrase keyslot is **never exercised in normal service**: STRUBS mounts with the *keyfile*, so nothing
+ever reads the passphrase slot. A disk on the wrong passphrase mounts, serves, scrubs and verifies flawlessly,
+for years, and announces itself on exactly one day — the OS disk is dead, the passphrase comes out of the safe,
+and it opens eleven of thirty disks.
+
+An earlier draft tried to defend that by **discovering** the fleet passphrase from the platters: testing
+candidates against every LUKS header, fingerprinting keyslot areas to detect tampering, refusing to trust its
+own database. It went through *five* review rounds, each finding a real defect in the fix for the last one
+(volume ids survive conversions; LUKS uuids survive `luksAddKey`; `luksDump` is blind to keyslot-material rot; a
+broken disk masks a split fleet…). That churn was the signal.
+
+**It was solving the wrong problem.** We hold the keyfile, and the keyfile opens every disk. So the passphrase
+is not a fact about the disks that we must observe and defend — it is a fact we **enforce**:
+
+| | |
+|---|---|
+| **Validation** | An argon2id hash in `runtimeConfig` (Node 24's built-in; no native dependency). ~350 ms, **no disk I/O at all**. |
+| **Rotation** | `PUT /$/encryption/passphrase` writes the new passphrase into every encrypted disk's second keyslot, authenticating with the keyfile. |
+| **Drift** | Not defended, deliberately. An admin who hand-runs `cryptsetup luksKillSlot` can equally `dd` over the header — we are no more immune to a hostile root than any other component. If a keyslot is mangled, the remedy is to re-run the rotation, which rewrites it. |
+
+**The rotation's ordering is the design**, because a crash must never leave a disk that no known passphrase
+opens:
+
+1. **Add** the new passphrase to every disk, and prove on each that it *opens* (a successful `luksAddKey` is not
+   the same thing). Both passphrases now open everything.
+2. Only once **every** disk has it, record the new hash. Before this line the old passphrase is the fleet's;
+   after it, the new one is. There is no instant at which the recorded passphrase opens nothing.
+3. **Remove** the old one — best-effort, because by now the fleet is already correct and a lingering old keyslot
+   is untidy, not dangerous.
+
+**Rotation refuses to run while ANY volume is unplugged** — not merely the ones we believe are encrypted.
+
+That distinction cost five review rounds. The "clever" rule consulted a `luksEncryptedVolumes` record so it could
+refuse only for disks it thought were encrypted; it produced a defect every single round, and the reason was
+structural: **the record lived in the same database a restore can take away.** "Volume 12 is not in the list"
+can mean *12 is plaintext* or *the list is gone*, and the code kept betting on the first. The record has been
+deleted outright.
+
+The coarse rule needs no record and cannot be restored away: if a volume of this fleet is not in front of us, we
+do not rewrite the fleet's keys behind its back. The cost is plugging the drives in before changing a
+passphrase — which is required for the operation to be *correct* anyway.
+
+Two more rules of the same shape, and for the same reason:
+
+- **No disk, no undelete.** A soft-deleted volume cannot return unless its disk is attached — because with the
+  disk absent we cannot tell whether it is encrypted, and if it is, rotations passed it by while it was retired.
+- **A path is not an identity.** `/dev/sdf1` is whatever the kernel last called the thing in that slot, and USB
+  paths get reused. Every keyslot write is preceded (and followed) by `cryptsetup luksUUID`, so a disk that
+  swapped underneath a rotation is refused rather than written to.
+
+The audit (`POST /$/encryption/audit`) catches what enforcement cannot: a disk reattached after missing a
+rotation. It reports `notChecked` for volumes it could not even ask, and refuses to call the fleet healthy while
+any exist.
+
 **The recovery passphrase is enforced, not advised.** `luks.format()` creates only the keyfile slot, so
 `addPassphrase()` + `assertRecoverable()` (which re-reads the header and demands ≥2 keyslots) run before
-the mkfs — a keyfile-only volume is impossible to create, not merely discouraged. A salted-scrypt verifier
-in Mongo (`luks-recovery-key.ts`) refuses a passphrase that disagrees with the rest of the fleet, so the
-fleet cannot silently end up with two different recovery keys. The verifier does not weaken the threat
-model: it lives on the OS disk, not the platters, and anyone holding the OS disk already has the keyfile.
+the mkfs — a keyfile-only volume is impossible to create, not merely discouraged. The provisioner then proves
+the passphrase actually *opens* the header it just wrote, because `luksAddKey` returning success is not the same
+thing.
+
+An **argon2id** verifier in `runtimeConfig` validates the passphrase before any of that, locally and without
+touching a disk — the disks carry what we wrote to them.
 
 **Conversion wipes one of our own disks on purpose**, so `convertVolumeId` inverts the identity guard: the
 disk must **prove** it is that exact volume, of this instance, before anything touches it. A stranger's
