@@ -455,6 +455,31 @@ export class Database {
         return this.contentRepository.countObjectsOnVolume(volumeId, opts);
     }
 
+    // WHAT ARE THE SLICE FILES LEFT ON THIS PLATTER, REALLY?
+    //
+    // A DRAIN KEEPS THE SOURCE (drain-volume-job.ts). It copies each slice to another disk, flips the reference,
+    // and leaves the original file exactly where it was -- so a drained disk is a full REDUNDANT COPY of what it
+    // used to hold, until somebody wipes it. That is deliberate, and it means "drained" does not mean "empty".
+    //
+    // So a slice file on a drained platter is one of three things, and they could not be more different:
+    //
+    //   its object no longer references this volume  -- a STALE COPY. The real slice lives elsewhere; wiping
+    //                                                   this destroys nothing. This is the normal state of every
+    //                                                   drained disk, and 4,963 of them were sitting on volume 57.
+    //   its object still references this volume      -- LIVE DATA. Wiping it is data loss.
+    //   its object has no record at all              -- a TRUE ORPHAN, and orphans are RECOVERABLE data (that is
+    //                                                   the whole of DR-E). Wiping it is data loss of the worst
+    //                                                   kind: the sort nobody notices.
+    //
+    // Anything that is about to destroy a platter must be able to tell them apart. Counting files cannot.
+    async classifySlicesOnVolume(volumeId: number, objectIds: string[]): Promise<{
+        stale: number;              // safe to destroy: the object lives elsewhere now
+        stillReferenced: string[];  // ⚠️ LIVE
+        orphans: string[];          // ⚠️ RECOVERABLE, and unrecorded
+    }> {
+        return this.contentRepository.classifySlicesOnVolume(volumeId, objectIds);
+    }
+
     async replaceObjectVolumeRef(id: ObjectIdentifier, fromVolumeId: number, toVolumeId: number): Promise<boolean> {
         return this.contentRepository.replaceObjectVolumeRef(id, fromVolumeId, toVolumeId);
     }

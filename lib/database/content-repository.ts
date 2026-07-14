@@ -391,6 +391,48 @@ export class ContentRepository {
     // Count objects with a slice on the volume. excludeDead omits recoveryComment'd objects
     // (documented-unrecoverable / accepted-loss), so a fully-drained volume whose only remaining
     // refs are dead objects reports 0 -> removable.
+    // See database.classifySlicesOnVolume() for why counting slice files on a drained platter is not enough.
+    async classifySlicesOnVolume(volumeId: number, objectIds: string[]): Promise<{
+        stale: number;
+        stillReferenced: string[];
+        orphans: string[];
+    }> {
+        const stillReferenced: string[] = [];
+        const seen = new Set<string>();
+
+        // Batched: a drained 4TB disk can hold tens of thousands of slice files, and $in has limits.
+        const BATCH = 500;
+
+        for (let i = 0; i < objectIds.length; i += BATCH) {
+            const batch = objectIds.slice(i, i + BATCH);
+            const oids = batch.map(id => new ObjectId(id));
+
+            const docs = await this.collection.find(
+                { _id: { $in: oids } },
+                { projection: { dataVolumes: 1, parityVolumes: 1 } }
+            ).toArray();
+
+            for (const doc of docs) {
+                const id = doc._id.toHexString();
+                seen.add(id);
+
+                const volumes = [...(doc.dataVolumes ?? []), ...(doc.parityVolumes ?? [])];
+                if (volumes.includes(volumeId))
+                    stillReferenced.push(id);
+            }
+        }
+
+        // An id with no record ANYWHERE is an orphan: a slice with no name. Orphans are RECOVERABLE (DR-E
+        // rebuilds records from them), so they are data, and destroying them is data loss.
+        const orphans = objectIds.filter(id => !seen.has(id));
+
+        return {
+            stale: objectIds.length - stillReferenced.length - orphans.length,
+            stillReferenced,
+            orphans
+        };
+    }
+
     async countObjectsOnVolume(volumeId: number, opts?: { excludeDead?: boolean }): Promise<number> {
         const query: Filter<ContentDocument> = {
             isFile: true,

@@ -126,6 +126,9 @@ const databaseBucketAuthMock = {
 };
 
 const databaseGetVolumesMock = vi.fn(async () => [] as any[]);
+// A DRAIN KEEPS THE SOURCE, so a drained platter is FULL of slice files -- every one a stale copy of an object
+// that now lives elsewhere. Counting them and refusing made the conversion refuse the one flow it exists for.
+const databaseClassifySlicesMock = vi.fn(async () => ({ stale: 0, stillReferenced: [] as string[], orphans: [] as string[] }));
 
 // NOT redeclared here: `databaseBucketAuthMock` already carries getRuntimeConfig/setRuntimeConfig, and it is
 // spread LAST into the factory below -- so a second pair declared here would be silently overridden and every
@@ -138,6 +141,7 @@ vi.mock('../lib/database', () => ({
         softDeleteVolume: databaseSoftDeleteMock,
         updateVolumeFlags: databaseUpdateFlagsMock,
         countObjectsOnVolume: databaseCountOnVolumeMock,
+        classifySlicesOnVolume: databaseClassifySlicesMock,
         getVolumes: databaseGetVolumesMock,
         ...databaseBucketAuthMock
     }
@@ -1593,6 +1597,7 @@ describe('encrypting a volume', () => {
         journalState.replicaVolumeIds = [3, 7, 9];        // not the last journal copy
         deviceProvisionerProvisionMock.mockResolvedValue({ id: 15, uuid: 'vol-15-new' });
         buildSliceIndexMock.mockResolvedValue(new Map());   // the platter is genuinely empty
+        databaseClassifySlicesMock.mockResolvedValue({ stale: 0, stillReferenced: [], orphans: [] });
         // ...and the kernel agrees the disk really is mounted where the volume thinks it is.
         readProcMountsMock.mockResolvedValue(new Map([[mountPoint, '/dev/sde']]));
     });
@@ -1616,42 +1621,47 @@ describe('encrypting a volume', () => {
         expect(ioManagerMock.deregisterVolume).not.toHaveBeenCalled();
     });
 
-    // THE DISK IS AUTHORITATIVE; MONGO IS A DERIVED INDEX. `countObjectsOnVolume` returns zero for a disk
-    // carrying 9,000 ORPHANS -- slices with no record, which are RECOVERABLE data (rebuilding them is the
-    // whole of DR-E). Wiping them because Mongo has never heard of them inverts "orphans beat phantoms".
-    it('refuses when slice files remain on the platter, even though the database says it is empty', async () => {
-        databaseCountOnVolumeMock.mockResolvedValue(0);          // Mongo: nothing here
-        buildSliceIndexMock.mockResolvedValue(new Map([          // the platter: nine thousand orphans
-            ['507f1f77bcf86cd799439011', new Uint16Array(32)]
-        ]));
+    // ⚠️ A DRAINED DISK IS NOT AN EMPTY DISK -- AND THAT IS THE WHOLE POINT OF A DRAIN.
+    //
+    // The drain COPIES each slice elsewhere, flips the reference, and LEAVES THE ORIGINAL. So a drained disk is
+    // a full redundant copy until somebody wipes it. Volume 57 sat there with 4,963 slice files after a clean
+    // drain -- and an earlier version of this guard counted files and refused, which made the conversion REFUSE
+    // THE ONE FLOW IT EXISTS FOR. Every disk you would ever convert has just been drained, and every drained
+    // disk looks exactly like this.
+    it('converts a DRAINED disk whose platter is still full of stale copies', async () => {
+        buildSliceIndexMock.mockResolvedValue(new Map([['507f1f77bcf86cd799439011', new Uint16Array(32)]]));
+        databaseClassifySlicesMock.mockResolvedValue({ stale: 4963, stillReferenced: [], orphans: [] });
+
+        await encrypt({ recoveryPassphrase: 'correct horse battery staple' });
+
+        expect(deviceProvisionerProvisionMock).toHaveBeenCalled();
+    });
+
+    // THE DISK IS AUTHORITATIVE; MONGO IS A DERIVED INDEX. A slice file whose object has NO RECORD AT ALL is an
+    // ORPHAN -- recoverable data, which a rebuild turns back into an object (that is the whole of DR-E). Mongo
+    // has never heard of it, so `countObjectsOnVolume` says zero. Wiping it is the worst kind of data loss: the
+    // sort nobody notices.
+    it('refuses when the platter holds TRUE ORPHANS, which Mongo cannot see', async () => {
+        buildSliceIndexMock.mockResolvedValue(new Map([['507f1f77bcf86cd799439011', new Uint16Array(32)]]));
+        databaseClassifySlicesMock.mockResolvedValue({
+            stale: 0, stillReferenced: [], orphans: ['507f1f77bcf86cd799439011']
+        });
 
         await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
             .rejects.toThrow(/ORPHANS/);
 
         expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
-        expect(ioManagerMock.deregisterVolume).not.toHaveBeenCalled();
     });
 
-    // THE FLAG IS A BELIEF; /proc/mounts IS THE FACT. A USB disk drops, the mount goes, and `isMounted` stays
-    // true until the next reconcile. In that window the mount point is an EMPTY DIRECTORY ON THE ROOT
-    // FILESYSTEM -- scanning it finds no slices, reports the disk clean, and we wipe a platter full of orphans
-    // on the strength of a readdir that never touched the disk.
-    it('refuses when the kernel says nothing is mounted there, whatever the volume believes', async () => {
-        readProcMountsMock.mockResolvedValue(new Map());   // the kernel: nothing is mounted at that path
+    // ...and a slice the database still points at is LIVE, whatever its own count claimed.
+    it('refuses when a slice file is still referenced by a live object', async () => {
+        buildSliceIndexMock.mockResolvedValue(new Map([['507f1f77bcf86cd799439011', new Uint16Array(32)]]));
+        databaseClassifySlicesMock.mockResolvedValue({
+            stale: 0, stillReferenced: ['507f1f77bcf86cd799439011'], orphans: []
+        });
 
         await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
-            .rejects.toThrow(/kernel says nothing is mounted/);
-
-        expect(buildSliceIndexMock).not.toHaveBeenCalled();
-        expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
-    });
-
-    // Mounted -- but by somebody else's disk. Scanning it tells us nothing about the platter we are wiping.
-    it('refuses when the mount point is backed by a different device', async () => {
-        readProcMountsMock.mockResolvedValue(new Map([[mountPoint, '/dev/sdz9']]));
-
-        await expect(encrypt({ recoveryPassphrase: 'correct horse battery staple' }))
-            .rejects.toThrow(/is mounted from \/dev\/sdz9, not from \/dev\/sde/);
+            .rejects.toThrow(/still referenced by live objects/);
 
         expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
     });

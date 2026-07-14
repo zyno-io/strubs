@@ -1462,14 +1462,45 @@ export class HttpMgmt {
             );
         }
 
-        if (index.size > 0)
+        // WHAT ARE THESE FILES, THOUGH?
+        //
+        // A DRAIN KEEPS THE SOURCE. It copies each slice to another disk, flips the reference, and leaves the
+        // original exactly where it was -- so a drained disk is a full REDUNDANT COPY until somebody wipes it,
+        // and "drained" does not mean "empty". Volume 57 sat there with 4,963 slice files after a clean drain.
+        //
+        // So counting files and refusing was wrong, and wrong in the way that matters: it made the conversion
+        // REFUSE THE ONE FLOW IT EXISTS FOR. Every disk you would ever want to convert has just been drained,
+        // and every drained disk looks like this.
+        //
+        // Ask what the files ARE:
+        //
+        //   the object no longer references this volume  -- STALE. The slice lives elsewhere; wiping destroys
+        //                                                   nothing. This is what a drained disk is made of.
+        //   the object still references this volume      -- LIVE. Wiping is data loss.
+        //   the object has no record at all              -- a TRUE ORPHAN, and orphans are RECOVERABLE data.
+        //                                                   Wiping is the worst kind of data loss: unnoticed.
+        const { stale, stillReferenced, orphans } = await database.classifySlicesOnVolume(
+            volume.id, [...index.keys()]);
+
+        if (stillReferenced.length)
             throw new HttpBadRequestError(
-                `refusing to convert volume ${volume.id}: ${index.size} slice file(s) are still on the disk, `
-                + `even though the database lists none. Those are ORPHANS -- slices with no record -- and they `
-                + `are RECOVERABLE data that this wipe would destroy. Run the drift scrub, resolve them, and `
-                + `try again. (If a write was in flight when the drain finished, simply re-draining may clear `
-                + `them.)`
+                `refusing to convert volume ${volume.id}: ${stillReferenced.length} slice file(s) on it are still `
+                + `referenced by live objects, even though the database's own count said none were. Something is `
+                + `wrong; do not wipe this disk. (First: ${stillReferenced[0]}.)`
             );
+
+        if (orphans.length)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: ${orphans.length} slice file(s) on it belong to objects `
+                + `with NO record at all. Those are ORPHANS -- recoverable data that a rebuild can turn back into `
+                + `objects (that is the whole of the namespace recovery) -- and this wipe would destroy them with `
+                + `nobody the wiser. Run the drift scrub, resolve them, and try again. (First: ${orphans[0]}.)`
+            );
+
+        if (stale)
+            log('volume%d: %d slice file(s) remain from the drain -- every one of them a stale copy of an object '
+                + 'that now lives elsewhere. The conversion will destroy them, which is what wiping a drained '
+                + 'disk means.', volume.id, stale);
     }
 
     // DOES THE RECOVERY PASSPHRASE STILL OPEN EVERY ENCRYPTED DISK?
