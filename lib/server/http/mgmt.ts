@@ -1035,7 +1035,6 @@ export class HttpMgmt {
         }>(req);
         const blockPath = payload.blockPath;
         const wipe = payload.wipe;
-        const replace = payload.replace;
         if (!blockPath || typeof blockPath !== 'string')
             throw new HttpBadRequestError('blockPath must be provided');
         let wipeFlag: boolean | undefined;
@@ -1047,8 +1046,13 @@ export class HttpMgmt {
                 throw new HttpBadRequestError('wipe timestamp must be within 10 seconds of current time');
             wipeFlag = true;
         }
-        if (replace !== undefined && typeof replace !== 'boolean')
-            throw new HttpBadRequestError('replace must be a boolean');
+        // `replace` is gone: it reused an existing volume's id WITHOUT any of conversion's guards (drain,
+        // reference check, platter scan), which made it the last way to manufacture a phantom. A new disk gets a
+        // new id; re-encrypting an existing volume goes through the guarded conversion flow.
+        if (payload.replace !== undefined)
+            throw new HttpBadRequestError(
+                'replace is no longer supported. Add the disk as a new volume (it gets a new id), or to '
+                + 're-encrypt an existing volume in place, drain it and use the encrypt/convert flow.');
 
         if (payload.encrypt !== undefined && typeof payload.encrypt !== 'boolean')
             throw new HttpBadRequestError('encrypt must be a boolean');
@@ -1058,7 +1062,6 @@ export class HttpMgmt {
         const volumeConfig = await deviceProvisioner.provision({
             blockPath,
             wipe: wipeFlag,
-            replace: replace as boolean | undefined,
             // Left undefined, the provisioner falls back to the fleet default (encryptNewVolumes).
             encrypt: payload.encrypt as boolean | undefined,
             recoveryPassphrase: payload.recoveryPassphrase as string | undefined
@@ -1530,7 +1533,6 @@ export class HttpMgmt {
             volumeConfig = await deviceProvisioner.provision({
                 blockPath: disk.path,
                 wipe: true,
-                replace: true,
                 encrypt: true,
                 recoveryPassphrase: passphrase,
                 convertVolumeId: id,

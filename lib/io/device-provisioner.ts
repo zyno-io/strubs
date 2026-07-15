@@ -137,7 +137,6 @@ const defaultDeps: DeviceProvisionerDeps = {
 export type ProvisionOptions = {
     blockPath: string;
     wipe?: boolean;
-    replace?: boolean;
 
     // Tri-state ON PURPOSE. `undefined` means "whatever the fleet default says" (the runtimeConfig flag); an
     // explicit true/false is the operator overriding it for this one disk. Defaulting this to `false` in the
@@ -189,7 +188,7 @@ export class DeviceProvisioner {
     }
 
     private async doProvision(options: ProvisionOptions, encrypt: boolean): Promise<PersistedVolumeConfig> {
-        const { blockPath, wipe, replace } = options;
+        const { blockPath, wipe } = options;
         this.validateWipeOption(wipe);
 
         // Conversion rebuilds the disk from scratch: there is no such thing as converting it gently. Requiring
@@ -299,8 +298,13 @@ export class DeviceProvisioner {
         // On the conversion path the volume was deregistered before we were called, so it is no longer in the
         // fleet map for ensureDeviceNotRegistered to find -- but its id must be preserved regardless. Losing it
         // would renumber a disk that never left the array.
+        // Reuse of an already-registered volume id happens ONLY on the conversion path (convertVolumeId), which
+        // is fully guarded upstream: the volume must be drained and read-only, its DB references checked, and its
+        // platter scanned for live-or-orphan slices. There is no longer a generic `replace` -- a new disk gets a
+        // NEW id, and re-provisioning a registered disk means deleting its volume first. That deletes the last
+        // unguarded destructive escape hatch (a `replace` that skipped every one of conversion's checks).
         const registeredVolumeId = await this.ensureDeviceNotRegistered(
-            targetDevice, devices, replace || options.convertVolumeId !== undefined);
+            targetDevice, devices, options.convertVolumeId !== undefined);
         const replacedVolumeId = options.convertVolumeId ?? registeredVolumeId;
 
         // PREFLIGHT BEFORE WE TOUCH THE PARTITION TABLE. If the key is missing, or the operator cannot produce
@@ -761,17 +765,22 @@ export class DeviceProvisioner {
         throw new HttpBadRequestError('wipe must be a boolean');
     }
 
-    private async ensureDeviceNotRegistered(targetDevice: RawBlockDevice, devices: RawBlockDevice[], replace?: boolean): Promise<number | undefined> {
+    private async ensureDeviceNotRegistered(targetDevice: RawBlockDevice, devices: RawBlockDevice[], reuseForConversion?: boolean): Promise<number | undefined> {
+        const alreadyRegistered = () => new HttpBadRequestError(
+            'device already registered: this disk already belongs to a volume. Delete that volume first, then '
+            + 'add the disk as a new one (it will get a new id). To re-encrypt an existing volume in place, use '
+            + 'the conversion flow, which drains and checks it first.');
+
         const { identityKeys, serials, volumeIdByIdentity, volumeIdBySerial } = await this.getRegisteredIdentities(devices);
         if (targetDevice.serial && serials.has(targetDevice.serial)) {
-            if (!replace)
-                throw new HttpBadRequestError('device already registered');
+            if (!reuseForConversion)
+                throw alreadyRegistered();
             return volumeIdBySerial.get(targetDevice.serial);
         }
         const identityKey = getDeviceIdentityKey(targetDevice);
         if (identityKey && identityKeys.has(identityKey)) {
-            if (!replace)
-                throw new HttpBadRequestError('device already registered');
+            if (!reuseForConversion)
+                throw alreadyRegistered();
             return volumeIdByIdentity.get(identityKey);
         }
         return undefined;

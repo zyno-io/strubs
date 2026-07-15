@@ -978,7 +978,7 @@ describe('HttpMgmt.handle', () => {
             nullResponse
         );
 
-        expect(deviceProvisionerProvisionMock).toHaveBeenCalledWith({ blockPath: '/dev/sdb', wipe: undefined, replace: undefined });
+        expect(deviceProvisionerProvisionMock).toHaveBeenCalledWith({ blockPath: '/dev/sdb', wipe: undefined });
         expect(response).toMatchObject({
             id: 2,
             deviceSerial: 'SERNEW',
@@ -1003,12 +1003,14 @@ describe('HttpMgmt.handle', () => {
         expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
     });
 
-    it('validates replace input types', async () => {
+    // ⚠️ replace IS GONE. It reused a volume id without conversion's guards -- the last phantom-making escape
+    // hatch. The API now refuses it outright rather than pass it down.
+    it('REFUSES replace: a new disk gets a new id, and re-encryption goes through conversion', async () => {
         await expect(HttpMgmt.handle(
             13,
-            createRequest('POST', '/$/volumes', { blockPath: '/dev/sdb', replace: 'yes' }),
+            createRequest('POST', '/$/volumes', { blockPath: '/dev/sdb', replace: true }),
             nullResponse
-        )).rejects.toBeInstanceOf(HttpBadRequestError);
+        )).rejects.toThrow(/replace is no longer supported/);
 
         expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
     });
@@ -1018,11 +1020,11 @@ describe('HttpMgmt.handle', () => {
 
         await expect(HttpMgmt.handle(
             11,
-            createRequest('POST', '/$/volumes', { blockPath: '/dev/sdc', wipe: Date.now(), replace: true }),
+            createRequest('POST', '/$/volumes', { blockPath: '/dev/sdc', wipe: Date.now() }),
             nullResponse
         )).rejects.toBeInstanceOf(HttpBadRequestError);
 
-        expect(deviceProvisionerProvisionMock).toHaveBeenCalledWith({ blockPath: '/dev/sdc', wipe: true, replace: true });
+        expect(deviceProvisionerProvisionMock).toHaveBeenCalledWith({ blockPath: '/dev/sdc', wipe: true });
     });
 
     it('resolves file info requests with slice locations', async () => {

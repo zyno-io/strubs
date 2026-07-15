@@ -488,21 +488,21 @@ describe('DeviceProvisioner', () => {
         });
     });
 
-    it('replaces existing volumes when replace is true', async () => {
-        deps.listRawBlockDevices
-            .mockResolvedValueOnce([baseDevice])
-            .mockResolvedValueOnce([deviceWithPartition(null)])
-            .mockResolvedValueOnce([deviceWithPartition('PART-UUID')]);
-
+    // ⚠️ NO GENERIC REPLACE. Adding a disk that is already a registered volume is refused: it reused an id
+    // WITHOUT any of conversion's checks, which made it the last way to manufacture a phantom. A new disk gets a
+    // new id; re-encrypting an existing volume goes through the guarded conversion flow (convertVolumeId).
+    it('REFUSES a disk that already belongs to a registered volume, and wipes nothing', async () => {
+        deps.listRawBlockDevices.mockResolvedValue([{ ...baseDevice, serial: 'SERNEW' }]);
         deps.ioManager.getVolumeEntries.mockReturnValue([
             [2, { deviceSerial: 'SERNEW', partitionUuid: null }]
         ]);
 
         const provisioner = new DeviceProvisioner(deps);
-        const result = await provisioner.provision({ blockPath: '/dev/sdb', replace: true });
+        await expect(provisioner.provision({ blockPath: '/dev/sdb' }))
+            .rejects.toThrow(/device already registered/);
 
-        expect(deps.database.deleteVolume).toHaveBeenCalledWith(2);
-        expect(result.id).toBe(2);
+        expect(deps.database.deleteVolume).not.toHaveBeenCalled();
+        expect(deps.spawnHelper).not.toHaveBeenCalledWith('parted', expect.anything());
     });
 
     it('recreates the partition table when wipe is true', async () => {
@@ -1049,7 +1049,7 @@ describe('DeviceProvisioner', () => {
 
                 const provisioner = new DeviceProvisioner(deps);
                 await provisioner.provision({
-                    blockPath: '/dev/sdb', wipe: true, replace: true, encrypt: true,
+                    blockPath: '/dev/sdb', wipe: true, encrypt: true,
                     recoveryPassphrase: PASSPHRASE, convertVolumeId: 7
                 });
 
@@ -1072,7 +1072,7 @@ describe('DeviceProvisioner', () => {
 
                 const provisioner = new DeviceProvisioner(deps);
                 const volume = await provisioner.provision({
-                    blockPath: '/dev/sdb', wipe: true, replace: true, encrypt: true,
+                    blockPath: '/dev/sdb', wipe: true, encrypt: true,
                     recoveryPassphrase: PASSPHRASE, convertVolumeId: 7
                 });
 
@@ -1091,7 +1091,7 @@ describe('DeviceProvisioner', () => {
 
                 const provisioner = new DeviceProvisioner(deps);
                 await expect(provisioner.provision({
-                    blockPath: '/dev/sdb', wipe: true, replace: true, encrypt: true,
+                    blockPath: '/dev/sdb', wipe: true, encrypt: true,
                     recoveryPassphrase: PASSPHRASE, convertVolumeId: 7   // ...but we asked for volume 7
                 })).rejects.toThrow(/carries STRUBS volume 9, not volume 7/);
 
@@ -1112,7 +1112,7 @@ describe('DeviceProvisioner', () => {
 
                 const provisioner = new DeviceProvisioner(deps);
                 const volume = await provisioner.provision({
-                    blockPath: '/dev/sdb', wipe: true, replace: true, encrypt: true,
+                    blockPath: '/dev/sdb', wipe: true, encrypt: true,
                     recoveryPassphrase: PASSPHRASE, convertVolumeId: 7
                 });
 
@@ -1131,7 +1131,7 @@ describe('DeviceProvisioner', () => {
 
                 const provisioner = new DeviceProvisioner(deps);
                 await expect(provisioner.provision({
-                    blockPath: '/dev/sdb', wipe: true, replace: true, encrypt: true,
+                    blockPath: '/dev/sdb', wipe: true, encrypt: true,
                     recoveryPassphrase: PASSPHRASE, convertVolumeId: 7
                 })).resolves.toMatchObject({ id: 7 });
             });
@@ -1142,7 +1142,7 @@ describe('DeviceProvisioner', () => {
 
                 const provisioner = new DeviceProvisioner(deps);
                 await expect(provisioner.provision({
-                    blockPath: '/dev/sdb', wipe: true, replace: true, encrypt: true,
+                    blockPath: '/dev/sdb', wipe: true, encrypt: true,
                     recoveryPassphrase: PASSPHRASE, convertVolumeId: 7
                 })).rejects.toThrow(/belongs to STRUBS instance ffffffff/);
 
@@ -1156,7 +1156,7 @@ describe('DeviceProvisioner', () => {
 
                 const provisioner = new DeviceProvisioner(deps);
                 await expect(provisioner.provision({
-                    blockPath: '/dev/sdb', wipe: true, replace: true, encrypt: true,
+                    blockPath: '/dev/sdb', wipe: true, encrypt: true,
                     recoveryPassphrase: PASSPHRASE, convertVolumeId: 7
                 })).rejects.toThrow(/must first prove it is the disk you meant/);
 
@@ -1178,7 +1178,7 @@ describe('DeviceProvisioner', () => {
 
                 const provisioner = new DeviceProvisioner(deps);
                 await expect(provisioner.provision({
-                    blockPath: '/dev/sdb', wipe: true, replace: true, encrypt: true,
+                    blockPath: '/dev/sdb', wipe: true, encrypt: true,
                     recoveryPassphrase: PASSPHRASE, convertVolumeId: 7
                 })).rejects.toThrow(/mounted partitions/);
 
