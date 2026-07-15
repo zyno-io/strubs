@@ -44,6 +44,7 @@ describe('listRawBlockDevices', () => {
                             name: 'sda1',
                             size: '512',
                             uuid: 'PART-UUID',
+                            partuuid: 'PART-PUUID',
                             fstype: 'ext4',
                             mountpoint: '/mnt/data',
                             something: 'else'
@@ -88,6 +89,7 @@ describe('listRawBlockDevices', () => {
                         fstype: 'ext4',
                         mountpoint: '/mnt/data',
                         partlabel: null,
+                        partuuid: 'PART-PUUID',
                         children: []
                     }
                 ]

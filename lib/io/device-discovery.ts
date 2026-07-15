@@ -21,6 +21,13 @@ export type RawBlockDeviceChild = {
     // encrypted disk says who it is. Advisory only: `.identity` inside the filesystem remains the real check.
     partlabel?: string | null;
 
+    // THE GPT PARTITION UUID -- distinct from `uuid` (which is the filesystem/LUKS-header uuid). partuuid is
+    // minted by `parted mkpart` and exists the instant the partition table is written, BEFORE any filesystem or
+    // LUKS header. That makes it the one stable handle for the earliest partition-level writes: luksFormat and a
+    // plaintext mkfs both target /dev/disk/by-partuuid/<partuuid>, which resolves to the exact partition or
+    // dangles (never a different disk). See notes/dr-g-by-uuid-migration-plan.md.
+    partuuid?: string | null;
+
     // A LUKS PARTITION'S FILESYSTEM IS NOT ON THE PARTITION. IT IS ON A MAPPER CHILD.
     //
     //     sdf          disk
@@ -399,6 +406,7 @@ function sanitizeChild(child: any): RawBlockDeviceChild {
         fstype: child.fstype,
         mountpoint: child.mountpoint ?? null,
         partlabel: child.partlabel ?? null,
+        partuuid: child.partuuid ?? null,
         children: (child.children || []).map(sanitizeChild)
     };
 }
