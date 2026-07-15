@@ -98,3 +98,7 @@ tools/orphan-quarantine-manifest.json
 
 # Same: production object metadata, generated, and not something to put in a public history.
 tools/dead-archive-manifest.json
+
+# VitePress
+docs/.vitepress/dist
+docs/.vitepress/cache

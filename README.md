@@ -143,10 +143,15 @@ For a real deployment — the systemd unit, adding and replacing drives, and wha
 
 ## Documentation
 
+📖 **Full documentation site: [signal24.github.io/strubs](https://signal24.github.io/strubs/)** — built with
+VitePress from the `docs/` directory and deployed on every push to `main`. Run it locally with
+`cd docs && npm install && npm run docs:dev`.
+
 | | |
 |---|---|
 | [Architecture](docs/architecture.md) | How a read and a write actually work, the volume model, and the background jobs. |
 | [Operations](docs/operations.md) | The runbook: adding, replacing, draining, and rebalancing drives; responding to failures. |
+| [Encryption](docs/encryption.md) | The full LUKS story: keyfile, recovery passphrase, rotation, audit, and recovery. |
 | [Data integrity](docs/data-integrity.md) | What "verified" means here, the quorum rules, and the failure modes checksums alone don't catch. |
 | [HTTP API](docs/api.md) | The object API, the management API, and the FUSE mount. |
 | [Configuration](docs/configuration.md) | Every environment variable and runtime setting. |

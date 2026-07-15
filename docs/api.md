@@ -123,10 +123,12 @@ All under `/$/`. Bodies are JSON; an empty body is treated as `{}`.
 ### `POST /$/volumes` — the dangerous one
 
 ```json
-{ "blockPath": "/dev/sdx", "wipe": 1783794000000, "replace": false }
+{ "blockPath": "/dev/sdx", "wipe": 1783794000000, "encrypt": true }
 ```
 
 `wipe` is **a timestamp in milliseconds, not a boolean**, and it must be within **10 seconds of now**. That freshness window is the only guard against a replayed request repartitioning a disk — there is no other confirmation step. Get the device path right.
+
+`encrypt` is optional (defaults to the fleet's `encryptNewVolumes` setting); you do **not** pass the recovery passphrase — STRUBS holds it sealed. There is **no `replace` option**: a new disk gets a new id, re-provisioning a registered disk means deleting its volume first, and re-encrypting a volume in place goes through the drain → `POST /$/volumes/{id}/encrypt` → rebalance flow. Passing `replace` is rejected.
 
 `DELETE` and soft-delete are **refused** while a volume still holds live object slices:
 

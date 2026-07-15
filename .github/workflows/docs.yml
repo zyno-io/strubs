@@ -1,0 +1,68 @@
+# Build the VitePress docs and deploy them to GitHub Pages on every push to main.
+#
+# The repo lives on GitLab (git.s24.dev) and mirrors to GitHub; this workflow runs on the GitHub side, so a
+# mirror push to `main` triggers a deploy. One-time setup on GitHub: Settings → Pages → "Build and deployment"
+# → Source = "GitHub Actions".
+#
+# Base path: the site is configured for project Pages (https://<org>.github.io/strubs/) via DOCS_BASE below.
+# For a user/org page or a custom domain, set DOCS_BASE to "/".
+name: Deploy docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  # Allow a manual run from the Actions tab.
+  workflow_dispatch:
+
+# Least-privilege token: read the repo, write Pages, mint the deploy id-token.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let an in-progress production deploy finish rather than cancelling it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build with VitePress
+        env:
+          DOCS_BASE: /strubs/
+        run: npm run docs:build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
