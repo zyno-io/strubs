@@ -1367,8 +1367,8 @@ describe('recovery: a fleet restore raises its flag before it touches anything',
 
         const deps = (overrides: Record<string, unknown> = {}) => ({
             findManifests: async () => [
-                { device: '/dev/sdf1', manifest: manifest as never },
-                { device: '/dev/sdg1', manifest: manifest as never }
+                { device: '/dev/sdf1', luksUuid: 'luks-f', manifest: manifest as never },
+                { device: '/dev/sdg1', luksUuid: 'luks-g', manifest: manifest as never }
             ],
             restoreInterrupted: async () => null,
             existingVolumes: async () => [],
@@ -1376,6 +1376,7 @@ describe('recovery: a fleet restore raises its flag before it touches anything',
             adoptIdentity: async () => undefined,
             writeVolumes: async () => undefined,
             keyfileReadable: async () => true,
+            assertExactlyOneLuksHeader: async () => undefined,   // the header resolves uniquely by default
             ...overrides
         });
 
@@ -1393,7 +1394,8 @@ describe('recovery: a fleet restore raises its flag before it touches anything',
                 }
             }) as never, { recoveryPassphrase: 'the fleet recovery passphrase' });
 
-            expect(ensured).toEqual(['/dev/sdf1', '/dev/sdg1']);
+            // Addressed by header uuid, never by /dev/sdX1. The report to the operator still names the device.
+            expect(ensured).toEqual(['UUID=luks-f', 'UUID=luks-g']);
             expect(summary.keyfileRestoredOn).toEqual(['/dev/sdf1', '/dev/sdg1']);
         });
 
@@ -1413,7 +1415,7 @@ describe('recovery: a fleet restore raises its flag before it touches anything',
         it('completes the recovery even if a keyslot cannot be restored', async () => {
             const summary = await recoverFleetFromDisks(deps({
                 ensureKeyfileSlot: async (partition: string) => {
-                    if (partition === '/dev/sdf1') throw new Error('header is read-only');
+                    if (partition === 'UUID=luks-f') throw new Error('header is read-only');
                     return 'added' as const;
                 }
             }) as never, { recoveryPassphrase: 'the fleet recovery passphrase' });
@@ -1438,9 +1440,9 @@ describe('recovery: a fleet restore raises its flag before it touches anything',
 
             const summary = await recoverFleetFromDisks(deps({
                 findManifests: async () => [
-                    { device: '/dev/sdf1', manifest: manifest as never },
-                    { device: '/dev/sdg1', manifest: manifest as never },
-                    { device: '/dev/sdz1', manifest: foreign as never }      // <- not ours
+                    { device: '/dev/sdf1', luksUuid: 'luks-f', manifest: manifest as never },
+                    { device: '/dev/sdg1', luksUuid: 'luks-g', manifest: manifest as never },
+                    { device: '/dev/sdz1', luksUuid: 'luks-z', manifest: foreign as never }      // <- not ours
                 ],
                 ensureKeyfileSlot: async (partition: string) => {
                     ensured.push(partition);
@@ -1448,9 +1450,25 @@ describe('recovery: a fleet restore raises its flag before it touches anything',
                 }
             }) as never, { recoveryPassphrase: 'the fleet recovery passphrase' });
 
-            expect(ensured).toEqual(['/dev/sdf1', '/dev/sdg1']);
-            expect(ensured).not.toContain('/dev/sdz1');
+            expect(ensured).toEqual(['UUID=luks-f', 'UUID=luks-g']);
+            expect(ensured).not.toContain('UUID=luks-z');
             expect(summary.keyfileRestoredOn).not.toContain('/dev/sdz1');
+        });
+
+        // ⚠️ NEVER WRITE THE KEYFILE INTO AN AMBIGUOUS OR VANISHED HEADER. A dd'd clone makes UUID= resolve to
+        // two headers; a swapped-away disk makes it resolve to none. Either way we refuse the keyslot write for
+        // that disk (best-effort, so the rest of the recovery continues) rather than write the keyfile blind.
+        it('does not restore a keyslot on a header whose uuid does not resolve uniquely', async () => {
+            const ensured: string[] = [];
+            const summary = await recoverFleetFromDisks(deps({
+                assertExactlyOneLuksHeader: async (uuid: string) => {
+                    if (uuid === 'luks-f') throw new Error('2 attached partitions carry that uuid (a clone)');
+                },
+                ensureKeyfileSlot: async (partition: string) => { ensured.push(partition); return 'added' as const; }
+            }) as never, { recoveryPassphrase: 'the fleet recovery passphrase' });
+
+            expect(ensured).toEqual(['UUID=luks-g']);            // sdf1 refused, sdg1 restored
+            expect(summary.keyfileRestoredOn).toEqual(['/dev/sdg1']);
         });
 
         // No keyfile on the host to put back. Say so loudly rather than reporting a restored keyslot that does

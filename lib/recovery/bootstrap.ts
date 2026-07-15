@@ -15,6 +15,7 @@ import {
     keyfileReadable,
     openWithSecret
 } from '../io/luks';
+import { assertExactlyOneLuksHeader, luksHeaderSpecifier } from '../io/block-identity';
 import { volumeConfigsFromManifest, assertSafeToRestoreFleet } from './fleet-restore';
 import type { PersistedVolumeConfig } from '../io/volume';
 
@@ -38,6 +39,12 @@ const log = createLogger('bootstrap-recovery');
 
 export type DiscoveredManifest = {
     device: string;
+
+    // The LUKS container uuid, ONLY for an encrypted disk (undefined for a plaintext one). Captured at scan
+    // time so a keyslot restore can address the header by `UUID=<luksUuid>` -- not by a path that may point at
+    // a different disk by the time we get to writing. See notes/dr-g-by-uuid-migration-plan.md.
+    luksUuid?: string;
+
     manifest: BootstrapManifest;
 };
 
@@ -92,7 +99,7 @@ export async function findManifestsOnDevices(options: ScanOptions = {}): Promise
 
                 if (probe.kind === 'manifest') {
                     log('found a bootstrap manifest on %s (encrypted)', partition);
-                    found.push({ device: partition, manifest: probe.manifest });
+                    found.push({ device: partition, luksUuid: child.uuid, manifest: probe.manifest });
                 }
                 else if (probe.kind === 'locked')
                     locked.push(partition);
@@ -428,6 +435,7 @@ export type FleetRecoveryDeps = {
     beginRestore: (expected: number) => Promise<void>;
     ensureKeyfileSlot?: (partition: string, passphrase: string) => Promise<'added' | 'already-present'>;
     keyfileReadable?: () => Promise<boolean>;
+    assertExactlyOneLuksHeader?: (luksUuid: string) => Promise<void>;
 };
 
 export async function recoverFleetFromDisks(
@@ -514,14 +522,23 @@ async function restoreKeyfileSlots(
         return [];
     }
 
+    const assertOne = deps.assertExactlyOneLuksHeader ?? assertExactlyOneLuksHeader;
     const restored: string[] = [];
 
     for (const entry of found) {
+        // A plaintext disk has no keyslot to restore. Only LUKS disks (which carry a container uuid) get here --
+        // and we address the header BY THAT UUID, never by entry.device, because a path can point at a different
+        // disk by the time we write and this tool's whole promise is that it does not touch what it did not
+        // identify.
+        if (!entry.luksUuid)
+            continue;
+
         try {
-            const outcome = await ensure(entry.device, passphrase);
+            await assertOne(entry.luksUuid);   // refuse a clone or a vanished header, before we write the keyfile
+            const outcome = await ensure(luksHeaderSpecifier(entry.luksUuid), passphrase);
             if (outcome === 'added') {
                 restored.push(entry.device);
-                log('the keyfile keyslot was restored on %s', entry.device);
+                log('the keyfile keyslot was restored on %s (LUKS %s)', entry.device, entry.luksUuid);
             }
         }
         catch (err) {
