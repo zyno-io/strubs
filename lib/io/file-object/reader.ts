@@ -316,18 +316,24 @@ export class FileObjectReader extends Base {
     // wrong data -- the incident failure mode) shows up here as a mismatch; nothing else validates it.
     // Skips (dataIncomplete=true) when a data slice had to be reconstructed, since then the recomputed
     // parity is derived from possibly-wrong data. Advances to the next chunk set. Returns null at EOF.
-    async verifyChunkSetParity(): Promise<{ mismatched: number[]; missing: number[]; dataIncomplete: boolean } | null> {
+    async verifyChunkSetParity(): Promise<{ mismatched: number[]; missing: number[]; dataIncomplete: boolean; dataRegion: Buffer; chunkDataSize: number; parityErrors: { index: number; code: string }[] } | null> {
         if (this.hasReachedEOF)
             return null;
         const chunkIndex = this._currentChunkSetIndex;
         // Read the parity as stored on disk (independent of the recompute buffer).
         const stored: (Buffer | null)[] = [];
+        const parityErrors: { index: number; code: string }[] = [];
         for (const parityIndex of this.parityIndices()) {
             try {
                 await this.ensureSliceOpen(parityIndex); // a healthy read only opens data slices
                 stored.push(Buffer.from(await this._readSliceChunk(parityIndex, chunkIndex)));
             }
-            catch { stored.push(null); }
+            catch (err) {
+                // Preserve WHY the stored parity could not be read (ECHECKSUM/EIO/EHEADER/EUNAVAIL/ENOENT) so an
+                // out-of-band verify does not have to record every unreadable parity slice as merely "missing".
+                stored.push(null);
+                parityErrors.push({ index: parityIndex, code: (err as { code?: string } | undefined)?.code ?? 'EPARITYREAD' });
+            }
         }
         // Recompute the correct full chunk set (reconstructs any missing DATA from parity, then recomputes
         // every parity chunk from that data region).
@@ -344,7 +350,11 @@ export class FileObjectReader extends Base {
             if (!onDisk) { missing.push(parityIndex); return; }
             if (!dataIncomplete && !onDisk.equals(correct)) mismatched.push(parityIndex);
         });
-        return { mismatched, missing, dataIncomplete };
+        // The reconstructed DATA region (systematic: data slices 0..N-1 concatenated) is surfaced so an
+        // out-of-band full verify can compute the whole-object md5 from the SAME read that checked parity --
+        // no second pass over the data. A view into the snapshot buffer reconstructFullChunkSet already built.
+        const dataRegion = recomputed.buffer.subarray(0, this.dataSliceCount * recomputed.chunkDataSize);
+        return { mismatched, missing, dataIncomplete, dataRegion, chunkDataSize: recomputed.chunkDataSize, parityErrors };
     }
 
     private dataIndices(): number[] {

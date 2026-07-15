@@ -19,6 +19,7 @@ const { FileObjectReader } = require('../dist/lib/io/file-object/reader');
 
 const LIMIT = (() => { const i = process.argv.indexOf('--limit'); return i >= 0 ? parseInt(process.argv[i + 1], 10) : Infinity; })();
 const CONC = (() => { const i = process.argv.indexOf('--conc'); return i >= 0 ? parseInt(process.argv[i + 1], 10) : 8; })();
+const SAMPLE = (() => { const i = process.argv.indexOf('--sample'); return i >= 0 ? parseInt(process.argv[i + 1], 10) : 0; })();
 const MR = '/run/strubs/mounts';
 const DEAD = new Set([34, 7, 43]); // offline/dead vols -> their slices are erasures
 const md5Of = doc => (doc && doc.md5 && doc.md5.buffer) ? doc.md5.buffer : (doc ? doc.md5 : null);
@@ -74,7 +75,11 @@ const md5Of = doc => (doc && doc.md5 && doc.md5.buffer) ? doc.md5.buffer : (doc 
     else s.error++;
   };
 
-  const cur = C.find({ isFile: true }, { projection: { dataVolumes: 1, parityVolumes: 1, chunkSize: 1, size: 1, md5: 1, name: 1, containerId: 1 } }).batchSize(500).addCursorFlag('noCursorTimeout', true);
+  const proj = { dataVolumes: 1, parityVolumes: 1, chunkSize: 1, size: 1, md5: 1, name: 1, containerId: 1 };
+  const cur = SAMPLE > 0
+    ? C.aggregate([{ $match: { isFile: true } }, { $sample: { size: SAMPLE } }, { $project: proj }], { allowDiskUse: true }).batchSize(500)
+    : C.find({ isFile: true }, { projection: proj }).batchSize(500).addCursorFlag('noCursorTimeout', true);
+  if (SAMPLE > 0) console.log(`RANDOM SAMPLE of ${SAMPLE} objects`);
   const inflight = new Set();
   for await (const doc of cur) {
     if (s.objs >= LIMIT) break; s.objs++;
