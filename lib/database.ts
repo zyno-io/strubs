@@ -147,6 +147,36 @@ export class Database {
         return this.volumeRepository.getVolumes();
     }
 
+    // WHICH RUN OF mongod ARE WE TALKING TO? A token that is stable while this mongod keeps running and CHANGES
+    // when it is restarted -- which is what a file/snapshot restore of the database looks like.
+    //
+    // This is the anchor for "has the passphrase been proven since the disks last MIGHT have changed" (see
+    // recoveryAuditIsDue). It beats the host boot time: our own Node service restarts constantly and mongod does
+    // not, so a marker tied to mongod fires on a database-only restart-restore that a reboot check would miss.
+    // (It cannot catch a live `mongorestore` into a still-running mongod -- nothing DB-resident can -- and that
+    // residual is accepted; the encryption gate proves the passphrase against a real disk regardless.)
+    //
+    // local.startup_log gets one document per mongod start, _id = <host>-<startMillis>. `local` is excluded from
+    // mongodump, so a logical restore does not forge it.
+    async mongodStartupToken(): Promise<string | null> {
+        try {
+            const client = this._client;
+            if (!client)
+                return null;
+
+            const latest = await client.db('local').collection('startup_log')
+                .find({}).sort({ startTime: -1 }).limit(1).project({ _id: 1 }).toArray();
+
+            const id = latest[0]?._id;
+            return id != null ? String(id) : null;
+        }
+        catch {
+            // Cannot read it -> we cannot prove the fleet is unchanged since the last audit. The caller treats
+            // null as "audit is due", which is the safe direction: an audit is read-only.
+            return null;
+        }
+    }
+
     async deleteVolume(id: number): Promise<void> {
         await this.volumeRepository.deleteVolume(id);
     }

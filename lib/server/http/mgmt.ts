@@ -29,6 +29,7 @@ import { bootstrapManifestWriter, type ManifestSnapshotRef } from '../../io/boot
 import { deviceProvisioner, ENCRYPT_NEW_VOLUMES_KEY } from '../../io/device-provisioner';
 import {
     assertFleetRecoveryPassphrase,
+    assertPassphraseOpensTheFleet,
     auditRecoveryKey,
     hasRecoveryPassphrase,
     lastRecoveryAudit,
@@ -41,6 +42,7 @@ import {
     type RecoveryAudit
 } from '../../io/luks-recovery-key';
 import { listRawBlockDevices, type CachedDevice } from '../../io/device-discovery';
+import { smartInfoService } from '../../io/smart-info';
 import { verifyVolumesJob } from '../../jobs/verify-volumes-job';
 import type { VerifyVolumesStatus } from '../../jobs/verify-volumes-job';
 import { drainVolumeJob } from '../../jobs/drain-volume-job';
@@ -1334,10 +1336,40 @@ export class HttpMgmt {
             throw new HttpBadRequestError('another volume is already being converted; wait for it to finish');
 
         try {
-            return await this.convertVolumeToEncrypted(id, volume, passphrase);
+            const converted = await this.convertVolumeToEncrypted(id, volume, passphrase);
+
+            // PROVE THE WHOLE FLEET NOW THAT ANOTHER DISK JOINED IT.
+            //
+            // The encryption gate itself only asks ONE disk (the accepted design), so this fleet-wide audit is
+            // how the OTHER disks -- and the one we just wrote -- get re-proven at every step of a backfill,
+            // which is when it is cheapest to discover the passphrase has stopped opening one of them.
+            //
+            // Detached: the conversion has succeeded and the volume is in service. An audit failure here is
+            // news, not a reason to fail the request.
+            void this.auditAfterConversion(id);
+
+            return converted;
         }
         finally {
             endConversion();
+        }
+    }
+
+    private static async auditAfterConversion(id: number): Promise<void> {
+        try {
+            const passphrase = await sealedRecoveryPassphrase();
+            if (!passphrase) return;
+
+            const audit = await auditRecoveryKey(passphrase);
+
+            if (!audit.healthy)
+                log.error('volume%d was encrypted, but the recovery passphrase does NOT open every encrypted '
+                    + 'disk in the fleet (%d refused, %d unreadable, %d not attached)',
+                    id, audit.refused.length, audit.unreadable.length, audit.notChecked.length);
+        }
+        catch (err) {
+            log.error('could not prove the recovery passphrase against the disks after converting volume%d: %s',
+                id, err instanceof Error ? err.message : String(err));
         }
     }
 
@@ -1358,7 +1390,7 @@ export class HttpMgmt {
         // becomes sdf when somebody breathes on the rack, and a rule that manufactures a disk path out of a
         // partition path is a rule that will one day `parted` the wrong spindle. The uuid is an identity; the
         // path is a rumour.
-        const blockPath = await this.resolveDiskHoldingPartition(volume);
+        const disk = await this.resolveDiskHoldingPartition(volume);
 
         // THE DOOR MUST ALREADY BE SHUT. WE DO NOT SHUT IT OURSELVES AND WALK STRAIGHT IN.
         //
@@ -1381,11 +1413,25 @@ export class HttpMgmt {
             );
 
         // The conversion slot is already held by the caller, and released by it whatever happens here.
-        return await this.doVolumeEncrypt(id, volume, blockPath, passphrase);
+        return await this.doVolumeEncrypt(id, volume, disk, passphrase);
     }
 
-    // Which whole disk currently carries this volume's partition? Asked of the machine, right now, by identity.
-    private static async resolveDiskHoldingPartition(volume: Volume): Promise<string> {
+    // WHICH WHOLE DISK ARE WE ABOUT TO WIPE? Asked of the machine, right now, by identity -- and refused unless
+    // the answer is unambiguous AND agrees with the disk the kernel has actually mounted for this volume.
+    //
+    // A partition uuid is not guaranteed unique in the world; it is only unique among disks somebody has not
+    // cloned. Plug in a dd'd copy of a STRUBS disk -- a bench clone, a failed-drive image, a backup somebody
+    // made the sensible way -- and TWO partitions now answer to this uuid. `find()` would take whichever the
+    // kernel happened to enumerate first, and we would scan the mounted original for slices, find it empty, and
+    // then `parted` the CLONE: a disk full of recoverable orphans, wiped on the strength of a scan of a
+    // different platter. ORPHANS BEAT PHANTOMS, and that would destroy them.
+    //
+    // So: exactly one, or nothing. And the one we find must be the very device `/proc/mounts` says this volume
+    // is mounted from (assertPlatterHoldsNoSlices proves that separately) -- because the platter we SCANNED and
+    // the platter we WIPE have to be the same piece of metal, and nothing else here can prove that.
+    private static async resolveDiskHoldingPartition(
+        volume: Volume
+    ): Promise<{ path: string; serial: string }> {
         const partitionUuid = volume.partitionUuid;
 
         if (!partitionUuid)
@@ -1395,20 +1441,59 @@ export class HttpMgmt {
             );
 
         const devices = await listRawBlockDevices();
-        const disk = devices.find(device =>
-            device.children?.some(child => child.uuid === partitionUuid));
+        const matches = devices.flatMap(disk =>
+            (disk.children ?? [])
+                .filter(child => child.uuid === partitionUuid)
+                .map(child => ({ disk, child })));
 
-        if (!disk)
+        if (!matches.length)
             throw new HttpBadRequestError(
                 `no attached disk carries volume ${volume.id}'s partition (${partitionUuid}). It may have been `
                 + `unplugged since the fleet last looked.`
             );
 
-        return disk.path;
+        // TWO DISKS CLAIM TO BE THIS VOLUME. One of them is a copy, and we cannot tell which from here -- the
+        // uuid, the identity file and the nameplate were all duplicated along with everything else.
+        if (matches.length > 1)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: ${matches.length} attached partitions carry its uuid `
+                + `(${matches.map(m => m.child.path ?? m.child.name).join(', ')}). One of them is a clone, and a `
+                + `wipe cannot be aimed at "whichever one lsblk listed first". Detach the copy and try again.`
+            );
+
+        const match = matches[0]!;
+
+        // The record and the machine must agree about WHICH partition this is. If they do not, the volume was
+        // re-enumerated under a new name and nothing here has caught up -- so the disk we scanned for slices is
+        // not provably the disk we are about to destroy. Refuse; a `Refresh` puts it right.
+        if (match.child.path !== volume.blockPath)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: it is recorded on ${volume.blockPath}, but its partition `
+                + `is attached at ${match.child.path}. The kernel has renamed this disk since the fleet last `
+                + `looked at it, so we cannot prove the platter we scanned is the platter we would wipe. Refresh `
+                + `the devices and try again.`
+            );
+
+        // ⚠️ THE DRIVE'S SERIAL, FROM SMART -- NOT lsblk's, WHICH IS THE USB BRIDGE'S.
+        //
+        // On this rack the bridge serial is not an identity at all: six pairs of disks share one and eight
+        // report none, because the enclosure answers on the drive's behalf (every disk claims WWN
+        // 0x5000000000000001). Holding a wipe to that would let the disk in the next bay inherit the blessing
+        // meant for its neighbour. The SMART serial comes from the platter's own controller: 31 drives, 31
+        // distinct values.
+        const serial = (await smartInfoService.fetch(match.disk.path))?.serial_number;
+
+        if (!serial)
+            throw new HttpBadRequestError(
+                `refusing to convert volume ${volume.id}: the drive at ${match.disk.path} will not report a SMART `
+                + `serial, so we have no identity to hold it to while we wipe it.`
+            );
+
+        return { path: match.disk.path, serial };
     }
 
     private static async doVolumeEncrypt(
-        id: number, volume: Volume, blockPath: string, passphrase: string | undefined
+        id: number, volume: Volume, disk: { path: string; serial: string }, passphrase: string | undefined
     ): Promise<VolumeStatus> {
         // The same two checks that gate pulling a disk out of the array -- because this destroys the disk just
         // as thoroughly, and "it grew back" is no comfort to an object that was below quorum when it did.
@@ -1443,12 +1528,18 @@ export class HttpMgmt {
         let volumeConfig;
         try {
             volumeConfig = await deviceProvisioner.provision({
-                blockPath,
+                blockPath: disk.path,
                 wipe: true,
                 replace: true,
                 encrypt: true,
                 recoveryPassphrase: passphrase,
-                convertVolumeId: id
+                convertVolumeId: id,
+
+                // THE DISK WE SCANNED, not the disk that happens to answer to this name by the time the
+                // provisioner looks. We have just unmounted and deregistered this volume; a clone plugged in
+                // during that handoff would otherwise be wiped in its place, and a clone is full of exactly the
+                // orphan slices that ORPHANS BEAT PHANTOMS says we must never destroy.
+                expectDiskSerial: disk.serial
             });
         }
         catch (err) {
@@ -1645,7 +1736,18 @@ export class HttpMgmt {
         if (typeof payload.passphrase !== 'string' || !payload.passphrase)
             throw new HttpBadRequestError('passphrase is required');
 
-        // Verifies against the recorded hash and seals it on the way through. Throws if it is the wrong one.
+        // ⚠️ THE PLATTER FIRST, AND THE ORDER IS THE WHOLE POINT.
+        //
+        // assertFleetRecoveryPassphrase() SEALS the passphrase as a side effect of accepting it. So checking the
+        // hash first and the disks second would, on a restored database, write the stale passphrase into the
+        // seal and only THEN refuse the request -- leaving the array reporting `passphraseUsable: true` about a
+        // passphrase that opens nothing. The request fails and the damage stays.
+        //
+        // Asking a disk costs nothing and changes nothing (`--test-passphrase` is read-only), so ask it before
+        // anything is written anywhere.
+        await assertPassphraseOpensTheFleet(payload.passphrase);
+
+        // ...and only now, against the recorded hash -- which seals it on the way through.
         await assertFleetRecoveryPassphrase(payload.passphrase);
 
         const usable = await sealedRecoveryPassphrase() !== null;

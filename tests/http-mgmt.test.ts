@@ -75,7 +75,9 @@ vi.mock('../lib/recovery/recovery', async importOriginal => ({
 const sealedRecoveryPassphraseMock = vi.fn<() => Promise<string | null>>();
 const auditRecoveryKeyMock = vi.fn();
 const listRawBlockDevicesMock = vi.fn();
+const smartFetchMock = vi.fn();
 const assertFleetRecoveryPassphraseMock = vi.fn();
+const assertPassphraseOpensTheFleetMock = vi.fn();
 const scanFleetMock = vi.fn(async () => ({ ours: [] as unknown[], unknown: [] as string[], absent: [] as number[] }));
 // ⚠️ Asked of THIS volume's disk. `scanFleet().absent` CANNOT answer it -- that list excludes deleted volumes,
 // so it can never report the very volume being undeleted. An earlier guard asked it anyway (dead code), and the
@@ -92,7 +94,8 @@ vi.mock('../lib/io/luks-recovery-key', async importOriginal => ({
     withEncryptionSlot: withEncryptionSlotMock,
     sealedRecoveryPassphrase: sealedRecoveryPassphraseMock,
     auditRecoveryKey: auditRecoveryKeyMock,
-    assertFleetRecoveryPassphrase: assertFleetRecoveryPassphraseMock
+    assertFleetRecoveryPassphrase: assertFleetRecoveryPassphraseMock,
+    assertPassphraseOpensTheFleet: assertPassphraseOpensTheFleetMock
 }));
 
 // The machine's own view of the rack. A volume's blockPath is a PARTITION (/dev/sde1); this list only ever
@@ -100,6 +103,12 @@ vi.mock('../lib/io/luks-recovery-key', async importOriginal => ({
 vi.mock('../lib/io/device-discovery', async importOriginal => ({
     ...await importOriginal<typeof import('../lib/io/device-discovery')>(),
     listRawBlockDevices: listRawBlockDevicesMock
+}));
+
+// ⚠️ THE DRIVE'S IDENTITY COMES FROM SMART, NOT FROM lsblk. On the real rack lsblk reports the USB BRIDGE's
+// serial: six pairs of disks share one and eight have none at all. It cannot name a piece of metal.
+vi.mock('../lib/io/smart-info', () => ({
+    smartInfoService: { fetch: smartFetchMock }
 }));
 
 vi.mock('../lib/io/device-provisioner', () => ({
@@ -230,6 +239,8 @@ beforeEach(() => {
     // one test would otherwise leak into the next.)
     sealedRecoveryPassphraseMock.mockResolvedValue('correct horse battery staple');
     assertFleetRecoveryPassphraseMock.mockResolvedValue(undefined);
+    assertPassphraseOpensTheFleetMock.mockResolvedValue(undefined);
+    smartFetchMock.mockResolvedValue({ serial_number: 'DRIVE-WD-VOL-15' });
     auditRecoveryKeyMock.mockResolvedValue({
         checkedAt: '2026-07-14T00:00:00.000Z', healthy: true, total: 1,
         opened: [], refused: [], unreadable: [], unidentified: [], notChecked: []
@@ -1636,9 +1647,9 @@ describe('encrypting a volume', () => {
 
         // The rack, as lsblk actually reports it: whole disks, partitions underneath.
         listRawBlockDevicesMock.mockResolvedValue([
-            { name: 'sdd', path: '/dev/sdd', type: 'disk', size: 1, children: [
+            { name: 'sdd', path: '/dev/sdd', type: 'disk', size: 1, serial: 'SERIAL-OTHER', children: [
                 { name: 'sdd1', path: '/dev/sdd1', type: 'part', size: 1, uuid: 'part-uuid-other' }] },
-            { name: 'sde', path: '/dev/sde', type: 'disk', size: 1, children: [
+            { name: 'sde', path: '/dev/sde', type: 'disk', size: 1, serial: 'SERIAL-VOL-15', children: [
                 { name: 'sde1', path: '/dev/sde1', type: 'part', size: 1, uuid: 'part-uuid-15' }] }
         ]);
     });
@@ -1915,7 +1926,7 @@ describe('encrypting a volume', () => {
         // The first request blocks exactly where the old guard had its hole: inside the async disk lookup.
         listRawBlockDevicesMock.mockImplementationOnce(async () => {
             await firstIsInFlight;
-            return [{ name: 'sde', path: '/dev/sde', type: 'disk', size: 1, children: [
+            return [{ name: 'sde', path: '/dev/sde', type: 'disk', size: 1, serial: 'SERIAL-VOL-15', children: [
                 { name: 'sde1', path: '/dev/sde1', type: 'part', size: 1, uuid: 'part-uuid-15' }] }];
         });
 
@@ -1931,6 +1942,32 @@ describe('encrypting a volume', () => {
         expect(deviceProvisionerProvisionMock).toHaveBeenCalledTimes(1);
     });
 
+    // A LOCK THAT IS NOT RELEASED IS A FEATURE THAT NEVER WORKS AGAIN.
+    //
+    // The conversion slot is claimed before the first await, so every way out of the handler -- including the
+    // refusals that fire deep inside, after the lock is held -- has to give it back. Leak it once and every
+    // future conversion answers "another volume is already being converted", forever, until someone restarts a
+    // production array to clear an in-memory flag.
+    it('releases the conversion slot when the conversion FAILS', async () => {
+        deviceProvisionerProvisionMock.mockRejectedValueOnce(new Error('the disk fell out of the rack'));
+
+        await expect(encrypt({})).rejects.toThrow(/fell out of the rack/);
+
+        // ...and the next one is not locked out by the corpse of the last.
+        deviceProvisionerProvisionMock.mockResolvedValue({ id: 15, uuid: 'vol-15-new' });
+        await expect(encrypt({})).resolves.toBeDefined();
+    });
+
+    it('releases the conversion slot when a GUARD refuses, after the lock was taken', async () => {
+        // Refused inside the handler, well past the claim: the disk is not attached.
+        listRawBlockDevicesMock.mockResolvedValueOnce([]);
+
+        await expect(encrypt({})).rejects.toThrow(/no attached disk carries/);
+
+        // The refusal must not have wedged the feature.
+        await expect(encrypt({})).resolves.toBeDefined();
+    });
+
     // ---- WHICH SPINDLE ARE WE ABOUT TO WIPE? ----
     //
     // The provisioner runs `parted` on whatever path it is handed. Hand it the wrong one and you have formatted
@@ -1944,28 +1981,58 @@ describe('encrypting a volume', () => {
                 expect.objectContaining({ blockPath: '/dev/sde', convertVolumeId: 15 }));
         });
 
-        // ⚠️ RESOLVED BY IDENTITY, NOT BY CHOPPING THE '1' OFF THE PATH. These are USB disks: /dev/sde is
-        // whatever the kernel most recently decided to call the thing in that slot. If the partition has moved
-        // to another spindle since the fleet last looked, we follow the UUID -- we do not `parted` the disk that
-        // happens to be sitting on the old name.
-        it('follows the partition uuid when the kernel has renamed the disk', async () => {
+        // ⚠️ THE SCAN AND THE WIPE MUST BE THE SAME PIECE OF METAL. We scan the platter, unmount it, deregister
+        // it -- and only then does the provisioner touch the disk. A dd'd clone plugged in during that handoff
+        // would answer to the same path and the same partition uuid. The SERIAL is the one thing it cannot
+        // forge, so the disk we scanned is named explicitly and every destructive step is held to it.
+        it('tells the provisioner the SERIAL of the disk it scanned, not just the path', async () => {
+            await encrypt({});
+
+            expect(deviceProvisionerProvisionMock).toHaveBeenCalledWith(
+                expect.objectContaining({ blockPath: '/dev/sde', expectDiskSerial: 'DRIVE-WD-VOL-15' }));
+        });
+
+        it('refuses a drive that will not say who it is', async () => {
+            smartFetchMock.mockResolvedValue(null);   // SMART would not answer
+
+            await expect(encrypt({})).rejects.toThrow(/no identity to hold it to while we wipe it/);
+            expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+        });
+
+        // ⚠️ I GOT THIS WRONG THE FIRST TIME. The original version of this test asserted that a renamed disk is
+        // FOLLOWED to its new path -- and that is not safe. If the volume record says /dev/sde1 and the machine
+        // says the partition is at /dev/sdk1, then the fleet has not caught up with reality, and the platter we
+        // scanned for slices is not provably the platter we would wipe. The safe answer to "these two disagree"
+        // is not "pick one".
+        it('REFUSES when the record and the machine disagree about where the partition is', async () => {
             listRawBlockDevicesMock.mockResolvedValue([
-                { name: 'sde', path: '/dev/sde', type: 'disk', size: 1, children: [
-                    { name: 'sde1', path: '/dev/sde1', type: 'part', size: 1, uuid: 'somebody-elses-partition' }] },
-                { name: 'sdk', path: '/dev/sdk', type: 'disk', size: 1, children: [
+                { name: 'sdk', path: '/dev/sdk', type: 'disk', size: 1, serial: 'SERIAL-VOL-15', children: [
                     { name: 'sdk1', path: '/dev/sdk1', type: 'part', size: 1, uuid: 'part-uuid-15' }] }
             ]);
 
-            await encrypt({});
+            await expect(encrypt({})).rejects.toThrow(/kernel has renamed this disk/);
+            expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
+        });
 
-            // The volume still SAYS /dev/sde1. The disk carrying its partition is /dev/sdk. Wipe /dev/sdk.
-            expect(deviceProvisionerProvisionMock).toHaveBeenCalledWith(
-                expect.objectContaining({ blockPath: '/dev/sdk' }));
+        // ⚠️ TWO DISKS ANSWER TO THE SAME PARTITION UUID. A partition uuid is unique only among disks nobody has
+        // cloned -- and a dd'd copy of a STRUBS disk carries the uuid, the identity file and the nameplate too.
+        // `find()` takes whichever lsblk listed first. So we could scan the mounted ORIGINAL, find it empty, and
+        // then wipe the CLONE -- which may be full of recoverable orphans. ORPHANS BEAT PHANTOMS.
+        it('REFUSES when two attached partitions claim the same uuid -- one of them is a clone', async () => {
+            listRawBlockDevicesMock.mockResolvedValue([
+                { name: 'sdx', path: '/dev/sdx', type: 'disk', size: 1, children: [
+                    { name: 'sdx1', path: '/dev/sdx1', type: 'part', size: 1, uuid: 'part-uuid-15' }] },
+                { name: 'sde', path: '/dev/sde', type: 'disk', size: 1, children: [
+                    { name: 'sde1', path: '/dev/sde1', type: 'part', size: 1, uuid: 'part-uuid-15' }] }
+            ]);
+
+            await expect(encrypt({})).rejects.toThrow(/One of them is a clone/);
+            expect(deviceProvisionerProvisionMock).not.toHaveBeenCalled();
         });
 
         it('refuses when no attached disk carries the volume\'s partition', async () => {
             listRawBlockDevicesMock.mockResolvedValue([
-                { name: 'sdd', path: '/dev/sdd', type: 'disk', size: 1, children: [
+                { name: 'sdd', path: '/dev/sdd', type: 'disk', size: 1, serial: 'SERIAL-OTHER', children: [
                     { name: 'sdd1', path: '/dev/sdd1', type: 'part', size: 1, uuid: 'part-uuid-other' }] }
             ]);
 
@@ -2010,6 +2077,28 @@ describe('encrypting a volume', () => {
         it('requires a passphrase', async () => {
             await expect(seal({})).rejects.toThrow(/passphrase is required/);
             expect(assertFleetRecoveryPassphraseMock).not.toHaveBeenCalled();
+        });
+
+        // ⚠️ "USABLE" HAS TO MEAN THE DISKS AGREE. The hash is a note, and a restored database's notes agree
+        // with each other and with nothing in the rack. Recording such a passphrase as the fleet's -- and then
+        // encrypting disks with it -- is the split fleet, arrived at politely.
+        it('refuses to make a passphrase usable if it does not open the disks we have', async () => {
+            assertPassphraseOpensTheFleetMock.mockRejectedValue(
+                new HttpBadRequestError('the recovery passphrase does NOT open volume57 (/dev/sde1)'));
+
+            await expect(seal({ passphrase: 'the one from the old backup' }))
+                .rejects.toThrow(/does NOT open volume/);
+
+            // ⚠️ AND THE HASH WAS NEVER RECORDED. assertFleetRecoveryPassphrase() seals as a side effect, so if
+            // the disk proof does not run FIRST, a passphrase the platters reject still gets written down as the
+            // fleet's -- the request fails but the seal persists. Ordering is the whole fix; pin it.
+            expect(assertFleetRecoveryPassphraseMock).not.toHaveBeenCalled();
+        });
+
+        it('proves the passphrase against a real disk before sealing it', async () => {
+            await seal({ passphrase: 'correct horse battery staple' });
+
+            expect(assertPassphraseOpensTheFleetMock).toHaveBeenCalledWith('correct horse battery staple');
         });
 
         // The passphrase was right and it STILL could not be sealed -- which means the keyfile is gone. Saying

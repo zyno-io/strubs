@@ -29,6 +29,8 @@ import {
     auditRecoveryKey,
     hasRecoveryPassphrase,
     lastRecoveryAudit,
+    assertPassphraseOpensTheFleet,
+    recoveryAuditIsDue,
     sealedRecoveryPassphrase,
     setFleetRecoveryPassphrase,
     withEncryptionSlot,
@@ -64,6 +66,8 @@ const fakeDeps = (opts: {
     absentVolumes?: number[];
     identity?: string | null;
     keyfile?: Buffer | null;
+    encryptedOnRecord?: number[];
+    startupToken?: string | null;
 } = {}) => {
     const store = new Map<string, unknown>();
     let encrypted = opts.encrypted ?? [];
@@ -125,7 +129,15 @@ const fakeDeps = (opts: {
         }),
 
         // The key to every disk in the fleet -- and, therefore, what the sealed passphrase is sealed with.
-        readKeyfile: vi.fn(async () => opts.keyfile === undefined ? Buffer.alloc(512, 7) : opts.keyfile)
+        readKeyfile: vi.fn(async () => opts.keyfile === undefined ? Buffer.alloc(512, 7) : opts.keyfile),
+
+        // What the RUNNING fleet believes is encrypted. Defaults to "the encrypted disks in this fixture",
+        // because a volume whose disk is attached and encrypted is one the fleet has mounted through a mapper.
+        encryptedVolumeIds: () => opts.encryptedOnRecord
+            ?? (opts.encrypted ?? []).map(path => VOLUME_IDS[path] ?? 99),
+
+        // /proc/stat's btime. The MACHINE's boot, not the process's -- a service restart must not move it.
+        mongodStartupToken: vi.fn(async () => opts.startupToken === undefined ? 'mongod-run-1' : opts.startupToken)
     } as any;
 };
 
@@ -672,6 +684,239 @@ describe('the sealed recovery passphrase', () => {
     });
 });
 
+// ---------------------------------------------------------------------------------------------------------
+// THE DATABASE IS A NOTE. THE DISKS ARE THE TRUTH. Make the note prove itself.
+// ---------------------------------------------------------------------------------------------------------
+describe('proving the passphrase against a disk before writing it to another one', () => {
+    const OLD = 'correct horse battery staple';
+    const NEW = 'an entirely different passphrase';
+
+    // ⚠️ THE ONE THIS EXISTS FOR. Rotate OLD -> NEW (every disk rewritten, notes updated), then restore Mongo
+    // from a backup taken BEFORE the rotation. The hash and the seal are rewound TOGETHER, so they agree with
+    // each other perfectly -- every database-only check passes. The platters, meanwhile, want NEW.
+    //
+    // Without this guard the next auto-encrypted disk gets OLD, and the array now has two passphrases and one
+    // safe. Nobody finds out until the OS disk dies.
+    it('REFUSES a passphrase the platters have already moved on from (a restored database)', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'] });
+        db.slotsOf('/dev/sdf1').add(OLD);
+
+        await setFleetRecoveryPassphrase(OLD, undefined, db);
+
+        // THE BACKUP. Mongo's notes, as they were before the rotation. Nothing else is captured -- a database
+        // backup does not, and cannot, back up a LUKS keyslot.
+        const backup = new Map(db.store);
+
+        await setFleetRecoveryPassphrase(NEW, OLD, db);
+        expect(db.slotsOf('/dev/sdf1').has(NEW)).toBe(true);
+        expect(db.slotsOf('/dev/sdf1').has(OLD)).toBe(false);   // the platter has moved on
+
+        // THE RESTORE. The notes are rewound. The disk is NOT: it is the same piece of metal it was a second
+        // ago, and it wants NEW.
+        db.store.clear();
+        for (const [key, value] of backup) db.store.set(key, value);
+
+        // Every database-only check is delighted. The hash and the seal were rewound TOGETHER, so they agree
+        // with each other perfectly -- which is exactly why checking one against the other proves nothing.
+        expect(await sealedRecoveryPassphrase(db)).toBe(OLD);
+
+        // The disk disagrees, and the disk is the thing that has to open on the day the OS disk dies.
+        await expect(assertPassphraseOpensTheFleet(OLD, db)).rejects.toThrow(/does NOT open volume/);
+    });
+
+    it('accepts the passphrase the disks actually carry', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1', '/dev/sdg1'] });
+        ['/dev/sdf1', '/dev/sdg1'].forEach(p => db.slotsOf(p).add(OLD));
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db)).resolves.toBeUndefined();
+    });
+
+    // ⚠️ A PATH IS NOT AN IDENTITY HERE EITHER. The header at the path when we scanned may not be the header at
+    // the path when we test -- these are USB disks, and testPassphrase is argon2-slow. A disk whose LUKS
+    // container uuid no longer matches the one the scan recorded is not allowed to answer for the disk we meant.
+    it('does not let a header that swapped in BEFORE the test answer for the scanned one', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'] });
+        db.slotsOf('/dev/sdf1').add(OLD);
+        db.swapDiskAt('/dev/sdf1');   // the live container uuid no longer matches what the scan saw
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db))
+            .rejects.toThrow(/could not be checked against a single encrypted disk/);
+    });
+
+    // ...and a header that swaps DURING the slow test, and happens to open, must not be accepted either.
+    it('does not accept a header that swapped in DURING the test, even if it opens', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'] });
+        db.slotsOf('/dev/sdf1').add(OLD);
+        db.testPassphrase.mockImplementation(async (path: string) => {
+            db.swapDiskAt(path);      // the disk changes underneath us mid-argon2...
+            return 'opens';           // ...and the impostor happens to open with this passphrase
+        });
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db))
+            .rejects.toThrow(/could not be checked against a single encrypted disk/);
+    });
+
+    // Nothing is encrypted, so no disk can contradict us -- and this is the first encryption, which is exactly
+    // when there is nothing to be inconsistent WITH.
+    it('proceeds when no disk is encrypted yet', async () => {
+        const db = fakeDeps();
+        await expect(assertPassphraseOpensTheFleet(OLD, db)).resolves.toBeUndefined();
+        expect(db.testPassphrase).not.toHaveBeenCalled();
+    });
+
+    // ⚠️ THE FAIL-OPEN I ALMOST SHIPPED, AND ONLY FOUND BY RUNNING IT AGAINST THE REAL ARRAY.
+    //
+    // "No encrypted disk of ours answered" was being read as "nothing is encrypted", so the guard waved the
+    // passphrase through. But an empty scan is also what a rack of unplugged disks looks like, and what an
+    // unreadable nameplate looks like. On the live array this check accepted a passphrase of pure nonsense.
+    //
+    // "Could not tell" is not "it is safe".
+    it('REFUSES when the fleet has encrypted volumes but not one of them is attached', async () => {
+        const db = fakeDeps({ encrypted: [], encryptedOnRecord: [11, 12] });
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db))
+            .rejects.toThrow(/not one of them answered the scan/);
+    });
+
+    it('REFUSES when an attached LUKS container cannot be identified -- it might be one of ours', async () => {
+        const db = fakeDeps({ encrypted: [], unknown: ['/dev/sdz1'], encryptedOnRecord: [] });
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db))
+            .rejects.toThrow(/could not be identified/);
+    });
+
+    // ⚠️ THE BLIND SPOT A REVIEWER HAD TO SHOW ME, AND THE REASON THE FIX ABOVE WAS NOT ENOUGH.
+    //
+    // `volume.isEncrypted` is derived from the volume's fsType -- and markMissing() NULLS fsType when the disk
+    // goes away. So the one signal I was using to notice "we have encrypted disks we cannot see" goes silent
+    // EXACTLY when a disk cannot be seen. An unplugged encrypted volume reports isEncrypted === false, the scan
+    // finds nothing, and the guard concluded "first encryption -- carry on" while a disk in a drawer somewhere
+    // held a passphrase it would never agree with.
+    //
+    // A volume whose disk is not here might be an encrypted one, and there is no way to ask it. Refuse.
+    it('REFUSES while ANY volume is absent -- an unplugged encrypted disk looks just like a plaintext one', async () => {
+        const db = fakeDeps({ encrypted: [], absentVolumes: [12], encryptedOnRecord: [] });
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db))
+            .rejects.toThrow(/are not attached/);
+    });
+
+    // ⚠️ A DISK THAT ANSWERED DOES NOT SPEAK FOR THE ONES THAT DID NOT. This was checked only on the "nothing is
+    // encrypted" branch -- the one case where it matters least. Volume 11 opens; volume 12 is in a drawer with a
+    // passphrase nobody has proven; we were about to encrypt a third disk on volume 11's say-so.
+    it('REFUSES when a disk is absent even though another encrypted disk answers', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'], absentVolumes: [12] });
+        db.slotsOf('/dev/sdf1').add(OLD);
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db)).rejects.toThrow(/are not attached/);
+    });
+
+    it('REFUSES an unidentifiable LUKS container even though another encrypted disk answers', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'], unknown: ['/dev/sdz1'] });
+        db.slotsOf('/dev/sdf1').add(OLD);
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db)).rejects.toThrow(/could not be identified/);
+    });
+
+    // One disk with a rotted header must not veto an encryption when another disk can answer.
+    it('asks another disk when the first will not read', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1', '/dev/sdg1'], unreadableDisks: ['/dev/sdf1'] });
+        db.slotsOf('/dev/sdg1').add(OLD);
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db)).resolves.toBeUndefined();
+    });
+
+    // ⚠️ "COULD NOT TELL" IS NOT "IT IS FINE". Not one disk said no -- but not one said yes, and this check is
+    // the only thing standing between us and a split fleet.
+    it('REFUSES when no encrypted disk could be asked at all', async () => {
+        const db = fakeDeps({
+            encrypted: ['/dev/sdf1', '/dev/sdg1'],
+            unreadableDisks: ['/dev/sdf1', '/dev/sdg1']
+        });
+
+        await expect(assertPassphraseOpensTheFleet(OLD, db))
+            .rejects.toThrow(/could not be checked against a single encrypted disk/);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// AUDITING ITSELF -- because nothing in normal service ever touches the passphrase slot, so a passphrase that
+// has stopped working is invisible until the day the OS disk dies.
+// ---------------------------------------------------------------------------------------------------------
+describe('deciding when to prove the passphrase against the disks, unprompted', () => {
+    const PASS = 'correct horse battery staple';
+
+    const auditedIn = async (db: any, token: string | null, opts: { daysAgo?: number } = {}) => {
+        db.store.set(RECOVERY_AUDIT_KEY, {
+            checkedAt: new Date(Date.now() - (opts.daysAgo ?? 0) * 86_400_000).toISOString(),
+            startupToken: token,
+            total: 1, opened: [], refused: [], unreadable: [], unidentified: [], notChecked: [], healthy: true
+        });
+    };
+
+    it('does not audit when nothing is encrypted -- there is nothing to prove', async () => {
+        expect(await recoveryAuditIsDue(fakeDeps())).toBeNull();
+    });
+
+    it('audits when the fleet has encrypted disks and has NEVER been proven', async () => {
+        expect(await recoveryAuditIsDue(fakeDeps({ encrypted: ['/dev/sdf1'] })))
+            .toBe('it has never been checked');
+    });
+
+    // ⚠️ IT SAYS WHY, AND THE WHY HAS TO BE TRUE. The first version logged "the machine has rebooted since the
+    // last check" for EVERY reason an audit was due -- and the first time it ran on the live array the machine
+    // had not rebooted at all: the previous audit simply predated the field. An operator reading that line would
+    // have gone looking for a reboot that never happened.
+    it('says the REAL reason: an audit with no marker recorded is not a restart', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'], startupToken: 'mongod-run-1' });
+        await auditedIn(db, null);
+
+        expect(await recoveryAuditIsDue(db)).toBe('the last check did not record a database startup marker');
+    });
+
+    // ⚠️ THE DISTINCTION THAT MATTERS. STRUBS restarts on every deploy -- a dozen times on a busy afternoon --
+    // but mongod does not, so the marker is unchanged. Re-auditing on each of those is pure noise.
+    it('does NOT re-audit after a mere service restart: same mongod run', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'], startupToken: 'mongod-run-1' });
+        await auditedIn(db, 'mongod-run-1');
+
+        expect(await recoveryAuditIsDue(db)).toBeNull();
+    });
+
+    // ...but a mongod RESTART is what a database restored from a snapshot looks like -- the notes may have gone
+    // back in time while the platters did not. That is exactly when the passphrase needs re-proving.
+    it('DOES audit when mongod has restarted since the last check (a restore looks like this)', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'], startupToken: 'mongod-run-2' });
+        await auditedIn(db, 'mongod-run-1');
+
+        expect(await recoveryAuditIsDue(db)).toBe('the database has restarted since the last check (a restore looks like this)');
+    });
+
+    it('audits when the last one has gone stale, restart or not', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'], startupToken: 'mongod-run-1' });
+        await auditedIn(db, 'mongod-run-1', { daysAgo: 91 });
+
+        expect(await recoveryAuditIsDue(db)).toBe('the last check was 91 days ago');
+    });
+
+    // "I cannot read the marker" is not "the old audit still stands".
+    it('audits when the startup marker cannot be read at all', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'], startupToken: null });
+        await auditedIn(db, 'mongod-run-1');
+
+        expect(await recoveryAuditIsDue(db)).toBe('we cannot read the database startup marker');
+    });
+
+    it('records which mongod run an audit was taken in', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'], startupToken: 'mongod-run-42' });
+        db.slotsOf('/dev/sdf1').add(PASS);
+
+        await auditRecoveryKey(PASS, db);
+
+        expect((db.store.get(RECOVERY_AUDIT_KEY) as any).startupToken).toBe('mongod-run-42');
+    });
+});
+
 describe('changing the fleet recovery passphrase', () => {
     const OLD = 'the old fleet passphrase';
     const NEW = 'the new fleet passphrase';
@@ -784,6 +1029,25 @@ describe('changing the fleet recovery passphrase', () => {
 
         // Nothing was recorded: the OLD passphrase is still the fleet's, and still opens everything.
         await expect(assertFleetRecoveryPassphrase(OLD, db)).resolves.toBeUndefined();
+    });
+
+    // ⚠️ THE POST-WRITE PROOF NEEDS THE AFTER-BRACKET TOO. We add the new passphrase to sdf1 (fenced), then ask
+    // "did it land?" -- and if the disk swaps DURING that argon2 test to a header that also opens with the new
+    // passphrase, an unbracketed proof would accept the swapped disk's answer for the one we wrote and roll on.
+    it('refuses when a disk swaps during the post-write landing proof', async () => {
+        const db = await fleetOn(['/dev/sdf1', '/dev/sdg1'], OLD);
+
+        db.testPassphrase
+            .mockImplementationOnce(async () => 'rejected')          // sdf1 idempotency: not already on NEW
+            .mockImplementationOnce(async () => {                    // sdf1 landing proof: swaps mid-test
+                db.swapDiskAt('/dev/sdf1');
+                return 'opens';
+            });
+
+        await expect(setFleetRecoveryPassphrase(NEW, OLD, db))
+            .rejects.toThrow(/no longer the disk we scanned/);
+
+        await expect(assertFleetRecoveryPassphrase(OLD, db)).resolves.toBeUndefined();  // OLD still the fleet's
     });
 
     it('requires the current passphrase to change it', async () => {
@@ -934,6 +1198,22 @@ describe('finding the encrypted disks on the platters', () => {
 // was ABSENT when the passphrase was rotated, and came back afterwards. Nothing else will ever notice, because
 // STRUBS mounts with the keyfile and never touches that slot.
 // ---------------------------------------------------------------------------------------------------------
+describe('the recovery passphrase audit does not trust a swapped header', () => {
+    const PASS = 'correct horse battery staple';
+
+    it('counts a disk whose header swapped DURING the test as unreadable, not opened', async () => {
+        const db = fakeDeps({ encrypted: ['/dev/sdf1'] });
+        db.slotsOf('/dev/sdf1').add(PASS);
+        db.testPassphrase.mockImplementation(async (path: string) => {
+            db.swapDiskAt(path);      // the header changes underneath the argon2 test...
+            return 'opens';           // ...and the impostor opens
+        });
+
+        await expect(auditRecoveryKey(PASS, db))
+            .rejects.toThrow(/could not be tested/);   // not one disk honestly answered -> not "healthy"
+    });
+});
+
 describe('the recovery passphrase audit', () => {
     const PASS = 'the fleet recovery passphrase';
 

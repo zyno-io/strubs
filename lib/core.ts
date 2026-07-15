@@ -1,6 +1,11 @@
 import { promises as fs } from 'fs';
 
 import { config } from './config';
+import {
+    auditRecoveryKey,
+    recoveryAuditIsDue,
+    sealedRecoveryPassphrase
+} from './io/luks-recovery-key';
 import { database } from './database';
 import { ioManager } from './io/manager';
 import { serverManager } from './server/manager';
@@ -46,6 +51,8 @@ const defaultDeps: CoreDependencies = {
     volumeSmartMonitor
 };
 
+const RECOVERY_AUDIT_DELAY_MS = 5 * 60 * 1000;
+
 export class Core {
     private readonly deps: CoreDependencies;
     private startPromise: Promise<void> | null = null;
@@ -58,6 +65,58 @@ export class Core {
 
     // Best-effort and never fatal: an array with no encrypted disks and no keyfile is just an array that has
     // never used encryption, and it must start regardless. What must NOT happen quietly is the other case.
+// PROVE THE RECOVERY PASSPHRASE AGAINST THE PLATTERS -- BY ITSELF, AFTER A REBOOT.
+    //
+    // The passphrase is the only thing that opens these disks if the OS disk dies, and NOTHING in normal service
+    // ever touches it: STRUBS unlocks with the keyfile. So a passphrase that has stopped opening a disk is
+    // invisible, indefinitely, until the day you need it. It has to be checked by something that is not a human
+    // remembering to click a button.
+    //
+    // WHEN mongod RESTARTS, NOT WHEN WE DO. STRUBS bounces on every deploy and every crash; mongod does not, and
+    // the rack does not move with it. A mongod restart, on the other hand, is what a database restored from a
+    // snapshot looks like -- and a restore is exactly the moment an audit needs to catch: the notes are
+    // confident, coherent, and possibly wrong about which passphrase the platters carry. (recoveryAuditIsDue()
+    // compares local.startup_log's marker with the one the last audit was taken in.)
+    //
+    // Delayed, because the fleet has to finish mounting first and the audit costs ~4s per encrypted disk -- and
+    // never fatal: an audit that cannot run must not stop an array from serving.
+    private scheduleRecoveryAudit(): void {
+        setTimeout(async () => {
+            try {
+                const why = await recoveryAuditIsDue();
+
+                if (!why)
+                    return;
+
+                const passphrase = await sealedRecoveryPassphrase();
+
+                if (!passphrase) {
+                    log('the recovery passphrase is due to be proven against the disks, but STRUBS cannot '
+                        + 'produce it (no sealed copy). Set it once on the Encryption tab.');
+                    return;
+                }
+
+                log('proving the recovery passphrase against the disks (%s)...', why);
+
+                const audit = await auditRecoveryKey(passphrase);
+
+                if (!audit.healthy)
+                    void notificationService.notify({
+                        severity: 'critical',
+                        title: 'THE RECOVERY PASSPHRASE DOES NOT OPEN EVERY ENCRYPTED DISK',
+                        body: `${audit.refused.length} disk(s) refused it, ${audit.unreadable.length} could not `
+                            + `be read, and ${audit.notChecked.length} were not attached. If the OS disk dies, `
+                            + `those disks are lost with it. Set the recovery passphrase again with every disk `
+                            + `attached to rewrite it onto all of them.`
+                    });
+            }
+            catch (err) {
+                log.error('the boot-time recovery-passphrase audit failed: %s',
+                    err instanceof Error ? err.message : String(err));
+            }
+        }, RECOVERY_AUDIT_DELAY_MS).unref();
+    }
+
     private async ensureLuksKeyfile(): Promise<void> {
         try {
             const result = await ensureKeyfile();
@@ -101,6 +160,7 @@ export class Core {
             // an array whose key has been lost. See luks.ensureKeyfile(): a fresh key opens none of those disks,
             // and generating one would leave a system that looks healthy and cannot read a byte.
             await this.ensureLuksKeyfile();
+            this.scheduleRecoveryAudit();
 
             // No instance identity => this host cannot verify a single disk. Starting the fleet would
             // reject every volume ("not from this STRUBS instance"), and starting the object API would

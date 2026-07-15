@@ -232,6 +232,11 @@ export type RecoveryKeyDeps = {
     containerUuid: typeof containerUuid;
 
     readKeyfile: typeof readKeyfile;
+    mongodStartupToken: () => Promise<string | null>;
+
+    // Which volumes the fleet believes are encrypted, from the volumes it actually MOUNTED (a mapper is a fact,
+    // not a flag). Used only to refuse when we cannot see any of them -- never to decide that we can.
+    encryptedVolumeIds: () => number[];
 };
 
 export type FleetScan = {
@@ -248,7 +253,11 @@ const defaultDeps: RecoveryKeyDeps = {
     removePassphrase,
     testPassphrase,
     containerUuid,
-    readKeyfile
+    readKeyfile,
+    mongodStartupToken: () => database.mongodStartupToken(),
+    encryptedVolumeIds: () => ioManager.getVolumeEntries()
+        .filter(([, volume]) => volume.isEncrypted && !volume.isDeleted)
+        .map(([id]) => id)
 };
 
 // IS THIS ONE VOLUME'S DISK IN THE MACHINE? -- asked directly, about a volume that may be soft-deleted.
@@ -712,7 +721,13 @@ async function rotate(
 
         // Prove it took, on this disk, before moving on. `luksAddKey` returning success is not the same thing as
         // the passphrase opening the header, and the difference matters on the one key that has no undo.
-        if (await deps.testPassphrase(disk.path, next) !== 'opens')
+        const landed = await deps.testPassphrase(disk.path, next);
+
+        // ...AND AFTER the argon2 test: a header that swapped in during it could answer 'opens' for a disk we
+        // never wrote. Without this, a silently-failed write to the real disk would be masked by an impostor.
+        await assertStillTheSameDisk(disk);
+
+        if (landed !== 'opens')
             throw new HttpBadRequestError(
                 `the new passphrase was written to volume ${disk.volumeId} (${disk.path}) but does not open it. `
                 + `Stopping here. The OLD passphrase still opens every disk in this fleet and nothing has been `
@@ -761,7 +776,13 @@ async function rotate(
             // The same-passphrase guard should make this impossible. But "should" is not a word that belongs
             // anywhere near the only key that opens 130TB: if the disk no longer takes the new passphrase, the
             // removal took the wrong slot. Stop, loudly, while the rest of the fleet still has both keys.
-            if (await deps.testPassphrase(disk.path, next) !== 'opens')
+            const stillOpens = await deps.testPassphrase(disk.path, next);
+
+            // ...AND AFTER: same reason as the add loop. An impostor that opens `next` must not answer for this
+            // disk and let the retire loop roll on having "confirmed" a disk it never checked.
+            await assertStillTheSameDisk(disk);
+
+            if (stillOpens !== 'opens')
                 throw new HttpBadRequestError(
                     `volume ${disk.volumeId} (${disk.path}) no longer opens with the new recovery passphrase after `
                     + `retiring the old one. Its keyslots are not what we think they are. STOP: no further keyslots `
@@ -789,6 +810,13 @@ async function rotate(
 // ---------------------------------------------------------------------------------------------------------
 export type RecoveryAudit = {
     checkedAt: string;
+
+    // WHICH RUN OF mongod THIS AUDIT BELONGS TO (local.startup_log). An audit proves the fleet as it was
+    // ATTACHED at the time, and the event most likely to change what is attached -- disks swapped, bays
+    // shuffled, the database restored from a snapshot -- shows up as a mongod restart. So the audit carries the
+    // mongod run it was taken in, and a new run makes it due again. Our own Node service restarts (a dozen times
+    // on a busy afternoon) do NOT restart mongod, so they do not needlessly re-arm it.
+    startupToken: string | null;
     total: number;
     opened: EncryptedDisk[];
     refused: EncryptedDisk[];      // ⚠️ does not open. Almost certainly missed a rotation.
@@ -797,6 +825,154 @@ export type RecoveryAudit = {
     notChecked: number[];          // ⚠️ volumes whose disks are not attached: NOT asked, and the likeliest to be wrong
     healthy: boolean;
 };
+
+// ---------------------------------------------------------------------------------------------------------
+// MAKE THE NOTE PROVE ITSELF AGAINST A PLATTER, BEFORE WE WRITE IT ONTO A DISK.
+//
+// Everything else in this file trusts the database to know what the fleet's passphrase is. That is fine right
+// up until the database is RESTORED and the disks are not.
+//
+// Rotate hunter2 -> swordfish: every disk's keyslot is rewritten, and the note in Mongo is updated. Two weeks
+// later the OS disk is restored from a backup older than that rotation. Mongo goes back in time; the platters
+// do not. The note now says hunter2 and every disk wants swordfish -- and NOTHING NOTICES, because STRUBS mounts
+// with the keyfile and never asks a disk about the passphrase in normal service. Then `encryptNewVolumes` fires
+// on the next disk added, reads the note, and writes hunter2 onto it. One array, two passphrases, and only one
+// of them written down. You find out the day the OS disk dies and swordfish opens twenty-nine disks out of
+// thirty -- which, in a 4+2 array, is the day you lose data.
+//
+// The hash check cannot see this. The hash and the seal are BOTH notes, and a restore rewinds them together,
+// consistently: checking one against the other is checking a photocopy against its original.
+//
+// So ask a disk. One disk, already encrypted, actually in the rack: does this passphrase open you? Three
+// seconds, once per encryption -- not per disk. If the answer is no, the note is stale and we refuse rather
+// than split the fleet. If nothing is encrypted yet there is nothing to disagree with, and we proceed.
+//
+// A false refusal here (we tested the one disk that missed a rotation) costs an operator an audit. A false
+// ACCEPTANCE costs them the array. It fails closed.
+// ⚠️ "I CANNOT SEE AN ENCRYPTED DISK" IS NOT "THERE ARE NONE", AND THE DIFFERENCE IS THE WHOLE GUARD.
+//
+// An empty scan has two very different causes. It might genuinely be the first encryption this array has ever
+// done -- nothing can contradict us, get on with it. Or we might simply have FAILED TO SEE the encrypted disks:
+// a nameplate that would not read, a USB hub mid-flap, an array whose encrypted disks are all unplugged.
+//
+// The nastiest version of that, and the one a reviewer had to point out to me: `volume.isEncrypted` is derived
+// from the volume's fsType, and `markMissing()` NULLS fsType when a disk goes away. So an unplugged encrypted
+// volume reports isEncrypted === false. The one signal I was using to notice "we have encrypted disks we cannot
+// see" goes silent EXACTLY when a disk cannot be seen. It agreed with me instead of with the rack.
+//
+// So "nothing to disagree with" has to be PROVEN, three ways, and every one of them fails closed.
+async function assertNothingUnaskableIsAttached(
+    deps: RecoveryKeyDeps, unknown: string[], absent: number[]
+): Promise<void> {
+    if (unknown.length)
+        throw new HttpBadRequestError(
+            `refusing to encrypt: ${unknown.length} attached LUKS container(s) (${unknown.join(', ')}) could not `
+            + `be identified, so we cannot prove the recovery passphrase opens them. If they are ours, encrypting `
+            + `another disk could split the fleet. Identify or detach them and try again.`
+        );
+
+    // A VOLUME WHOSE DISK IS NOT HERE MIGHT BE AN ENCRYPTED ONE, and we have no way to ask it. This is the same
+    // rule the passphrase ROTATION already lives by, for the same reason: the disks we cannot reach are exactly
+    // the ones a stale passphrase strands, and nothing in normal service would ever tell us.
+    if (absent.length)
+        throw new HttpBadRequestError(
+            `refusing to encrypt: volume(s) ${absent.join(', ')} are not attached. We cannot prove they are not `
+            + `encrypted -- an unplugged encrypted disk looks exactly like an unplugged plaintext one -- so we `
+            + `cannot prove the recovery passphrase we are about to write is the one they carry.\n\n`
+            + `Attach them and try again. If a disk is gone for good, DELETE the volume `
+            + `(DELETE /$/volumes/{id}) -- a retired volume is excluded from this check, and leaving a dead one `
+            + `merely "disabled" would block every encryption on this array forever.`
+        );
+}
+
+// ...and if the scan found NOTHING of ours, the fleet's own record of what it mounted gets the last word. (It
+// is not enough on its own -- markMissing() nulls the fsType this is derived from -- which is why the absent
+// check above runs first and unconditionally.)
+async function assertNoEncryptedVolumesOnRecord(deps: RecoveryKeyDeps): Promise<void> {
+    const encryptedOnRecord = deps.encryptedVolumeIds();
+
+    if (encryptedOnRecord.length)
+        throw new HttpBadRequestError(
+            `refusing to encrypt: this fleet has ${encryptedOnRecord.length} encrypted volume(s) `
+            + `(${encryptedOnRecord.join(', ')}) and not one of them answered the scan. The recovery passphrase `
+            + `cannot be proven against a single platter.`
+        );
+}
+
+export async function assertPassphraseOpensTheFleet(
+    passphrase: string, overrides: Partial<RecoveryKeyDeps> = {}
+): Promise<void> {
+    const deps = { ...defaultDeps, ...overrides };
+    const { ours, unknown, absent } = await deps.scanFleet();
+
+    // ⚠️ A DISK THAT ANSWERED DOES NOT SPEAK FOR THE ONES THAT DID NOT.
+    //
+    // The unplugged volume in the drawer, and the LUKS container we cannot identify, are outside this proof
+    // whether or not some OTHER disk happens to open. Proving the passphrase against the disks we can see, while
+    // an encrypted disk we cannot see may carry a different one, is the split fleet with extra steps. This used
+    // to be checked only on the "nothing is encrypted" branch, which is the one case where it matters least.
+    await assertNothingUnaskableIsAttached(deps, unknown, absent);
+
+    if (!ours.length) {
+        await assertNoEncryptedVolumesOnRecord(deps);
+        return;                                     // genuinely the first encryption
+    }
+
+    const unreadable: string[] = [];
+
+    // ⚠️ A PATH IS NOT AN IDENTITY HERE EITHER. `testPassphrase` is argon2 -- seconds -- during which a USB disk
+    // can drop and ANOTHER of our headers take its path. If that replacement happens to open with this
+    // passphrase, we would accept it as the fleet's on the strength of a disk we were not asked about, and then
+    // write it onto a new one. Rotation already brackets its slow key operations with the container uuid; the
+    // proof has to as well. The uuid is the identity of the HEADER, read live from whatever is at the path now.
+    const stillTheScannedHeader = async (disk: EncryptedDisk): Promise<boolean> =>
+        Boolean(disk.luksUuid) && await deps.containerUuid(disk.path) === disk.luksUuid;
+
+    for (const disk of ours) {
+        // BEFORE the slow test: is the header at this path the one the scan recorded?
+        if (!await stillTheScannedHeader(disk)) {
+            unreadable.push(disk.path);     // not "it opened" and not "it refused" -- we could not honestly ask
+            continue;
+        }
+
+        const verdict = await deps.testPassphrase(disk.path, passphrase);
+
+        // ...AND AFTER: a disk that swapped in during the test cannot be allowed to answer for the one we meant.
+        if (!await stillTheScannedHeader(disk)) {
+            unreadable.push(disk.path);
+            continue;
+        }
+
+        if (verdict === 'opens')
+            return;
+
+        if (verdict === 'unreadable') {
+            unreadable.push(disk.path);
+            continue;                       // a disk that would not answer has not said no
+        }
+
+        // REJECTED. An encrypted disk of ours does not open with the passphrase we were about to write onto a
+        // new one. Whatever the cause -- a restored database, a hand-edited keyslot -- the note and the platters
+        // disagree, and the platters are what a recovery will have to open.
+        throw new HttpBadRequestError(
+            `refusing to encrypt: the recovery passphrase this array has on record does NOT open volume`
+            + `${disk.volumeId} (${disk.path}), which is already encrypted. Encrypting another disk with it `
+            + `would leave you holding a passphrase that opens some of your disks and not others -- and nothing `
+            + `in normal service would ever tell you, because STRUBS unlocks with the keyfile.\n\n`
+            + `This is what a database restored from an older backup than the disks looks like. Run the `
+            + `encryption audit (POST /$/encryption/audit) to see the whole fleet, then set the recovery `
+            + `passphrase again -- with every disk attached -- to bring them back into agreement.`
+        );
+    }
+
+    // EVERY encrypted disk refused to answer. Not one of them said no -- but not one said yes either, and this
+    // is the check standing between us and a split fleet. "Could not tell" is not "it is fine".
+    throw new HttpBadRequestError(
+        `refusing to encrypt: the recovery passphrase could not be checked against a single encrypted disk `
+        + `(${unreadable.join(', ')} would not read their LUKS headers). We will not write a passphrase onto a `
+        + `new disk that we cannot prove opens the disks we already have.`
+    );
+}
 
 export async function auditRecoveryKey(
     passphrase: string, overrides: Partial<RecoveryKeyDeps> = {}
@@ -813,8 +989,20 @@ export async function auditRecoveryKey(
     const refused: EncryptedDisk[] = [];
     const unreadable: EncryptedDisk[] = [];
 
+    // ⚠️ A PATH IS NOT AN IDENTITY. The header at disk.path when we scanned may not be the header there when we
+    // test -- USB disks flap, and testPassphrase is argon2-slow. A header that is not the one the scan recorded
+    // (checked by its container uuid, before AND after the test) is counted as UNREADABLE, never as an answer:
+    // it must not let a disk that swapped in vouch for -- or against -- the one we meant.
+    const headerUnchanged = async (disk: EncryptedDisk): Promise<boolean> =>
+        Boolean(disk.luksUuid) && await deps.containerUuid(disk.path) === disk.luksUuid;
+
     for (const disk of ours) {
+        if (!await headerUnchanged(disk)) { unreadable.push(disk); continue; }
+
         const verdict = await deps.testPassphrase(disk.path, passphrase);
+
+        if (!await headerUnchanged(disk)) { unreadable.push(disk); continue; }
+
         if (verdict === 'opens') opened.push(disk);
         else if (verdict === 'rejected') refused.push(disk);
         else unreadable.push(disk);
@@ -861,6 +1049,7 @@ export async function auditRecoveryKey(
 
     const audit: RecoveryAudit = {
         checkedAt: new Date().toISOString(),
+        startupToken: await deps.mongodStartupToken(),
         total: ours.length,
         opened,
         refused,
@@ -875,6 +1064,53 @@ export async function auditRecoveryKey(
 
 
     return audit;
+}
+
+// HOW OLD IS TOO OLD. The UI has warned at 90 days since DR-G; this is the same line, now enforced.
+export const AUDIT_STALE_DAYS = 90;
+
+const auditAgeDays = (audit: RecoveryAudit): number =>
+    Math.floor((Date.now() - new Date(audit.checkedAt).getTime()) / 86_400_000);
+
+// SHOULD WE AUDIT, UNPROMPTED, RIGHT NOW?
+//
+// Yes if we have never audited, yes if the audit has gone stale, and yes if THE MACHINE HAS REBOOTED since the
+// last one -- because a reboot is when the rack changes underneath us, and it is very often what an operator
+// does immediately after restoring the OS disk from a backup. That last case is the one that matters: the
+// restored database is confident, coherent, and wrong, and this audit is what asks the platters.
+//
+// NOT on a mere service restart. STRUBS bounces on every deploy; the disks do not move.
+// Returns WHY, not just whether -- because the caller logs it, and a log line that states a reason it never
+// checked is a lie an operator will act on. (The first version of this said "the machine has rebooted since the
+// last check" whenever an audit was due, and the very first time it fired on the live array the machine had not
+// rebooted at all: the old audit simply predated the field.)
+export async function recoveryAuditIsDue(overrides: Partial<RecoveryKeyDeps> = {}): Promise<string | null> {
+    const deps = { ...defaultDeps, ...overrides };
+
+    // Nothing encrypted: nothing to prove, and nothing an audit could say.
+    if (!deps.encryptedVolumeIds().length)
+        return null;
+
+    const audit = await lastRecoveryAudit(overrides);
+    if (!audit)
+        return 'it has never been checked';
+
+    if (auditAgeDays(audit) >= AUDIT_STALE_DAYS)
+        return `the last check was ${auditAgeDays(audit)} days ago`;
+
+    const token = await deps.mongodStartupToken();
+
+    // We cannot tell which mongod run we are in. Do not claim the old audit still stands.
+    if (token === null)
+        return 'we cannot read the database startup marker';
+
+    if (audit.startupToken == null)
+        return 'the last check did not record a database startup marker';
+
+    if (token !== audit.startupToken)
+        return 'the database has restarted since the last check (a restore looks like this)';
+
+    return null;
 }
 
 export async function lastRecoveryAudit(

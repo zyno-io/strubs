@@ -5,6 +5,12 @@ import { DeviceProvisioner } from '../lib/io/device-provisioner';
 
 const createDeps = () => {
     const listRawBlockDevices = vi.fn();
+
+    // WHO IS AT THIS PATH RIGHT NOW -- the DRIVE's own SMART serial, not the USB bridge's (on the real rack the
+    // bridge serial repeats across bays and is blank on eight disks). The truthful default is "the same drive we
+    // were looking at". The tests that matter make it answer otherwise: a drive that vanished, or a DIFFERENT
+    // drive that took the path while we were busy.
+    const currentDiskIdentity = vi.fn(async (_path: string): Promise<string | null> => 'DRIVE-WD-0001');
     // ⚠️ A FAKE DATABASE THAT CANNOT LIE ABOUT DELETION.
     //
     // getVolumes() used to be a fixed mockResolvedValue and deleteVolume() a no-op, so the fake happily served
@@ -39,7 +45,10 @@ const createDeps = () => {
         // The nameplate is LOAD-BEARING on an encrypted volume: it is how a locked disk says it is ours, and
         // the fleet-passphrase guard enumerates encrypted disks by it. So the provisioner reads it back.
         nameplateIsPresent: vi.fn().mockResolvedValue(true),
-        mapperPath: vi.fn().mockImplementation((uuid: string) => `/dev/mapper/strubs-${uuid}`)
+        mapperPath: vi.fn().mockImplementation((uuid: string) => `/dev/mapper/strubs-${uuid}`),
+        // The mapper's backing device, by default the partition we opened -- backed by the disk we meant.
+        mapperBackingDevice: vi.fn().mockResolvedValue('sdb1'),
+        close: vi.fn().mockResolvedValue(undefined)
     };
     const assertFleetRecoveryPassphrase = vi.fn().mockResolvedValue(undefined);
 
@@ -48,6 +57,13 @@ const createDeps = () => {
     const sealedRecoveryPassphrase = vi.fn<() => Promise<string | null>>()
         .mockResolvedValue('correct horse battery staple');
     const hasRecoveryPassphrase = vi.fn<() => Promise<boolean>>().mockResolvedValue(true);
+
+    // Does this passphrase actually open a disk we already encrypted? The database can be restored to before a
+    // rotation; the platters cannot. Default: the disks agree with the notes.
+    const assertPassphraseOpensTheFleet = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+
+    // The whole fleet, recently proven to open with the passphrase we hold. The one-disk proof above asks
+    // whichever platter lsblk listed first; this is the one that asked them all.
     // The gate that stops a passphrase rotation running through the middle of an encrypted provision.
     const withEncryptionSlot = vi.fn(async (fn: () => Promise<unknown>) => fn());
     const spawnHelper = vi.fn().mockResolvedValue({ code: 0, stdout: '' });
@@ -59,7 +75,7 @@ const createDeps = () => {
     // characters. Testing with a tidy 16-hex string is what let the nameplate ship unparseable by its own
     // reader: the test agreed with the code, and both were wrong about the machine.
     const instanceIdentity = vi.fn().mockReturnValue('2fb05f23-1d5e-4c00-bb71-f3109b42476c');
-    return { listRawBlockDevices, database, ioManager, luks, spawnHelper, sleepSecs, probeDeviceForStrubsIdentity, instanceIdentity, assertFleetRecoveryPassphrase, sealedRecoveryPassphrase, hasRecoveryPassphrase, withEncryptionSlot };
+    return { listRawBlockDevices, currentDiskIdentity, database, ioManager, luks, spawnHelper, sleepSecs, probeDeviceForStrubsIdentity, instanceIdentity, assertFleetRecoveryPassphrase, assertPassphraseOpensTheFleet, sealedRecoveryPassphrase, hasRecoveryPassphrase, withEncryptionSlot };
 };
 
 const baseDevice: RawBlockDevice = {
@@ -220,6 +236,205 @@ describe('DeviceProvisioner', () => {
 
         expect(result.partition_uuid).toBe('PART-UUID');
         expect(deps.spawnHelper).toHaveBeenCalledWith('parted', ['-s', '/dev/sdb', 'mklabel', 'gpt']);
+    });
+
+    // ⚠️ EACH DESTRUCTIVE STEP HAS ITS OWN SWAP WINDOW, and each is pinned by asserting the SPECIFIC command it
+    // guards never ran. Delete the guard and that command executes on a disk that changed underneath us -- which
+    // is exactly what these assertions catch. (currentDiskIdentity returns the disk we meant on the establish
+    // call, then the impostor on the guarded check.)
+    describe('a disk that swaps at each destructive window', () => {
+        const wipeableDisk: RawBlockDevice = {
+            ...baseDevice,
+            children: [{ type: 'part', name: 'sdb1', size: 1024, uuid: 'OLD-UUID', fstype: 'ext4', mountpoint: null }]
+        };
+
+        // ⚠️ THE SAFETY PROBE IS ONLY TRUSTWORTHY IF IT EXAMINES THE DISK WE ANCHORED. If a blank disk is
+        // snapshotted at /dev/sdb and a PARTITIONED STRUBS disk takes the path before we probe, the probe --
+        // reading a stale empty `children` and then a live whole-disk GPT signature -- could call the swapped-in
+        // disk "clean" and we would repartition live data. So the identity is anchored FIRST, the rack is listed
+        // AFTER, and the probe is bracketed by serial checks. Pin the ordering: anchor before probe.
+        it('anchors the disk identity BEFORE running the safety probe, and lists the rack after', async () => {
+            deps.listRawBlockDevices.mockResolvedValue([baseDevice]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({ status: 'clean' });
+
+            const provisioner = new DeviceProvisioner(deps);
+            // The anchor, list and probe all happen early; we do not need the provision to run to completion.
+            await provisioner.provision({ blockPath: '/dev/sdb' }).catch(() => undefined);
+
+            const anchoredAt = deps.currentDiskIdentity.mock.invocationCallOrder[0];
+            const probedAt = deps.probeDeviceForStrubsIdentity.mock.invocationCallOrder[0];
+            const listedAt = deps.listRawBlockDevices.mock.invocationCallOrder[0];
+
+            expect(anchoredAt).toBeLessThan(probedAt);   // identity established before we trust a read of the disk
+            expect(anchoredAt).toBeLessThan(listedAt);    // ...and before the snapshot the probe examines
+        });
+
+        // ...and if the disk changes between the anchor and the probe reading it, refuse before any parted.
+        it('REFUSES when the disk changes across the safety probe', async () => {
+            deps.listRawBlockDevices.mockResolvedValue([baseDevice]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({ status: 'clean' });
+            deps.currentDiskIdentity
+                .mockResolvedValueOnce('DRIVE-WD-0001')       // anchor
+                .mockResolvedValue('SWAPPED-DURING-PROBE');   // the bracket check refuses
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb' }))
+                .rejects.toThrow(/DIFFERENT PHYSICAL DISK/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith(
+                'parted', ['-s', '/dev/sdb', 'mkpart', 'primary', 'ext4', '0%', '100%']);
+        });
+
+        // Window 1: between establishing identity and `parted mklabel` (the wipe). Delete the guard and the
+        // partition table of a swapped-in disk is destroyed.
+        it('REFUSES before wiping the partition table', async () => {
+            deps.listRawBlockDevices
+                .mockResolvedValueOnce([wipeableDisk])
+                .mockResolvedValueOnce([baseDevice])
+                .mockResolvedValueOnce([deviceWithPartition(null)])
+                .mockResolvedValueOnce([deviceWithPartition('PART-UUID')]);
+            deps.currentDiskIdentity
+                .mockResolvedValueOnce('DRIVE-WD-0001')       // establish
+                .mockResolvedValue('SWAPPED-IN-IMPOSTOR');    // the pre-wipe check, and everything after
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', wipe: true }))
+                .rejects.toThrow(/DIFFERENT PHYSICAL DISK/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('parted', ['-s', '/dev/sdb', 'mklabel', 'gpt']);
+        });
+
+        // Window 2: between establishing identity and `parted mkpart` (the new partition table). Non-wipe path.
+        it('REFUSES before writing a new partition table', async () => {
+            deps.listRawBlockDevices.mockResolvedValue([baseDevice]);
+            deps.currentDiskIdentity
+                .mockResolvedValueOnce('DRIVE-WD-0001')       // establish
+                .mockResolvedValue('SWAPPED-IN-IMPOSTOR');    // the pre-partition check
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb' }))
+                .rejects.toThrow(/DIFFERENT PHYSICAL DISK/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith(
+                'parted', ['-s', '/dev/sdb', 'mkpart', 'primary', 'ext4', '0%', '100%']);
+        });
+
+        // Window 3: AFTER `parted` created the partition, BEFORE `mkfs` (plaintext). This is the window
+        // waitForPartition() opens: parted ran, we slept, we re-enumerated, and the disk could have changed.
+        it('REFUSES before mkfs, after the partition was created', async () => {
+            deps.listRawBlockDevices
+                .mockResolvedValueOnce([baseDevice])
+                .mockResolvedValueOnce([deviceWithPartition(null)])
+                .mockResolvedValueOnce([deviceWithPartition('PART-UUID')]);
+            deps.currentDiskIdentity
+                .mockResolvedValueOnce('DRIVE-WD-0001')       // establish
+                .mockResolvedValueOnce('DRIVE-WD-0001')       // pre-partition: still ours
+                .mockResolvedValue('SWAPPED-IN-IMPOSTOR');    // ...gone by the pre-mkfs check
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb' }))
+                .rejects.toThrow(/DIFFERENT PHYSICAL DISK/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('mkfs.ext4', ['-F', '/dev/sdb1']);
+        });
+
+        // ⚠️ THE FENCES ON INDIVIDUAL WRITES, driven by the PRECEDING write's execution -- not by call counting,
+        // so deleting the fence genuinely lets the command through. The disk is itself until the earlier command
+        // runs, then swaps; the fence on the next command must catch it.
+
+        // parted mkpart is a SEPARATE write from parted mklabel. Swap after mklabel; mkpart must refuse.
+        it('REFUSES parted mkpart when the disk swaps after mklabel', async () => {
+            deps.listRawBlockDevices.mockResolvedValue([baseDevice]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({ status: 'clean' });
+            deps.spawnHelper.mockImplementation(async (cmd: string, args: string[]) => {
+                if (cmd === 'parted' && args.includes('mklabel'))
+                    deps.currentDiskIdentity.mockResolvedValue('SWAPPED-AFTER-MKLABEL');
+                return { code: 0, stdout: '' };
+            });
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb' })).rejects.toThrow(/DIFFERENT PHYSICAL DISK/);
+
+            expect(deps.spawnHelper).toHaveBeenCalledWith('parted', ['-s', '/dev/sdb', 'mklabel', 'gpt']);
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith(
+                'parted', ['-s', '/dev/sdb', 'mkpart', 'primary', 'ext4', '0%', '100%']);
+        });
+
+        // The fresh-header proof (testPassphrase on the just-created header) is the base case of the whole
+        // single-disk argument, so it is fenced too. Swap after luksFormat; the proof must refuse.
+        it('REFUSES the fresh-header proof when the disk swaps after luksFormat', async () => {
+            deps.listRawBlockDevices
+                .mockResolvedValueOnce([baseDevice])
+                .mockResolvedValue([deviceWithPartition(null)]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({ status: 'clean' });
+            // addPassphrase is fenced and runs; the swap lands just after, before the proof.
+            deps.luks.addPassphrase.mockImplementation(async () => {
+                deps.currentDiskIdentity.mockResolvedValue('SWAPPED-BEFORE-PROOF');
+            });
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true }))
+                .rejects.toThrow(/DIFFERENT PHYSICAL DISK/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('mkfs.ext4', expect.anything());
+        });
+
+        // luks.addPassphrase is a SEPARATE write from luks.format. Swap after the LUKS header is written; the
+        // keyslot write must refuse rather than authenticate with the keyfile against another of our disks.
+        it('REFUSES the keyslot write when the disk swaps after luksFormat', async () => {
+            deps.listRawBlockDevices
+                .mockResolvedValueOnce([baseDevice])
+                .mockResolvedValue([deviceWithPartition(null)]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({ status: 'clean' });
+            deps.luks.format.mockImplementation(async () => {
+                deps.currentDiskIdentity.mockResolvedValue('SWAPPED-AFTER-LUKSFORMAT');
+            });
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true }))
+                .rejects.toThrow(/DIFFERENT PHYSICAL DISK/);
+
+            expect(deps.luks.format).toHaveBeenCalled();
+            expect(deps.luks.addPassphrase).not.toHaveBeenCalled();
+        });
+
+        // mkfs is a SEPARATE write again. Swap after mkpart; mkfs must refuse (plaintext).
+        it('REFUSES mkfs when the disk swaps after the partition is created', async () => {
+            deps.listRawBlockDevices
+                .mockResolvedValueOnce([baseDevice])
+                .mockResolvedValue([deviceWithPartition('PART-UUID')]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({ status: 'clean' });
+            deps.spawnHelper.mockImplementation(async (cmd: string, args: string[]) => {
+                if (cmd === 'parted' && args.includes('mkpart'))
+                    deps.currentDiskIdentity.mockResolvedValue('SWAPPED-AFTER-MKPART');
+                return { code: 0, stdout: '' };
+            });
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb' })).rejects.toThrow(/DIFFERENT PHYSICAL DISK/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('mkfs.ext4', ['-F', '/dev/sdb1']);
+        });
+
+        // ⚠️ THE PLAINTEXT IDENTITY CLAIM. Encrypted fences its nameplate write; plaintext writes no nameplate,
+        // so its only identity claim is registerVolume -> .identity. Swap after mkfs (during the sleep); the
+        // registration must refuse rather than write our identity onto a disk we did not format.
+        it('REFUSES to claim identity on a plaintext disk that swapped in after mkfs', async () => {
+            deps.listRawBlockDevices
+                .mockResolvedValueOnce([baseDevice])
+                .mockResolvedValue([deviceWithPartition('PART-UUID')]);
+            deps.probeDeviceForStrubsIdentity.mockResolvedValue({ status: 'clean' });
+            deps.spawnHelper.mockImplementation(async (cmd: string, args: string[]) => {
+                if (cmd === 'mkfs.ext4')
+                    deps.currentDiskIdentity.mockResolvedValue('SWAPPED-AFTER-MKFS');
+                return { code: 0, stdout: '' };
+            });
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb' })).rejects.toThrow(/DIFFERENT PHYSICAL DISK/);
+
+            expect(deps.ioManager.registerVolume).not.toHaveBeenCalled();
+        });
     });
 
     it('replaces existing volumes when replace is true', async () => {
@@ -471,6 +686,164 @@ describe('DeviceProvisioner', () => {
             expect(deps.database.createVolume).toHaveBeenCalledWith(expect.objectContaining({
                 id: 58, label: null, comment: null
             }));
+        });
+
+        // ⚠️ A PATH IS NOT AN IDENTITY, AND `parted` TAKES A PATH.
+        //
+        // Between the scan and the wipe we run an identity probe, an argon2 hash, and (soon) a passphrase test
+        // against a real disk. That is seconds. These are USB spindles on a hub that drops them: /dev/sdb can
+        // become a DIFFERENT disk in that window, and the next line formats it. The serial comes from the
+        // hardware, not from the kernel's enumeration order.
+        it('REFUSES to partition a path that a different disk has taken since we looked', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            // It is the disk we meant when we identify it, and somebody else by the time we would partition it.
+            deps.currentDiskIdentity
+                .mockResolvedValueOnce('DRIVE-WD-0001')
+                .mockResolvedValue('A-COMPLETELY-DIFFERENT-DRIVE');
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true }))
+                .rejects.toThrow(/A DIFFERENT PHYSICAL DISK has taken that path/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('parted', expect.anything());
+            expect(deps.luks.format).not.toHaveBeenCalled();
+        });
+
+        it('REFUSES to partition a drive that will not say who it is', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+            deps.currentDiskIdentity.mockResolvedValue(null);
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true }))
+                .rejects.toThrow(/will not report a SMART serial/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('parted', expect.anything());
+        });
+
+        // ⚠️ THE DATABASE CAN BE RESTORED. THE PLATTERS CANNOT.
+        //
+        // A Mongo restored from before a passphrase rotation holds notes that agree with each other and with
+        // nothing in the rack. Every hash check passes; the disks want a different passphrase entirely. Writing
+        // the note onto a fresh disk splits the fleet, silently, and it stays silent until the OS disk dies.
+        it('REFUSES to encrypt when the passphrase does not open a disk we already encrypted', async () => {
+            deps.assertPassphraseOpensTheFleet.mockRejectedValue(
+                new Error('the recovery passphrase does NOT open volume11 (/dev/sdf1)'));
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true }))
+                .rejects.toThrow(/does NOT open volume/);
+
+            // BEFORE the disk was touched. The refusal is worthless if it arrives after `parted`.
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('parted', expect.anything());
+            expect(deps.luks.format).not.toHaveBeenCalled();
+        });
+
+        it('proves the passphrase against a real disk before writing it to a new one', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await provisioner.provision({ blockPath: '/dev/sdb', encrypt: true });
+
+            expect(deps.assertPassphraseOpensTheFleet).toHaveBeenCalledWith(PASSPHRASE);
+        });
+
+        // ⚠️ THE CLONE THAT ARRIVES AFTER THE SCAN.
+        //
+        // mgmt scans the volume's platter, proves it holds no slices, unmounts it and deregisters it -- and only
+        // THEN does the provisioner touch the disk. Plug a dd'd copy in during that handoff and it answers to
+        // the same path, the same partition uuid, the same nameplate, the same .identity file. Every check the
+        // provisioner makes on its own would pass, agreeing with itself about a disk nobody ever scanned -- and
+        // a clone is full of exactly the recoverable orphans that must never be destroyed.
+        //
+        // The serial is the one thing it cannot forge. The caller names the disk it MEANT.
+        it('REFUSES a disk whose serial is not the one the caller scanned (a clone in the handoff)', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({
+                blockPath: '/dev/sdb', encrypt: true, expectDiskSerial: 'THE-DRIVE-WE-ACTUALLY-SCANNED'
+            })).rejects.toThrow(/A DIFFERENT PHYSICAL DISK is sitting at that path/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('parted', expect.anything());
+            expect(deps.luks.format).not.toHaveBeenCalled();
+        });
+
+        it('proceeds when the disk at the path IS the one that was scanned', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await provisioner.provision({
+                blockPath: '/dev/sdb', encrypt: true, expectDiskSerial: 'DRIVE-WD-0001'
+            });
+
+            expect(deps.luks.format).toHaveBeenCalledWith('/dev/sdb1');
+        });
+
+        // ⚠️ `parted` IS NOT THE LAST DESTRUCTIVE STEP. After it we sleep, re-enumerate, and hand whatever now
+        // sits at that path to luksFormat and mkfs. A disk that drops in THAT window takes its replacement's
+        // data with it.
+        it('REFUSES to luksFormat a disk that swapped in after parted ran', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            // Itself right up to the partitioning...
+            deps.currentDiskIdentity
+                .mockResolvedValueOnce('DRIVE-WD-0001')       // the identity check at the start
+                .mockResolvedValueOnce('DRIVE-WD-0001')       // ...still itself before parted
+                .mockResolvedValue('SOMEBODY-ELSE-ENTIRELY'); // ...and then not
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true }))
+                .rejects.toThrow(/A DIFFERENT PHYSICAL DISK has taken that path/);
+
+            // parted ran -- we cannot un-run it -- but the disk that took the path was NOT encrypted or mkfs'd.
+            expect(deps.luks.format).not.toHaveBeenCalled();
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('mkfs.ext4', expect.anything());
+        });
+
+        // ⚠️ THE MAPPER HOLDS A DISK, NOT A PATH, AND mkfs RUNS ON THE MAPPER. The classic swap-back: A drops,
+        // B takes /dev/sdb, we open a mapper backed by B, A returns to /dev/sdb -- so every PATH check reads A
+        // and passes, while the disk under the mapper we are about to mkfs is B. Only asking the mapper who ITS
+        // disk is catches this.
+        it('REFUSES to mkfs when the MAPPER is backed by a different drive than the one we scanned', async () => {
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            // Every /dev/sdb probe says the disk we meant -- the swap is invisible at the path.
+            deps.currentDiskIdentity.mockImplementation(async (path: string) =>
+                path === '/dev/sdd' ? 'THE-IMPOSTOR-DRIVE' : 'DRIVE-WD-0001');
+            // ...but the mapper is backed by a partition on a DIFFERENT disk (/dev/sdd).
+            deps.luks.mapperBackingDevice.mockResolvedValue('sdd1');
+
+            // Capture the (random) volume uuid the provisioner minted, so we can prove the mapper it tears down
+            // is THIS one -- not some unrelated close() call.
+            let openedUuid: string | undefined;
+            deps.luks.open.mockImplementation(async (_path: string, uuid: string) => {
+                openedUuid = uuid;
+                return `/dev/mapper/strubs-${uuid}`;
+            });
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true }))
+                .rejects.toThrow(/DIFFERENT PHYSICAL DISK was mapped/);
+
+            expect(deps.spawnHelper).not.toHaveBeenCalledWith('mkfs.ext4', expect.anything());
+            expect(deps.luks.close).toHaveBeenCalledWith(openedUuid);   // THE bad mapper, torn down by its uuid
+        });
+
+        // ⚠️ RECORDING THE PASSPHRASE IS A WRITE, AND IT MUST BE THE LAST ONE. assertFleetRecoveryPassphrase()
+        // SEALS the passphrase as a side effect of accepting it -- so if a later guard refuses, the array would
+        // be left reporting `passphraseUsable: true` about a passphrase it was not allowed to use. The error
+        // would pass; the lie would persist.
+        it('does not RECORD the passphrase when the disk proof refuses the encryption', async () => {
+            deps.assertPassphraseOpensTheFleet.mockRejectedValue(
+                new Error('the recovery passphrase does NOT open volume11'));
+            stageDiscovery(luksDevice('LUKS-UUID'));
+
+            const provisioner = new DeviceProvisioner(deps);
+            await expect(provisioner.provision({ blockPath: '/dev/sdb', encrypt: true })).rejects.toThrow();
+
+            expect(deps.assertFleetRecoveryPassphrase).not.toHaveBeenCalled();
         });
 
         // An explicit passphrase still wins -- the API accepts one, and it is checked against the fleet exactly
