@@ -369,8 +369,14 @@ describe('luks', () => {
                 children: fstypes.map((fstype, i) => ({ type: 'part', name: `sdf${i}`, path: `/dev/sdf${i}`, fstype }))
             }]) as never;
 
+        // A disk with NO partition table at all -- the shape a whole-disk LUKS container takes (and a blank disk).
+        const wholeDisk = () =>
+            (async () => [{ name: 'sdf', path: '/dev/sdf', type: 'disk', size: 1 }]) as never;
+
         it('creates one when nothing is encrypted -- there is no key to have lost', async () => {
             statMock.mockRejectedValue(new Error('ENOENT'));   // no keyfile
+            // The null-fstype partition is PROBED, not skipped -- and wipefs says it is genuinely blank.
+            spawnHelper.mockResolvedValue({ code: 0, stdout: JSON.stringify({ signatures: [] }) });
             const written: Buffer[] = [];
             const handle = {
                 write: vi.fn(async (b: Buffer) => { written.push(b); }),
@@ -400,6 +406,85 @@ describe('luks', () => {
             // It did not create anything. A fresh key opens NONE of those disks, and a system that looks healthy
             // and cannot read a byte is worse than one that refuses to start quietly.
             expect(openMock).not.toHaveBeenCalled();
+        });
+
+        // ⚠️ THE GAP CODEX FOUND. This guard used to decide "nothing is encrypted" from `isLuksFsType(fstype)` --
+        // an lsblk cache. A genuinely encrypted disk of ours whose superblock lsblk failed to read reports fstype
+        // null, so it was INVISIBLE here, and a fresh key would be minted over a rack that a fresh key opens none
+        // of. It must PROBE the platter, exactly as findEncryptedPartitions and the wipe guard do.
+        it('REFUSES a LUKS disk whose fstype lsblk did not cache -- it asks the platter', async () => {
+            statMock.mockRejectedValue(new Error('ENOENT'));   // no keyfile
+            openMock.mockResolvedValue({} as never);
+            // lsblk gave us nothing (fstype null), but wipefs sees the crypto_LUKS signature on the platter.
+            spawnHelper.mockResolvedValue({ code: 0, stdout: JSON.stringify({ signatures: [{ type: 'crypto_LUKS' }] }) });
+
+            const result = await ensureKeyfile('/var/lib/strubs/luks.key', disks([null]));
+
+            expect(result).toEqual({ state: 'missing-but-disks-are-encrypted', disks: ['/dev/sdf0'] });
+            expect(openMock).not.toHaveBeenCalled();
+        });
+
+        // ...and a partition we cannot read AT ALL blocks the key too: an unreadable disk is not a disk we may
+        // assume is harmless, because behind it may be an entire array a fresh key would lock out forever.
+        it('REFUSES when a partition cannot be read -- unreadable is not blank', async () => {
+            statMock.mockRejectedValue(new Error('ENOENT'));   // no keyfile
+            openMock.mockResolvedValue({} as never);
+            spawnHelper.mockResolvedValue({ code: 1, stdout: 'wipefs: cannot open /dev/sdf0' });
+
+            const result = await ensureKeyfile('/var/lib/strubs/luks.key', disks([null]));
+
+            expect(result).toEqual({ state: 'missing-but-disks-are-encrypted', disks: ['/dev/sdf0'] });
+            expect(openMock).not.toHaveBeenCalled();
+        });
+
+        // ⚠️ A WHOLE-DISK LUKS container has no partition table, so a children-only scan sees nothing and would
+        // fall through to minting a fresh key over it. It is never one of ours (STRUBS always partitions), but
+        // the rule is "any LUKS container at all", and the wipe guard already refuses to touch one -- so must
+        // this. The disk itself is probed, exactly as device-identity-probe probes /dev/sdf.
+        it('REFUSES over a WHOLE-DISK LUKS container -- no partition table is not no encryption', async () => {
+            statMock.mockRejectedValue(new Error('ENOENT'));   // no keyfile
+            openMock.mockResolvedValue({} as never);
+            // The disk itself (/dev/sdf, no children) probes as crypto_LUKS.
+            spawnHelper.mockResolvedValue({ code: 0, stdout: JSON.stringify({ signatures: [{ type: 'crypto_LUKS' }] }) });
+
+            const result = await ensureKeyfile('/var/lib/strubs/luks.key', wholeDisk());
+
+            expect(result).toEqual({ state: 'missing-but-disks-are-encrypted', disks: ['/dev/sdf'] });
+            expect(openMock).not.toHaveBeenCalled();
+        });
+
+        // ⚠️ NOT the same as a whole-disk container: a disk that ADVERTISES a partition table (pttype/ptuuid) but
+        // enumerated NO partitions has not been looked at -- a corrupt or unreadable table can hide a LUKS
+        // partition, and probing offset 0 would only read the GPT header and call it blank. Fail closed WITHOUT
+        // probing, exactly as the wipe guard does.
+        it('REFUSES a disk that advertises a partition table but shows no partitions', async () => {
+            statMock.mockRejectedValue(new Error('ENOENT'));   // no keyfile
+            openMock.mockResolvedValue({} as never);
+            const partitionedButEmpty = (async () => [
+                { name: 'sdf', path: '/dev/sdf', type: 'disk', size: 1, pttype: 'gpt', ptuuid: 'TABLE-UUID' }
+            ]) as never;
+
+            const result = await ensureKeyfile('/var/lib/strubs/luks.key', partitionedButEmpty);
+
+            expect(result).toEqual({ state: 'missing-but-disks-are-encrypted', disks: ['/dev/sdf'] });
+            expect(openMock).not.toHaveBeenCalled();
+            // It did not fall through to an offset-0 probe -- an advertised table is refused on sight.
+            expect(spawnHelper).not.toHaveBeenCalled();
+        });
+
+        // ...and a genuinely blank disk with no partition table is still safe to key over: probed, and nothing there.
+        it('creates over a blank disk that has no partition table', async () => {
+            statMock.mockRejectedValue(new Error('ENOENT'));   // no keyfile
+            spawnHelper.mockResolvedValue({ code: 0, stdout: JSON.stringify({ signatures: [] }) });
+            const handle = {
+                write: vi.fn().mockResolvedValue(undefined),
+                sync: vi.fn().mockResolvedValue(undefined),
+                close: vi.fn().mockResolvedValue(undefined)
+            };
+            mkdirMock.mockResolvedValue(undefined as never);
+            openMock.mockResolvedValue(handle as never);
+
+            expect(await ensureKeyfile('/var/lib/strubs/luks.key', wholeDisk())).toEqual({ state: 'created' });
         });
 
         it('leaves an existing keyfile alone', async () => {

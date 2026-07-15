@@ -3,7 +3,7 @@ import { promises as fsp } from 'fs';
 import path from 'path';
 
 import { spawnHelper } from '../helpers/spawn';
-import { listRawBlockDevices, type RawBlockDeviceChild } from './device-discovery';
+import { listRawBlockDevices, type RawBlockDevice, type RawBlockDeviceChild } from './device-discovery';
 import { classifyPartition } from './signature-probe';
 import { createLogger } from '../log';
 
@@ -119,11 +119,41 @@ export async function ensureKeyfile(
 
     // Any LUKS container at all -- ours, a stranger's, or one we cannot identify. If there is encryption on this
     // machine and no key for it, we are not in a position to be inventing keys.
+    //
+    // isLuksPartition() asks the platter, not lsblk's fstype cache: a genuinely encrypted disk whose superblock
+    // lsblk failed to read reports fstype null, and keying on that alone would make it INVISIBLE here -- exactly
+    // the "invent a lost key" catastrophe this guard exists to prevent. Unreadable counts as encrypted (it folds
+    // into the fail-closed answer), so a disk we cannot read still blocks a fresh keyfile.
+    //
+    // A disk WITH partitions: ask each one. A disk that ADVERTISES a partition table but shows no partitions has
+    // NOT been looked at -- a corrupt table, a stale enumeration, or a table the kernel could not read all hide a
+    // LUKS partition just as well as an empty disk, and probing offset 0 (where the GPT header sits, not the
+    // partition's LUKS header) would call it blank. Fail closed there, exactly as the wipe guard does
+    // (device-identity-probe: "a disk that advertises a partition table and shows no partitions has not been
+    // looked at"). Only a disk with NO partition table AT ALL is asked directly -- that is the shape a whole-disk
+    // LUKS container takes, its header at offset 0 and invisible to a children-only scan.
     const encrypted: string[] = [];
-    for (const device of await list())
-        for (const child of device.children ?? [])
-            if (isLuksFsType(child.fstype))
-                encrypted.push(child.path ?? `/dev/${child.name}`);
+    for (const device of await list()) {
+        const parts = (device.children ?? []).filter(child => child.type === 'part');
+        const diskPath = device.path ?? `/dev/${device.name}`;
+
+        if (parts.length) {
+            for (const child of parts) {
+                const path = child.path ?? `/dev/${child.name}`;
+                if (await isLuksPartition(child, path))
+                    encrypted.push(path);
+            }
+        }
+        else if (device.pttype || device.ptuuid) {
+            log.error('%s says it has a %s partition table and not one partition could be enumerated on it. '
+                + 'Nothing on it was inspected, so a LUKS partition cannot be ruled out -- refusing to invent a '
+                + 'keyfile on the strength of an empty answer.', diskPath, device.pttype ?? 'partition');
+            encrypted.push(diskPath);
+        }
+        else if (await isLuksWholeDisk(device)) {
+            encrypted.push(diskPath);
+        }
+    }
 
     if (encrypted.length) {
         log.error('THE LUKS KEYFILE (%s) IS MISSING, AND THERE ARE %d ENCRYPTED DISK(S) ON THIS MACHINE (%s). '
@@ -696,11 +726,28 @@ const normaliseIdentity = (identity: string): string => identity.replace(/[^0-9a
 // bootstrap scan alike. An unreadable partition comes back as LUKS here -- i.e. it lands in `unknown` and
 // blocks encryption -- because a disk we cannot read is not a disk we may assume is harmless.
 async function isLuksPartition(child: RawBlockDeviceChild, path: string): Promise<boolean> {
-    const kind = await classifyPartition(child.fstype, path);
+    return isLuksContainer(child.fstype, path);
+}
+
+// The same question, one level up: is this WHOLE DISK a LUKS container -- no partition table, the encryption
+// sitting at offset 0? STRUBS always partitions its own disks, so this is never one of ours -- but the guard is
+// "any LUKS container at all", and the wipe guard (device-identity-probe) already refuses to touch a whole-disk
+// LUKS it cannot read into. lsblk would report the disk's own fstype as crypto_LUKS, but the sanitized listing
+// drops the top-level fstype, so we ASK THE DISK rather than trust a field that is not there.
+async function isLuksWholeDisk(device: RawBlockDevice): Promise<boolean> {
+    return isLuksContainer(undefined, device.path ?? `/dev/${device.name}`);
+}
+
+// IS THERE A LUKS CONTAINER AT THIS PATH? -- and "lsblk did not say" is not "no".
+//
+// classifyPartition() probes the platter when fstype is absent. An UNREADABLE device counts as a container here:
+// a disk we cannot read is not a disk we may assume is harmless, because behind it may be an entire array.
+async function isLuksContainer(fsType: string | null | undefined, path: string): Promise<boolean> {
+    const kind = await classifyPartition(fsType, path);
 
     if (kind.kind === 'unreadable') {
         log.error('could not establish what is on %s (%s). Treating it as an unidentified LUKS container: a '
-            + 'partition we cannot read is not a partition we may assume is harmless.', path, kind.reason);
+            + 'device we cannot read is not a device we may assume is harmless.', path, kind.reason);
         return true;
     }
 
