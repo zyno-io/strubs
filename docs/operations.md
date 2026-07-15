@@ -132,8 +132,9 @@ The new volume is mounted, started, and writable immediately, and new writes sta
 
 ## Encryption (LUKS)
 
-**Off by default, and off on this array today.** No volume is encrypted; nothing below has been run in
-anger. It exists so that it can be.
+**Off by default.** The fleet default (`encryptNewVolumes`) is off, so new disks provision plaintext. One volume
+(57) has been converted to encrypted as a canary and its recovery passphrase opens it; the rest are plaintext.
+Every capability below is live; broad enablement is a deliberate next step, not the default.
 
 What it defends against: **a disk leaving the building** — RMA'd, sold, discarded, stolen. That is a real
 risk here; failing drives get pulled from this rack routinely and they hold customers' photographs, video
@@ -210,10 +211,13 @@ curl -X POST localhost/\$/volumes/57/encrypt \
 curl -X POST localhost/\$/rebalance                 # refills it
 ```
 
-> **Encrypting a volume checks the passphrase locally** — against an argon2id hash in `runtimeConfig`, in about
-> 350 ms, touching no disk at all. It does not need to interrogate the platters, because the platters carry what
-> *we wrote to them* with the keyfile. (An earlier design tried to derive the fleet passphrase *from* the disks
-> and defend it against drifting; holding the keyfile makes all of that unnecessary.)
+> **Encrypting a volume checks the passphrase two ways.** First locally, against an argon2id hash in
+> `runtimeConfig` (~350 ms) — a fast reject for a wrong passphrase. Then, before that passphrase is written onto
+> a new disk, it is **proven against a real attached encrypted disk** (`cryptsetup --test-passphrase`, ~3–4 s):
+> the local hash lives in a database a restore can rewind, and the one thing that cannot be rewound is whether
+> the passphrase actually opens the platters. If a restored database and the disks disagree, the disk wins and
+> the encryption is refused. (STRUBS keeps the passphrase itself sealed under the keyfile so it can do this
+> unattended; it is never derived *from* the disks.)
 
 The encrypt step **refuses a volume that still holds live slices** — it does not drain for you. It wipes and
 rebuilds the disk under the same volume id, and before it touches anything the disk must *prove* it is that
@@ -249,10 +253,14 @@ curl -X POST localhost/\$/recover-fleet -H 'Content-Type: application/json' \
 The scan unlocks each `crypto_LUKS` partition (keyfile first if it still exists, passphrase otherwise), reads
 the bootstrap manifest from inside, and locks it again. Nothing is written to a disk to read it.
 
-**Create the new keyfile first** (see above). The recovery puts it back into a keyslot on every disk it opened
-— and if it can't, it says so. Skip that and the fleet unlocks only when a human types the passphrase, which
-means it will not survive a reboot: `Restart=always` has nobody to ask. The response lists the disks whose
-keyslot was restored in `keyfileRestoredOn`.
+**Restore the keyfile before you recover, if you have a backup of it.** STRUBS will NOT invent one at startup
+while encrypted disks are attached — a fresh random key would open none of them, and a system that looks healthy
+but cannot read a byte is worse than one that refuses to start. So put the backed-up `/var/lib/strubs/luks.key`
+back first. If it is truly lost, recover with the passphrase: the recovery uses it to unlock each disk and then
+**writes a new keyfile keyslot onto every disk it opened** (that is the keyfile becoming valid again), reporting
+them in `keyfileRestoredOn`. Either way, an encrypted disk whose keyslot could not be restored unlocks only when
+a human types the passphrase — it will not survive a reboot, because `Restart=always` has nobody to ask. This is
+why the keyfile must be backed up off the machine the day the first disk is encrypted.
 
 Then restart STRUBS, let the fleet come up, and rebuild the namespace with `POST /$/restore` as usual.
 
