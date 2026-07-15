@@ -72,12 +72,20 @@ const fakeDeps = (opts: {
     const store = new Map<string, unknown>();
     let encrypted = opts.encrypted ?? [];
 
-    // The passphrase keyslot on each disk. This IS the disk, as far as any of this is concerned.
-    const slots: Record<string, Set<string>> = {};
-    const slotsOf = (path: string) => (slots[path] ??= new Set());
-    let absent = opts.absentVolumes ?? [];
+    // The passphrase keyslot on each HEADER, keyed by its LUKS uuid -- because that is now how the code addresses
+    // a header (`UUID=<luksUuid>`), and it is what a header IS as far as any of this is concerned.
     const uuidAt: Record<string, string> = {};
-    const liveUuidAt: Record<string, string> = {};
+    const uuidOfPath = (path: string) => uuidAt[path] ?? `luks-${path}`;
+    // A key may arrive as a raw path (test seeding) or as a `UUID=<uuid>` specifier (the code under test).
+    const keyToUuid = (key: string) => key.startsWith('UUID=') ? key.slice(5) : uuidOfPath(key);
+    const slots: Record<string, Set<string>> = {};
+    const slotsOf = (key: string) => (slots[keyToUuid(key)] ??= new Set());
+    let absent = opts.absentVolumes ?? [];
+
+    // How many attached headers carry each uuid. Default: each encrypted disk's uuid resolves to exactly one.
+    const headerCount: Record<string, number> = {};
+    const pathIsUnreadable = (uuid: string): boolean =>
+        (opts.unreadableDisks ?? []).some(path => uuidOfPath(path) === uuid);
 
     return {
         store,
@@ -102,30 +110,38 @@ const fakeDeps = (opts: {
         // these are USB disks that flap: a volume absent for the first and back for the second falls through
         // BOTH guards.
         scanFleet: async () => ({
-            ours: encrypted.map(path => ({ path, volumeId: VOLUME_IDS[path] ?? 99, luksUuid: uuidAt[path] ?? `luks-${path}` })),
+            ours: encrypted.map(path => ({ path, volumeId: VOLUME_IDS[path] ?? 99, luksUuid: uuidOfPath(path) })),
             unknown: opts.unknown ?? [],
             absent
         }),
 
-        // ⚠️ A PATH IS NOT AN IDENTITY. This is the uuid read from whatever is at that path RIGHT NOW -- which
-        // is NOT necessarily what the scan saw. That gap is the bug.
-        containerUuid: vi.fn(async (path: string) => liveUuidAt[path] ?? uuidAt[path] ?? `luks-${path}`),
-        // A USB disk drops and ANOTHER of our encrypted disks lands on the same path AFTER the scan. The scan's
-        // record is unchanged; the disk actually sitting there is not the one it saw.
-        swapDiskAt: (path: string) => { liveUuidAt[path] = `luks-${path}-a-different-disk`; },
+        // EXACTLY ONE ATTACHED HEADER CARRIES THIS UUID? Default yes for every encrypted disk; a swap makes it
+        // zero (gone), a clone makes it two. cryptsetup's `UUID=` cannot disambiguate two, and cannot resolve
+        // zero -- so the code refuses on either.
+        assertExactlyOneLuksHeader: vi.fn(async (uuid: string) => {
+            const n = headerCount[uuid] ?? (encrypted.some(p => uuidOfPath(p) === uuid) ? 1 : 0);
+            if (n === 1) return;
+            throw new Error(n === 0
+                ? `no attached partition carries LUKS uuid ${uuid}`
+                : `${n} attached partitions carry LUKS uuid ${uuid} (a clone)`);
+        }),
+        // A USB disk drops: the header we scanned no longer resolves by its uuid.
+        swapDiskAt: (path: string) => { headerCount[uuidOfPath(path)] = 0; },
+        // A dd'd clone: two attached headers now carry the same uuid.
+        cloneDiskAt: (path: string) => { headerCount[uuidOfPath(path)] = 2; },
 
-        // We hold the keyfile, so writing a keyslot always works on a disk that is there.
-        addPassphrase: vi.fn(async (path: string, pass: string) => {
-            if (opts.unreadableDisks?.includes(path)) throw new Error('I/O error');
-            slotsOf(path).add(pass);
+        // We hold the keyfile, so writing a keyslot always works on a header that is there.
+        addPassphrase: vi.fn(async (spec: string, pass: string) => {
+            if (pathIsUnreadable(keyToUuid(spec))) throw new Error('I/O error');
+            slotsOf(spec).add(pass);
         }),
-        removePassphrase: vi.fn(async (path: string, pass: string) => {
-            if (opts.unreadableDisks?.includes(path)) throw new Error('I/O error');
-            slotsOf(path).delete(pass);
+        removePassphrase: vi.fn(async (spec: string, pass: string) => {
+            if (pathIsUnreadable(keyToUuid(spec))) throw new Error('I/O error');
+            slotsOf(spec).delete(pass);
         }),
-        testPassphrase: vi.fn(async (path: string, pass: string) => {
-            if (opts.unreadableDisks?.includes(path)) return 'unreadable';
-            return slotsOf(path).has(pass) ? 'opens' : 'rejected';
+        testPassphrase: vi.fn(async (spec: string, pass: string) => {
+            if (pathIsUnreadable(keyToUuid(spec))) return 'unreadable';
+            return slotsOf(spec).has(pass) ? 'opens' : 'rejected';
         }),
 
         // The key to every disk in the fleet -- and, therefore, what the sealed passphrase is sealed with.
@@ -743,14 +759,12 @@ describe('proving the passphrase against a disk before writing it to another one
             .rejects.toThrow(/could not be checked against a single encrypted disk/);
     });
 
-    // ...and a header that swaps DURING the slow test, and happens to open, must not be accepted either.
-    it('does not accept a header that swapped in DURING the test, even if it opens', async () => {
+    // ...and a CLONE (two attached headers with the same uuid) makes `UUID=` ambiguous -- a keyslot write could
+    // land on either -- so the proof cannot honestly ask it, and counts it unreadable rather than accept it.
+    it('does not accept a header whose uuid is duplicated by a clone', async () => {
         const db = fakeDeps({ encrypted: ['/dev/sdf1'] });
         db.slotsOf('/dev/sdf1').add(OLD);
-        db.testPassphrase.mockImplementation(async (path: string) => {
-            db.swapDiskAt(path);      // the disk changes underneath us mid-argon2...
-            return 'opens';           // ...and the impostor happens to open with this passphrase
-        });
+        db.cloneDiskAt('/dev/sdf1');   // two attached headers now carry this uuid
 
         await expect(assertPassphraseOpensTheFleet(OLD, db))
             .rejects.toThrow(/could not be checked against a single encrypted disk/);
@@ -992,62 +1006,48 @@ describe('changing the fleet recovery passphrase', () => {
     // `luksAddKey /dev/sdf1` then succeeds against the WRONG header. The proof tests the wrong header. The
     // verifier is updated. And the volume we meant to rotate was never reached at all -- it keeps the old
     // passphrase, while the database swears it does not.
-    it('refuses to touch a disk that is no longer the one it scanned', async () => {
+    it('refuses to touch a header whose uuid no longer resolves (swapped away)', async () => {
         const db = await fleetOn(['/dev/sdf1', '/dev/sdg1'], OLD);
 
-        // Between the scan and the write, the disk at sdf1 is swapped for a different one of ours.
+        // Between the scan and the write, the header at sdf1 is gone -- its uuid resolves to no attached disk.
         db.swapDiskAt('/dev/sdf1');
 
         await expect(setFleetRecoveryPassphrase(NEW, OLD, db))
-            .rejects.toThrow(/no longer the disk we scanned/);
+            .rejects.toThrow(/no attached partition carries/);
 
         // Nothing was written. The OLD passphrase still opens every disk.
         expect(db.addPassphrase).not.toHaveBeenCalled();
         await expect(assertFleetRecoveryPassphrase(OLD, db)).resolves.toBeUndefined();
     });
 
-    // ⚠️ THE "DO NOTHING" BRANCH NEEDS THE GUARD MORE THAN THE WRITE PATH DOES, NOT LESS.
-    //
-    // The idempotency check is argon2 -- about three seconds, during which the disk at this path can be swapped
-    // for another of ours. If the replacement already opens with the new passphrase, the skip fires and we
-    // `continue`, believing we have dealt with the disk we scanned when we have not touched it at all. It keeps
-    // the old passphrase; the rotation records the new one; nothing says otherwise.
-    //
-    // A write that lands on the wrong disk at least leaves evidence. A skip leaves none.
-    it('refuses when a disk swaps during the idempotency check and the replacement already opens', async () => {
+    // ⚠️ A CLONE MAKES `UUID=` AMBIGUOUS, so the rotation will not touch keys through it. Two attached headers
+    // carrying the same uuid could each be the one a keyslot write lands on -- so every key op proves the uuid
+    // names exactly one attached header first, and refuses otherwise. Nothing is written.
+    it('refuses to rotate a header whose uuid is duplicated by a clone', async () => {
         const db = await fleetOn(['/dev/sdf1', '/dev/sdg1'], OLD);
 
-        // The disk at sdf1 is swapped WHILE we are asking whether it already takes the new passphrase -- and the
-        // one that lands there does.
-        db.testPassphrase.mockImplementationOnce(async () => {
-            db.swapDiskAt('/dev/sdf1');
-            return 'opens';
-        });
+        db.cloneDiskAt('/dev/sdf1');   // a dd'd copy is attached; sdf1's uuid now resolves to two headers
 
         await expect(setFleetRecoveryPassphrase(NEW, OLD, db))
-            .rejects.toThrow(/no longer the disk we scanned/);
+            .rejects.toThrow(/attached partitions carry LUKS uuid.*clone/);
 
-        // Nothing was recorded: the OLD passphrase is still the fleet's, and still opens everything.
+        expect(db.addPassphrase).not.toHaveBeenCalled();
         await expect(assertFleetRecoveryPassphrase(OLD, db)).resolves.toBeUndefined();
     });
 
-    // ⚠️ THE POST-WRITE PROOF NEEDS THE AFTER-BRACKET TOO. We add the new passphrase to sdf1 (fenced), then ask
-    // "did it land?" -- and if the disk swaps DURING that argon2 test to a header that also opens with the new
-    // passphrase, an unbracketed proof would accept the swapped disk's answer for the one we wrote and roll on.
-    it('refuses when a disk swaps during the post-write landing proof', async () => {
-        const db = await fleetOn(['/dev/sdf1', '/dev/sdg1'], OLD);
+    // ⚠️ THE WHOLE POINT: the keys are addressed by HEADER UUID, never by /dev/sdX1. cryptsetup resolves
+    // `UUID=<luksUuid>` to the exact header or nothing, so there is no path that could point at a different disk.
+    it('addresses every key operation by UUID=, never by path', async () => {
+        const db = await fleetOn(['/dev/sdf1'], OLD);
 
-        db.testPassphrase
-            .mockImplementationOnce(async () => 'rejected')          // sdf1 idempotency: not already on NEW
-            .mockImplementationOnce(async () => {                    // sdf1 landing proof: swaps mid-test
-                db.swapDiskAt('/dev/sdf1');
-                return 'opens';
-            });
+        await setFleetRecoveryPassphrase(NEW, OLD, db);
 
-        await expect(setFleetRecoveryPassphrase(NEW, OLD, db))
-            .rejects.toThrow(/no longer the disk we scanned/);
-
-        await expect(assertFleetRecoveryPassphrase(OLD, db)).resolves.toBeUndefined();  // OLD still the fleet's
+        for (const mock of [db.addPassphrase, db.removePassphrase, db.testPassphrase]) {
+            for (const call of mock.mock.calls) {
+                expect(call[0]).toMatch(/^UUID=/);       // a header specifier...
+                expect(call[0]).not.toMatch(/^\/dev\//); // ...never a raw device path
+            }
+        }
     });
 
     it('requires the current passphrase to change it', async () => {
@@ -1201,13 +1201,10 @@ describe('finding the encrypted disks on the platters', () => {
 describe('the recovery passphrase audit does not trust a swapped header', () => {
     const PASS = 'correct horse battery staple';
 
-    it('counts a disk whose header swapped DURING the test as unreadable, not opened', async () => {
+    it('counts a header whose uuid no longer resolves as unreadable, not opened', async () => {
         const db = fakeDeps({ encrypted: ['/dev/sdf1'] });
         db.slotsOf('/dev/sdf1').add(PASS);
-        db.testPassphrase.mockImplementation(async (path: string) => {
-            db.swapDiskAt(path);      // the header changes underneath the argon2 test...
-            return 'opens';           // ...and the impostor opens
-        });
+        db.swapDiskAt('/dev/sdf1');   // the scanned header is gone; its uuid resolves to nothing
 
         await expect(auditRecoveryKey(PASS, db))
             .rejects.toThrow(/could not be tested/);   // not one disk honestly answered -> not "healthy"

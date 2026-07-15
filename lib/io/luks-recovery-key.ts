@@ -6,13 +6,13 @@ import { HttpBadRequestError } from '../server/http/errors';
 import { listRawBlockDevices } from './device-discovery';
 import {
     addPassphrase,
-    containerUuid,
     findEncryptedPartitions,
     readKeyfile,
     removePassphrase,
     testPassphrase,
     type EncryptedDisk
 } from './luks';
+import { assertExactlyOneLuksHeader, luksHeaderSpecifier } from './block-identity';
 import { ioManager } from './manager';
 import { createLogger } from '../log';
 
@@ -228,8 +228,11 @@ export type RecoveryKeyDeps = {
     removePassphrase: typeof removePassphrase;
     testPassphrase: typeof testPassphrase;
 
-    // The LUKS header's own uuid, read from whatever is at that path RIGHT NOW. A path is not an identity.
-    containerUuid: typeof containerUuid;
+    // Prove a LUKS uuid names EXACTLY ONE attached header before we operate on it by uuid. Replaces the old
+    // per-op container-uuid bracketing: instead of "read what is at this path and check it still matches", we
+    // hand cryptsetup `UUID=<uuid>`, which resolves to the exact header or nothing. This only has to guard the
+    // one thing UUID= cannot: a dd'd clone making the uuid ambiguous.
+    assertExactlyOneLuksHeader: typeof assertExactlyOneLuksHeader;
 
     readKeyfile: typeof readKeyfile;
     mongodStartupToken: () => Promise<string | null>;
@@ -252,7 +255,7 @@ const defaultDeps: RecoveryKeyDeps = {
     addPassphrase,
     removePassphrase,
     testPassphrase,
-    containerUuid,
+    assertExactlyOneLuksHeader,
     readKeyfile,
     mongodStartupToken: () => database.mongodStartupToken(),
     encryptedVolumeIds: () => ioManager.getVolumeEntries()
@@ -659,79 +662,42 @@ async function rotate(
         return { volumes: [], rotatedAt: new Date().toISOString() };
     }
 
-    // ⚠️ A PATH IS NOT AN IDENTITY. Prove each disk is still the one we scanned, immediately before writing.
+    // ⚠️ A PATH IS NOT AN IDENTITY, so we do not use one. Every key op below targets the HEADER by its own uuid
+    // (`cryptsetup ... UUID=<luksUuid>`), which libblkid resolves to the exact header or to nothing -- never to
+    // a different disk that took the path. headerSpec() proves the uuid names exactly one attached header first
+    // (a dd'd clone is the one thing UUID= cannot disambiguate) and hands back the specifier.
     //
-    // These are USB disks: /dev/sdf1 is whatever the kernel most recently decided to call the thing in that
-    // slot, and it gets reused. We scanned the fleet, and we now spend ~3 seconds per disk deriving keys. In
-    // that window the disk we scanned can drop and ANOTHER of our own encrypted disks can land on the same
-    // path -- at which point `luksAddKey /dev/sdf1` succeeds, against the wrong header, the proof tests the
-    // wrong header, and the volume we meant to rotate is never reached. It keeps the old passphrase, and the
-    // verifier says otherwise.
-    //
-    // The container uuid is the identity of the HEADER. Check it, every time, right before we touch the keys.
-    const assertStillTheSameDisk = async (disk: EncryptedDisk): Promise<void> => {
-        const uuid = await deps.containerUuid(disk.path);
-
-        if (!disk.luksUuid || uuid !== disk.luksUuid)
+    // This is what let the old per-op container-uuid bracketing be deleted: there is no path to re-verify,
+    // because there is no path.
+    const headerSpec = async (disk: EncryptedDisk): Promise<string> => {
+        if (!disk.luksUuid)
             throw new HttpBadRequestError(
-                `refusing to touch the keys of ${disk.path}: it is no longer the disk we scanned (expected LUKS `
-                + `container ${disk.luksUuid ?? 'unknown'}, found ${uuid ?? 'nothing readable'}). A disk moved `
-                + `underneath this rotation. Nothing further has been changed -- the old passphrase still opens `
-                + `every disk. Try again with the fleet settled.`
+                `refusing to touch the keys of volume ${disk.volumeId}: it has no LUKS uuid on record, so it can `
+                + `only be addressed by path -- and a path is not an identity. Nothing has been changed.`
             );
+        await deps.assertExactlyOneLuksHeader(disk.luksUuid);
+        return luksHeaderSpecifier(disk.luksUuid);
     };
 
     // --- 1. ADD the new passphrase everywhere, authenticating with the keyfile. ---
     for (const disk of ours) {
-        // BEFORE...
-        await assertStillTheSameDisk(disk);
-
-        // IDEMPOTENT, because a rotation that failed half-way WILL be re-run.
-        //
-        // `luksAddKey` does not de-duplicate: handing it a passphrase the disk already takes gives you a SECOND
-        // keyslot holding the same key. A LUKS2 header has 32 of them, and a few failed rotations that each got
-        // part-way through the fleet would quietly eat into that -- for no benefit, since the disk already
-        // opens. So ask first, and only write when there is something to write.
-        const alreadyOpens = await deps.testPassphrase(disk.path, next) === 'opens';
-
-        // ...AND AFTER *EVERY* SLOW STEP -- including this one, and including the branch that does NOTHING.
-        //
-        // `testPassphrase` is argon2: about three seconds, during which the disk at this path can be swapped for
-        // another of ours. If that replacement happens to already open with `next`, the idempotent skip below
-        // fires -- and we `continue`, believing we have dealt with the disk we scanned, when we have not touched
-        // it at all. It keeps the old passphrase; the rotation records the new one; and nothing says otherwise.
-        //
-        // The "do nothing" path needs the guard MORE than the write path does, not less: a write that lands on
-        // the wrong disk at least leaves evidence. A skip leaves none.
-        await assertStillTheSameDisk(disk);
-
-        if (alreadyOpens) {
+        // IDEMPOTENT, because a rotation that failed half-way WILL be re-run. `luksAddKey` does not de-duplicate:
+        // handing it a passphrase the disk already takes just eats another of the header's 32 keyslots. So ask
+        // first, and only write when there is something to write.
+        if (await deps.testPassphrase(await headerSpec(disk), next) === 'opens') {
             log('volume%d: already opens with the new passphrase; nothing to do', disk.volumeId);
             continue;
         }
 
-        await deps.addPassphrase(disk.path, next);
+        await deps.addPassphrase(await headerSpec(disk), next);
 
-        // The uuid check is not atomic with the write -- the disk could swap in the microseconds between them.
-        // Checking again afterwards does not make it atomic either, but it turns "we wrote a key into the wrong
-        // disk and never noticed" into "we wrote a key into the wrong disk and stopped dead", which is the
-        // difference between a silent split and a loud one. Closing the last of the window needs an open device
-        // handle rather than a re-opened path, and is not worth that here.
-        await assertStillTheSameDisk(disk);
-
-        // Prove it took, on this disk, before moving on. `luksAddKey` returning success is not the same thing as
-        // the passphrase opening the header, and the difference matters on the one key that has no undo.
-        const landed = await deps.testPassphrase(disk.path, next);
-
-        // ...AND AFTER the argon2 test: a header that swapped in during it could answer 'opens' for a disk we
-        // never wrote. Without this, a silently-failed write to the real disk would be masked by an impostor.
-        await assertStillTheSameDisk(disk);
-
-        if (landed !== 'opens')
+        // Prove it took, on this header, before moving on. `luksAddKey` returning success is not the same thing
+        // as the passphrase opening the header, and the difference matters on the one key that has no undo.
+        if (await deps.testPassphrase(await headerSpec(disk), next) !== 'opens')
             throw new HttpBadRequestError(
-                `the new passphrase was written to volume ${disk.volumeId} (${disk.path}) but does not open it. `
-                + `Stopping here. The OLD passphrase still opens every disk in this fleet and nothing has been `
-                + `recorded, so nothing is lost -- but investigate that disk.`
+                `the new passphrase was written to volume ${disk.volumeId} (LUKS ${disk.luksUuid}) but does not `
+                + `open it. Stopping here. The OLD passphrase still opens every disk in this fleet and nothing has `
+                + `been recorded, so nothing is lost -- but investigate that disk.`
             );
 
         log('volume%d: the new recovery passphrase was added', disk.volumeId);
@@ -754,35 +720,21 @@ async function rotate(
     // would be worse than saying so plainly.
     if (current) {
         for (const disk of ours) {
-            await assertStillTheSameDisk(disk);
-
             try {
-                await deps.removePassphrase(disk.path, current);
+                await deps.removePassphrase(await headerSpec(disk), current);
                 log('volume%d: the old recovery passphrase was removed', disk.volumeId);
             }
             catch (err) {
                 log.error('volume%d: the OLD recovery passphrase could not be removed (%s). The new one works and '
                     + 'is recorded, but the old one still opens this disk. Remove it by hand: '
-                    + 'cryptsetup luksRemoveKey %s', disk.volumeId, err, disk.path);
+                    + 'cryptsetup luksRemoveKey UUID=%s', disk.volumeId, err, disk.luksUuid);
             }
 
-            // The removal was another slow step against a path. Prove the disk is still the one we scanned before
-            // we draw any conclusion from what it now says.
-            await assertStillTheSameDisk(disk);
-
-            // AND CHECK WE DID NOT JUST DISARM THE DISK -- OUTSIDE the catch above, which exists to TOLERATE a
-            // failed removal (a stale keyslot is untidy, not dangerous) and must not also swallow this.
-            //
-            // The same-passphrase guard should make this impossible. But "should" is not a word that belongs
-            // anywhere near the only key that opens 130TB: if the disk no longer takes the new passphrase, the
-            // removal took the wrong slot. Stop, loudly, while the rest of the fleet still has both keys.
-            const stillOpens = await deps.testPassphrase(disk.path, next);
-
-            // ...AND AFTER: same reason as the add loop. An impostor that opens `next` must not answer for this
-            // disk and let the retire loop roll on having "confirmed" a disk it never checked.
-            await assertStillTheSameDisk(disk);
-
-            if (stillOpens !== 'opens')
+            // CHECK WE DID NOT JUST DISARM THE DISK -- OUTSIDE the catch above, which exists to TOLERATE a failed
+            // removal (a stale keyslot is untidy) and must not also swallow this. If the header no longer takes
+            // the new passphrase, the removal took the wrong slot. Stop, loudly, while the rest of the fleet
+            // still has both keys.
+            if (await deps.testPassphrase(await headerSpec(disk), next) !== 'opens')
                 throw new HttpBadRequestError(
                     `volume ${disk.volumeId} (${disk.path}) no longer opens with the new recovery passphrase after `
                     + `retiring the old one. Its keyslots are not what we think they are. STOP: no further keyslots `
@@ -920,28 +872,23 @@ export async function assertPassphraseOpensTheFleet(
 
     const unreadable: string[] = [];
 
-    // ⚠️ A PATH IS NOT AN IDENTITY HERE EITHER. `testPassphrase` is argon2 -- seconds -- during which a USB disk
-    // can drop and ANOTHER of our headers take its path. If that replacement happens to open with this
-    // passphrase, we would accept it as the fleet's on the strength of a disk we were not asked about, and then
-    // write it onto a new one. Rotation already brackets its slow key operations with the container uuid; the
-    // proof has to as well. The uuid is the identity of the HEADER, read live from whatever is at the path now.
-    const stillTheScannedHeader = async (disk: EncryptedDisk): Promise<boolean> =>
-        Boolean(disk.luksUuid) && await deps.containerUuid(disk.path) === disk.luksUuid;
-
+    // ⚠️ A PATH IS NOT AN IDENTITY, so we test the HEADER BY ITS UUID. cryptsetup resolves `UUID=<luksUuid>` to
+    // the exact header or nothing, so a disk that swapped away answers 'unreadable', and a clone that duplicated
+    // the uuid is refused by assertExactlyOneLuksHeader before we ask. Either way, no disk that is not the one
+    // we scanned can vouch for -- or against -- the passphrase we are about to write onto a new one.
     for (const disk of ours) {
-        // BEFORE the slow test: is the header at this path the one the scan recorded?
-        if (!await stillTheScannedHeader(disk)) {
-            unreadable.push(disk.path);     // not "it opened" and not "it refused" -- we could not honestly ask
+        let spec: string;
+        try {
+            if (!disk.luksUuid) throw new Error('no uuid');
+            await deps.assertExactlyOneLuksHeader(disk.luksUuid);
+            spec = luksHeaderSpecifier(disk.luksUuid);
+        }
+        catch {
+            unreadable.push(disk.path);     // could not honestly ask this one: gone, cloned, or uuid-less
             continue;
         }
 
-        const verdict = await deps.testPassphrase(disk.path, passphrase);
-
-        // ...AND AFTER: a disk that swapped in during the test cannot be allowed to answer for the one we meant.
-        if (!await stillTheScannedHeader(disk)) {
-            unreadable.push(disk.path);
-            continue;
-        }
+        const verdict = await deps.testPassphrase(spec, passphrase);
 
         if (verdict === 'opens')
             return;
@@ -989,19 +936,23 @@ export async function auditRecoveryKey(
     const refused: EncryptedDisk[] = [];
     const unreadable: EncryptedDisk[] = [];
 
-    // ⚠️ A PATH IS NOT AN IDENTITY. The header at disk.path when we scanned may not be the header there when we
-    // test -- USB disks flap, and testPassphrase is argon2-slow. A header that is not the one the scan recorded
-    // (checked by its container uuid, before AND after the test) is counted as UNREADABLE, never as an answer:
-    // it must not let a disk that swapped in vouch for -- or against -- the one we meant.
-    const headerUnchanged = async (disk: EncryptedDisk): Promise<boolean> =>
-        Boolean(disk.luksUuid) && await deps.containerUuid(disk.path) === disk.luksUuid;
-
+    // ⚠️ A PATH IS NOT AN IDENTITY. Test each header BY ITS UUID: cryptsetup resolves `UUID=<luksUuid>` to the
+    // exact header or nothing, and a duplicated uuid (a clone) is refused before we ask. A header we cannot
+    // address by uuid -- gone, cloned, or uuid-less -- is counted UNREADABLE, never as an answer for the disk we
+    // scanned.
     for (const disk of ours) {
-        if (!await headerUnchanged(disk)) { unreadable.push(disk); continue; }
+        let spec: string;
+        try {
+            if (!disk.luksUuid) throw new Error('no uuid');
+            await deps.assertExactlyOneLuksHeader(disk.luksUuid);
+            spec = luksHeaderSpecifier(disk.luksUuid);
+        }
+        catch {
+            unreadable.push(disk);
+            continue;
+        }
 
-        const verdict = await deps.testPassphrase(disk.path, passphrase);
-
-        if (!await headerUnchanged(disk)) { unreadable.push(disk); continue; }
+        const verdict = await deps.testPassphrase(spec, passphrase);
 
         if (verdict === 'opens') opened.push(disk);
         else if (verdict === 'rejected') refused.push(disk);
