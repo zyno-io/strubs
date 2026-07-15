@@ -25,6 +25,10 @@ const createDeps = () => {
         getVolumes: vi.fn(async () => rows.map(row => ({ ...row }))),
         createVolume: vi.fn(async (volume: Record<string, unknown>) => { rows.push({ ...volume }); }),
         deleteVolume: vi.fn(async (id: number) => { rows = rows.filter(row => row.id !== id); }),
+        updateVolumeFlags: vi.fn(async (id: number, changes: Record<string, unknown>) => {
+            const row = rows.find(r => r.id === id);
+            if (row && changes.isReadOnly !== undefined) row.read_only = changes.isReadOnly;
+        }),
         // The fleet default. `undefined` is what an untouched array returns from runtimeConfig, and it must
         // mean "no encryption" -- shipping in `off` is the whole plan.
         getRuntimeConfig: vi.fn().mockResolvedValue(undefined)
@@ -32,6 +36,7 @@ const createDeps = () => {
     const ioManager = {
         registerVolume: vi.fn().mockResolvedValue(undefined),
         deregisterVolume: vi.fn().mockResolvedValue(undefined),
+        updateVolumeFlags: vi.fn().mockResolvedValue(undefined),
         getVolumeEntries: vi.fn().mockReturnValue([])
     };
     const luks = {
@@ -205,9 +210,55 @@ describe('DeviceProvisioner', () => {
         expect(result.id).toBe(2);
         expect(deps.spawnHelper).toHaveBeenCalledWith('parted', ['-s', '/dev/sdb', 'mklabel', 'gpt']);
         expect(deps.spawnHelper).toHaveBeenCalledWith('parted', ['-s', '/dev/sdb', 'mkpart', 'primary', 'ext4', '0%', '100%']);
-        expect(deps.database.createVolume).toHaveBeenCalledWith(result);
-        // Provisioning is the ONLY path allowed to stamp our identity onto a disk -- it just formatted it.
-        expect(deps.ioManager.registerVolume).toHaveBeenCalledWith(result, { initializeIdentity: true });
+
+        // ⚠️ CLAIMED READ-ONLY, DURABLE-ROW, THEN ENABLED. The physical claim and the Mongo row are both written
+        // read-only, so the volume is never writable until its row is durable. Only then is it made writable.
+        expect(deps.ioManager.registerVolume).toHaveBeenCalledWith(
+            expect.objectContaining({ id: 2, read_only: true }), { initializeIdentity: true });
+        expect(deps.database.createVolume).toHaveBeenCalledWith(expect.objectContaining({ id: 2, read_only: true }));
+        expect(deps.database.updateVolumeFlags).toHaveBeenCalledWith(2, { isReadOnly: false });
+        expect(deps.ioManager.updateVolumeFlags).toHaveBeenCalledWith(2, { isReadOnly: false });
+        expect(result.read_only).toBe(false);   // returned in its final, writable state
+    });
+
+    // ⚠️ ORPHANS BEAT PHANTOMS. A failed database row write must leave a claimed disk with no row (recoverable),
+    // never a row pointing at a disk we did not finish claiming. And the volume must never have been writable in
+    // that window, so nothing could have been placed on it.
+    it('leaves an orphan, not a phantom, when the database row cannot be written', async () => {
+        deps.listRawBlockDevices
+            .mockResolvedValueOnce([baseDevice])
+            .mockResolvedValueOnce([deviceWithPartition(null)])
+            .mockResolvedValueOnce([deviceWithPartition('PART-UUID')]);
+        deps.database.createVolume.mockRejectedValueOnce(new Error('mongo is down'));
+
+        const provisioner = new DeviceProvisioner(deps);
+        await expect(provisioner.provision({ blockPath: '/dev/sdb' }))
+            .rejects.toThrow(/recoverable orphan -- it was never made writable/);
+
+        // The physical claim happened, READ-ONLY (never writable)...
+        expect(deps.ioManager.registerVolume).toHaveBeenCalledWith(
+            expect.objectContaining({ read_only: true }), { initializeIdentity: true });
+        // ...and the failed row write was cleaned up, so the fleet is not left serving an unpersisted volume.
+        expect(deps.ioManager.deregisterVolume).toHaveBeenCalledWith(2);
+        // It was never enabled, so no writable window ever existed.
+        expect(deps.ioManager.updateVolumeFlags).not.toHaveBeenCalled();
+    });
+
+    // The physical claim comes BEFORE the durable row, and the volume is only made WRITABLE after the row lands.
+    it('claims the disk read-only before the row, and enables only after it is durable', async () => {
+        const order: string[] = [];
+        deps.ioManager.registerVolume.mockImplementation(async () => { order.push('register(ro)'); });
+        deps.database.createVolume.mockImplementation(async () => { order.push('createVolume'); });
+        deps.database.updateVolumeFlags.mockImplementation(async () => { order.push('enable'); });
+        deps.listRawBlockDevices
+            .mockResolvedValueOnce([baseDevice])
+            .mockResolvedValueOnce([deviceWithPartition(null)])
+            .mockResolvedValueOnce([deviceWithPartition('PART-UUID')]);
+
+        const provisioner = new DeviceProvisioner(deps);
+        await provisioner.provision({ blockPath: '/dev/sdb' });
+
+        expect(order).toEqual(['register(ro)', 'createVolume', 'enable']);
     });
 
     it('wipes existing partitions when authorized', async () => {

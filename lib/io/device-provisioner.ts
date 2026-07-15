@@ -413,13 +413,49 @@ export class DeviceProvisioner {
         // platters what is in front of it and will not rewrite the fleet's keys behind a disk it cannot see.
         // Nothing to lose, nothing to restore, nothing to get subtly wrong.
 
-        await this.deps.database.createVolume(volumeConfig);
+        // ⚠️ CLAIM THE DISK BEFORE THE DATABASE ROW, AND CLAIM IT NON-WRITABLE. Two invariants, one ordering:
+        //
+        //  1. ORPHANS BEAT PHANTOMS. The physical identity claim (.identity on the filesystem) goes onto the
+        //     disk BEFORE the Mongo row. A failure then leaves a claimed disk with no row -- a recoverable
+        //     orphan -- never a row pointing at a disk we did not finish claiming, which is a phantom.
+        //
+        //  2. NOT WRITABLE UNTIL DURABLE. registerVolume makes the volume part of the LIVE fleet. If it were
+        //     writable in that instant, a concurrent PUT could place slices on it and write object rows that
+        //     reference it -- and if the row write below then failed, those object rows would point at a volume
+        //     the fleet no longer has. So we register it READ-ONLY: getWritableVolumes() excludes it, the planner
+        //     never picks it, and no slice can land until its row is durable and we make it writable.
+        //
+        // registerVolume is the ONLY caller that may stamp our identity onto a disk -- it just formatted it.
+        // Fenced, because initializeIdentity writes to physical media, and a claim on the wrong disk is a lie.
+        const readOnlyConfig: PersistedVolumeConfig = { ...volumeConfig, read_only: true };
 
-        // The ONLY caller that may stamp our identity onto a disk: this one just formatted it. Fenced, because
-        // initializeIdentity writes a .identity FILE to the disk's filesystem -- a claim on physical media -- and
-        // a claim on the wrong disk is a lie about whose data it is.
         await this.fencedWrite(blockPath, diskSerial, `claim identity on ${blockPath}`, () =>
-            this.deps.ioManager.registerVolume(volumeConfig, { initializeIdentity: true }));
+            this.deps.ioManager.registerVolume(readOnlyConfig, { initializeIdentity: true }));
+
+        // THE DURABLE ROW (still read-only). If this fails, deregister -- the volume was never writable, so no
+        // slice can have landed on it -- and leave the disk as a recoverable orphan, not a phantom.
+        try {
+            await this.deps.database.createVolume(readOnlyConfig);
+        }
+        catch (err) {
+            await this.deps.ioManager.deregisterVolume(volumeConfig.id).catch(deregErr =>
+                log.error('volume%d: could not deregister after a failed record write: %s', volumeConfig.id, deregErr));
+            throw new HttpBadRequestError(
+                `volume ${volumeConfig.id} was written to disk but its database record could not be created `
+                + `(${err instanceof Error ? err.message : String(err)}). The disk carries our identity and is a `
+                + `recoverable orphan -- it was never made writable, so nothing was placed on it, and it has NOT `
+                + `been left as a phantom. Fix the database and re-run recovery, or re-provision the disk.`
+            );
+        }
+
+        // The row is durable. NOW make it writable, on disk (Mongo) first then in memory -- the same order every
+        // other flag change uses. Whichever of these two fails, the result is safe: the durable row already
+        // exists, so there is never a phantom and never lost data. If the Mongo update fails the volume is a
+        // valid read-only volume an operator can enable; if only the in-memory update fails, Mongo says writable
+        // and the fleet catches up on the next reconcile or restart. Not yet taking writes, at worst.
+        await this.deps.database.updateVolumeFlags(volumeConfig.id, { isReadOnly: false });
+        await this.deps.ioManager.updateVolumeFlags(volumeConfig.id, { isReadOnly: false });
+
         return volumeConfig;
     }
 
