@@ -563,6 +563,7 @@ export class HttpMgmt {
             name: b.name,
             publicRead: b.publicRead ?? null,     // null = unset (open while dark)
             publicWrite: b.publicWrite ?? null,
+            deleteProtected: b.deleteProtected ?? false,
             activity: activity[b.name ?? ''] ?? { anon: 0, auth: 0 }
         }));
         return { buckets: rows, enforced: enforced === true };
@@ -592,8 +593,8 @@ export class HttpMgmt {
     }
 
     private static async handleBucketPolicyRequest(req: HttpRequest, params: { id: string }): Promise<{ updated: boolean }> {
-        const payload = await this.parseJsonBody<{ publicRead?: unknown; publicWrite?: unknown }>(req);
-        const policy: { publicRead?: boolean; publicWrite?: boolean } = {};
+        const payload = await this.parseJsonBody<{ publicRead?: unknown; publicWrite?: unknown; deleteProtected?: unknown }>(req);
+        const policy: { publicRead?: boolean; publicWrite?: boolean; deleteProtected?: boolean } = {};
         if (payload.publicRead !== undefined) {
             if (typeof payload.publicRead !== 'boolean') throw new HttpBadRequestError('publicRead must be a boolean');
             policy.publicRead = payload.publicRead;
@@ -602,8 +603,12 @@ export class HttpMgmt {
             if (typeof payload.publicWrite !== 'boolean') throw new HttpBadRequestError('publicWrite must be a boolean');
             policy.publicWrite = payload.publicWrite;
         }
-        if (policy.publicRead === undefined && policy.publicWrite === undefined)
-            throw new HttpBadRequestError('publicRead and/or publicWrite is required');
+        if (payload.deleteProtected !== undefined) {
+            if (typeof payload.deleteProtected !== 'boolean') throw new HttpBadRequestError('deleteProtected must be a boolean');
+            policy.deleteProtected = payload.deleteProtected;
+        }
+        if (policy.publicRead === undefined && policy.publicWrite === undefined && policy.deleteProtected === undefined)
+            throw new HttpBadRequestError('publicRead, publicWrite, and/or deleteProtected is required');
 
         // THE JOURNAL FIRST, then Mongo -- the same order as every other namespace change, and for the same
         // reason. The snapshot froze this bucket's policy at snapshot time; if a policy change is not recorded
@@ -616,7 +621,8 @@ export class HttpMgmt {
             ts: new Date().toISOString(),
             id: String(params.id),
             ...(policy.publicRead === undefined ? {} : { pr: policy.publicRead }),
-            ...(policy.publicWrite === undefined ? {} : { pw: policy.publicWrite })
+            ...(policy.publicWrite === undefined ? {} : { pw: policy.publicWrite }),
+            ...(policy.deleteProtected === undefined ? {} : { dp: policy.deleteProtected })
         });
 
         const updated = await database.setBucketPolicy(params.id, policy);

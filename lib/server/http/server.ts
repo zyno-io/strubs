@@ -415,6 +415,11 @@ export class HttpServer {
 
     private async _handleHttpDeleteRequest(requestId: number, req: HttpRequest, res: HttpResponse): Promise<void> {
         await this._withFileRecord(req, res, async record => {
+            // Delete protection is a per-bucket lock that blocks EVERY object delete in the bucket, always --
+            // independent of the (dark-by-default) auth path -- so it is enforced here, at the one choke point
+            // every DELETE passes through, before any slice is touched. A clean 403 with a plain-text reason.
+            if (await HttpHelpers.isBucketDeleteProtected(req.url, record.bucketId))
+                return this._outputHttpForbidden(res, 'bucket is delete-protected');
             const RequestCtor = this.deps.ObjectDeleteRequest;
             const request = new RequestCtor(requestId, record, req, res);
             await request.process();

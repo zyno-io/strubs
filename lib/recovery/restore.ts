@@ -38,10 +38,10 @@ const log = createLogger('restore');
 // The journal supplies the names. The disks supply the truth.
 
 export type RestoreRecord =
-    | { op: 'container'; id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean }
+    | { op: 'container'; id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean; dp?: boolean }
     | { op: 'put'; id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number }
     | { op: 'del'; id: string }
-    | { op: 'policy'; id: string; pr?: boolean; pw?: boolean }
+    | { op: 'policy'; id: string; pr?: boolean; pw?: boolean; dp?: boolean }
     | { op: 'end'; containers: number; objects: number; sha256: string };
 
 export type RestoreSummary = {
@@ -110,7 +110,7 @@ export type RestoreDeps = {
     beginRestore: () => Promise<void>;
     endRestore: () => Promise<void>;
     // Write a rebuilt record into Mongo. Injected so a DRY RUN can count without touching anything.
-    writeContainer: (r: { id: string; cid: string | null; name: string; bucketId: string | null; pr?: boolean; pw?: boolean }) => Promise<void>;
+    writeContainer: (r: { id: string; cid: string | null; name: string; bucketId: string | null; pr?: boolean; pw?: boolean; dp?: boolean }) => Promise<void>;
     writeObject: (r: Record<string, unknown>) => Promise<void>;
 };
 
@@ -267,7 +267,7 @@ export class NamespaceRestore {
 
             // ---- 1. the namespace as it was ----
             const containers = new Map<string,
-                { id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean }>();
+                { id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean; dp?: boolean }>();
             const objects = new Map<string, RestoreRecord & { op: 'put' }>();
             let trailer: (RestoreRecord & { op: 'end' }) | null = null;
             // Objects the journal says were deleted. Held aside rather than discarded, because a `del` is
@@ -434,7 +434,8 @@ export class NamespaceRestore {
                             cid: r.cid,
                             name: r.name,
                             ...(had?.pr === undefined ? {} : { pr: had.pr }),
-                            ...(had?.pw === undefined ? {} : { pw: had.pw })
+                            ...(had?.pw === undefined ? {} : { pw: had.pw }),
+                            ...(had?.dp === undefined ? {} : { dp: had.dp })
                         });
                     }
                     else if (r.op === 'policy') {
@@ -494,6 +495,23 @@ export class NamespaceRestore {
                             }
 
                             next[f] = want;               // closing, or already open: safe to apply
+                        }
+
+                        // deleteProtected INVERTS the polarity: dp=true CLOSES (blocks deletes), dp=false OPENS
+                        // (allows them). The close-only rule is the same principle -- a journalled policy may only
+                        // ever RESTRICT -- so here it is dp=false, the one that would strip protection off a bucket
+                        // somebody locked, that must be refused. An escaped record can then only ever over-protect
+                        // (deletes 403; an operator clears it in one call), never silently expose a locked bucket.
+                        if (r.dp !== undefined) {
+                            if (r.dp === false && bucket.dp === true) {
+                                log.error('journal: a policy record would REMOVE delete-protection on bucket %s. A '
+                                    + 'journalled policy may only ever ADD protection on restore, never strip it. NOT '
+                                    + 'honouring this flag. Re-apply it deliberately if it was real.', r.id);
+                                policiesDeclined++;
+                            }
+                            else {
+                                next.dp = r.dp;   // protecting, or already unprotected: safe to apply
+                            }
                         }
 
                         containers.set(r.id, next);
@@ -856,9 +874,10 @@ export function isCoherent(r: unknown): boolean {
     const parentOk = x.cid === null || typeof x.cid === 'string';
 
     if (x.op === 'container') {
-        const p = r as { pr?: unknown; pw?: unknown };
+        const p = r as { pr?: unknown; pw?: unknown; dp?: unknown };
         if (p.pr !== undefined && typeof p.pr !== 'boolean') return false;
         if (p.pw !== undefined && typeof p.pw !== 'boolean') return false;
+        if (p.dp !== undefined && typeof p.dp !== 'boolean') return false;
         return typeof x.name === 'string' && !!x.name && parentOk;
     }
     if (x.op === 'del') return true;                       // an id is all a delete needs
@@ -871,9 +890,10 @@ export function isCoherent(r: unknown): boolean {
         // malformed record reading `pr: "false"` would restore a bucket as PUBLICLY READABLE. That is a
         // corrupt byte turning into an access-control decision, and it fails in the one direction that
         // actually leaks: private becomes public.
-        const p = r as { pr?: unknown; pw?: unknown };
+        const p = r as { pr?: unknown; pw?: unknown; dp?: unknown };
         if (p.pr !== undefined && typeof p.pr !== 'boolean') return false;
         if (p.pw !== undefined && typeof p.pw !== 'boolean') return false;
+        if (p.dp !== undefined && typeof p.dp !== 'boolean') return false;
         return true;
     }
     if (x.op === 'put')

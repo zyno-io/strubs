@@ -20,6 +20,10 @@ export interface ContentDocument {
     // until the policy is explicitly set. publicWrite grants anonymous PUT *and DELETE*.
     publicRead?: boolean;
     publicWrite?: boolean;
+    // Delete protection: when true on a bucket, ALL object deletes within it are refused (403). A
+    // "more-closed" flag, so like publicRead/publicWrite it may only ever be tightened by a restore, never
+    // loosened -- a restore may ADD protection but never silently REMOVE it. Absent means not protected.
+    deleteProtected?: boolean;
     size?: number;
     chunkSize?: number;
     sliceSize?: number | null;

@@ -61,7 +61,7 @@ export type JournalRecord =
     // that matters: the snapshot records the policy as it was when the snapshot ran, so a bucket made PRIVATE
     // afterwards would be restored PUBLIC. The recovery would quietly re-open a bucket somebody deliberately
     // closed, and report success. Every other namespace change is journaled; so is this one.
-    | { op: 'policy'; ts: string; id: string; pr?: boolean; pw?: boolean };
+    | { op: 'policy'; ts: string; id: string; pr?: boolean; pw?: boolean; dp?: boolean };
 
 type Replica = {
     volumeId: number;

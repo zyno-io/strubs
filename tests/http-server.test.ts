@@ -29,9 +29,11 @@ vi.mock('../lib/database', () => ({
 }));
 
 const httpHelpersGetObjectMeta = vi.fn();
+const httpHelpersIsBucketDeleteProtected = vi.fn(async () => false);
 vi.mock('../lib/server/http/helpers', () => ({
     HttpHelpers: {
         getObjectMeta: httpHelpersGetObjectMeta,
+        isBucketDeleteProtected: httpHelpersIsBucketDeleteProtected,
     },
 }));
 
@@ -372,6 +374,19 @@ describe('HttpServer', () => {
 
         expect(objectDelete.ctor).toHaveBeenCalledTimes(1);
         expect(objectDelete.process).toHaveBeenCalledTimes(1);
+    });
+
+    it('REFUSES to delete an object in a delete-protected bucket (403), never entering the delete path', async () => {
+        const server = await importServer();
+        const { req, res, resData } = createReqRes('DELETE', '/locked/cat.jpg');
+        httpHelpersGetObjectMeta.mockResolvedValueOnce(createFileRecord());
+        httpHelpersIsBucketDeleteProtected.mockResolvedValueOnce(true);
+
+        await server._handleHttpRequest(req, res);
+
+        expect(resData.status).toBe(403);
+        expect(objectDelete.ctor).not.toHaveBeenCalled();
+        expect(objectDelete.process).not.toHaveBeenCalled();
     });
 
     it('returns 404 when DELETE target is missing', async () => {

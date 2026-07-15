@@ -2097,15 +2097,24 @@ describe('recovery: absent means absent, which means private', () => {
         await repo.restoreContainer({ id: 'c'.repeat(24), cid: null, name: 'photo', bucketId: null });
 
         const op = ops[0] as { $set: Record<string, unknown>; $unset?: Record<string, unknown> };
-        expect(op.$unset).toEqual({ publicRead: '', publicWrite: '' });
+        // deleteProtected rides the same rail: absent in the namespace record => removed from the row, so a
+        // stale protection cannot survive a restore that says the bucket is not protected.
+        expect(op.$unset).toEqual({ publicRead: '', publicWrite: '', deleteProtected: '' });
 
-        // ...and when the namespace DOES say public, it is set, and Mongo is never handed an empty $unset.
+        // ...and when the namespace DOES say public, it is set; the only field still absent (dp) is unset.
         ops.length = 0;
         await repo.restoreContainer({ id: 'c'.repeat(24), cid: null, name: 'photo', bucketId: null, pr: true, pw: false });
         const op2 = ops[0] as { $set: Record<string, unknown>; $unset?: Record<string, unknown> };
         expect(op2.$set.publicRead).toBe(true);
         expect(op2.$set.publicWrite).toBe(false);
-        expect(op2.$unset).toBeUndefined();
+        expect(op2.$unset).toEqual({ deleteProtected: '' });
+
+        // ...and when EVERY policy field is present, Mongo is never handed an empty $unset.
+        ops.length = 0;
+        await repo.restoreContainer({ id: 'c'.repeat(24), cid: null, name: 'photo', bucketId: null, pr: true, pw: false, dp: true });
+        const op3 = ops[0] as { $set: Record<string, unknown>; $unset?: Record<string, unknown> };
+        expect(op3.$set.deleteProtected).toBe(true);
+        expect(op3.$unset).toBeUndefined();
     });
 });
 

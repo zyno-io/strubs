@@ -60,6 +60,19 @@ const contextMenu = ref<{ x: number; y: number; volumeId: number | null }>({ x: 
 // server stops the flashing ~3s after the last ping, so closing the tab or a lost "stop" self-heals.
 const identifyDrive = ref<{ volumeId: number; device: string | null } | null>(null);
 let identifyHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+// SMART data viewer (populated on demand from the volume-detail endpoint)
+interface SmartSummary {
+  updatedAt: string | null;
+  isHealthy: boolean | null;
+  temperatureC: number | null;
+  powerOnHours: number | null;
+  error: string | null;
+  statusFlags: string[];
+  isSupported: boolean;
+}
+interface SmartInfo { summary: SmartSummary; details: Record<string, unknown> | null; }
+const smartModal = ref<{ volumeId: number; loading: boolean; error: string | null; data: SmartInfo | null } | null>(null);
 const showEditLabelModal = ref<boolean>(false);
 const editingVolumeId = ref<number | null>(null);
 const editLabelValue = ref<string>('');
@@ -1482,6 +1495,28 @@ async function openIdentify(): Promise<void> {
   identifyHeartbeatTimer = setInterval(sendIdentifyBeat, 1000);
 }
 
+// View a drive's SMART data: pull the volume-detail endpoint (which includes the SMART snapshot) and
+// show it in a modal. Read-only.
+async function openSmart(): Promise<void> {
+  const volume = contextMenuVolume.value;
+  if (volume === null) return;
+  const volumeId = volume.id;
+  hideContextMenu();
+  smartModal.value = { volumeId, loading: true, error: null, data: null };
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/volumes/${volumeId}`);
+    if (!res.ok) throw new Error(`Failed to load SMART data (HTTP ${res.status})`);
+    const detail = await res.json() as { smartInfo?: SmartInfo | null };
+    smartModal.value = { volumeId, loading: false, error: null, data: detail.smartInfo ?? null };
+  } catch (err) {
+    smartModal.value = { volumeId, loading: false, error: err instanceof Error ? err.message : 'Failed to load SMART data', data: null };
+  }
+}
+
+function closeSmart(): void {
+  smartModal.value = null;
+}
+
 async function sendIdentifyBeat(): Promise<void> {
   const target = identifyDrive.value;
   if (target === null) return;
@@ -1600,6 +1635,7 @@ type BucketRow = {
   name: string;
   publicRead: boolean | null;
   publicWrite: boolean | null;
+  deleteProtected: boolean;
   // Null until the (expensive) stats aggregation comes back -- names and policy render immediately.
   objectCount: number | null;
   logicalBytes: number | null;
@@ -1798,12 +1834,18 @@ function objectUrl(entryPath: string): string {
 
 // Checkbox handler for the bucket policy toggles. publicWrite gets an explicit, visible confirmation
 // (not just a tooltip) because it also grants anonymous DELETE. Reverts the checkbox on cancel/failure.
-async function onPolicyToggle(bucket: BucketRow, field: 'publicRead' | 'publicWrite', event: Event): Promise<void> {
+async function onPolicyToggle(bucket: BucketRow, field: 'publicRead' | 'publicWrite' | 'deleteProtected', event: Event): Promise<void> {
   const input = event.target as HTMLInputElement;
   const value = input.checked;
   if (field === 'publicWrite' && value) {
     if (!confirm(`Make bucket "${bucket.name}" publicly writable?\n\nThis ALSO allows anonymous DELETE — anyone could overwrite or delete any object in this bucket.`)) {
       input.checked = false;
+      return;
+    }
+  }
+  if (field === 'deleteProtected' && !value) {
+    if (!confirm(`Turn OFF delete protection for bucket "${bucket.name}"?\n\nObject deletes in this bucket will be allowed again.`)) {
+      input.checked = true;
       return;
     }
   }
@@ -1813,7 +1855,7 @@ async function onPolicyToggle(bucket: BucketRow, field: 'publicRead' | 'publicWr
   input.checked = bucket[field] === true;
 }
 
-async function setBucketPolicy(bucket: BucketRow, field: 'publicRead' | 'publicWrite', value: boolean): Promise<void> {
+async function setBucketPolicy(bucket: BucketRow, field: 'publicRead' | 'publicWrite' | 'deleteProtected', value: boolean): Promise<void> {
   accessBusy.value = true;
   try {
     const res = await apiFetch(`${apiBaseUrl}/$/buckets/${bucket.id}/policy`, {
@@ -2837,7 +2879,6 @@ onUnmounted(() => {
               <th>Name</th>
               <th class="num">Size</th>
               <th>Type</th>
-              <th></th>
             </tr>
           </thead>
           <tbody>
@@ -2849,23 +2890,21 @@ onUnmounted(() => {
             >
               <td>
                 <span class="entry-icon">{{ entry.isContainer ? '📁' : '📄' }}</span>
-                <span :class="{ 'entry-folder': entry.isContainer }">{{ entry.name }}</span>
-              </td>
-              <td class="num">{{ entry.isFile && entry.size !== null ? formatBytes(entry.size) : '—' }}</td>
-              <td class="entry-mime">{{ entry.isContainer ? 'folder' : (entry.mime || 'unknown') }}</td>
-              <td class="access-actions">
                 <a
                   v-if="entry.isFile"
-                  class="access-mini-btn"
+                  class="entry-name entry-link"
                   :href="objectUrl(browsePath + '/' + entry.name)"
                   target="_blank"
                   rel="noopener"
                   @click.stop
-                >Open</a>
+                >{{ entry.name }}</a>
+                <span v-else class="entry-name entry-folder">{{ entry.name }}</span>
               </td>
+              <td class="num">{{ entry.isFile && entry.size !== null ? formatBytes(entry.size) : '—' }}</td>
+              <td class="entry-mime">{{ entry.isContainer ? 'folder' : (entry.mime || 'unknown') }}</td>
             </tr>
             <tr v-if="!browseEntries.length && !browseLoading">
-              <td colspan="4" class="access-empty">This folder is empty.</td>
+              <td colspan="3" class="access-empty">This folder is empty.</td>
             </tr>
           </tbody>
         </table>
@@ -2926,6 +2965,7 @@ onUnmounted(() => {
                 <th class="num">Size</th>
                 <th>Public read</th>
                 <th>Public write</th>
+                <th title="Blocks ALL object deletes in this bucket">Delete protection</th>
                 <th class="num" title="Requests seen since the server last started">Anon / Auth</th>
               </tr>
             </thead>
@@ -2964,9 +3004,20 @@ onUnmounted(() => {
                     </span>
                   </label>
                 </td>
+                <td>
+                  <label class="access-switch" title="When on, every object delete in this bucket is refused">
+                    <input
+                      type="checkbox"
+                      :checked="b.deleteProtected"
+                      :disabled="accessBusy"
+                      @change="onPolicyToggle(b, 'deleteProtected', $event)"
+                    />
+                    <span :class="{ 'delete-protected': b.deleteProtected }">{{ b.deleteProtected ? 'protected' : 'off' }}</span>
+                  </label>
+                </td>
                 <td class="num">{{ b.activity.anon.toLocaleString() }} / {{ b.activity.auth.toLocaleString() }}</td>
               </tr>
-              <tr v-if="!buckets.length"><td colspan="6" class="access-empty">No buckets.</td></tr>
+              <tr v-if="!buckets.length"><td colspan="7" class="access-empty">No buckets.</td></tr>
             </tbody>
           </table>
         </div>
@@ -3173,6 +3224,13 @@ onUnmounted(() => {
       >
         Identify (flash LED)
       </div>
+      <div
+        v-if="contextMenuVolume"
+        class="context-menu-item"
+        @click="openSmart"
+      >
+        View SMART Data
+      </div>
       <div class="context-menu-item delete" @click="deleteVolume">Delete</div>
     </div>
 
@@ -3196,6 +3254,63 @@ onUnmounted(() => {
         </div>
         <div class="modal-footer">
           <button @click="stopIdentify" class="create-btn">Stop</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- SMART Data Modal -->
+    <div v-if="smartModal !== null" class="modal-overlay" @click="closeSmart">
+      <div class="modal" @click.stop style="max-width: 560px;">
+        <div class="modal-header">
+          <h2>SMART Data — Volume {{ smartModal.volumeId }}</h2>
+          <button @click="closeSmart" class="close-btn">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div v-if="smartModal.loading" class="smart-note">Loading…</div>
+          <div v-else-if="smartModal.error" class="smart-note smart-error">{{ smartModal.error }}</div>
+          <div v-else-if="!smartModal.data || smartModal.data.summary.isSupported === false" class="smart-note">
+            SMART is not available for this drive.
+          </div>
+          <div v-else>
+            <div class="smart-summary">
+              <div class="smart-row">
+                <span class="smart-label">Health</span>
+                <span
+                  class="smart-value smart-health"
+                  :class="smartModal.data.summary.isHealthy === false ? 'bad' : (smartModal.data.summary.isHealthy ? 'good' : '')"
+                >{{ smartModal.data.summary.isHealthy === null ? 'Unknown' : (smartModal.data.summary.isHealthy ? 'PASSED' : 'FAILED') }}</span>
+              </div>
+              <div class="smart-row">
+                <span class="smart-label">Temperature</span>
+                <span class="smart-value">{{ smartModal.data.summary.temperatureC !== null ? smartModal.data.summary.temperatureC + ' °C' : '—' }}</span>
+              </div>
+              <div class="smart-row">
+                <span class="smart-label">Power-on hours</span>
+                <span class="smart-value">{{ smartModal.data.summary.powerOnHours !== null ? smartModal.data.summary.powerOnHours.toLocaleString() : '—' }}</span>
+              </div>
+              <div class="smart-row">
+                <span class="smart-label">Last updated</span>
+                <span class="smart-value">{{ smartModal.data.summary.updatedAt ?? '—' }}</span>
+              </div>
+              <div v-if="smartModal.data.summary.error" class="smart-row">
+                <span class="smart-label">Error</span>
+                <span class="smart-value smart-error">{{ smartModal.data.summary.error }}</span>
+              </div>
+              <div v-if="smartModal.data.summary.statusFlags.length" class="smart-row">
+                <span class="smart-label">Flags</span>
+                <span class="smart-value">
+                  <span v-for="flag in smartModal.data.summary.statusFlags" :key="flag" class="smart-flag">{{ flag }}</span>
+                </span>
+              </div>
+            </div>
+            <details v-if="smartModal.data.details" class="smart-details">
+              <summary>Raw smartctl output</summary>
+              <pre class="smart-raw">{{ JSON.stringify(smartModal.data.details, null, 2) }}</pre>
+            </details>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button @click="closeSmart" class="create-btn">Close</button>
         </div>
       </div>
     </div>
@@ -4584,6 +4699,7 @@ h2 {
   cursor: pointer;
   font-size: 14px;
   color: #333;
+  white-space: nowrap;
 }
 
 .context-menu-item:hover {
@@ -4675,6 +4791,21 @@ h2 {
 .entry-icon { margin-right: 8px; }
 .entry-folder { font-weight: 600; }
 .entry-mime { color: #888; font-size: 12px; }
+.entry-name { cursor: pointer; }
+.entry-link { color: #1976d2; text-decoration: none; }
+.entry-link:hover { text-decoration: underline; }
+.smart-note { padding: 12px 0; color: #666; font-size: 14px; }
+.smart-note.smart-error, .smart-value.smart-error { color: #f44336; }
+.smart-summary { display: flex; flex-direction: column; gap: 8px; }
+.smart-row { display: flex; align-items: baseline; gap: 12px; }
+.smart-label { flex: 0 0 130px; color: #888; font-size: 13px; }
+.smart-value { color: #333; font-size: 14px; }
+.smart-health.good { color: #2e7d32; font-weight: 600; }
+.smart-health.bad { color: #f44336; font-weight: 600; }
+.smart-flag { display: inline-block; background: #fff3e0; color: #e65100; border-radius: 3px; padding: 1px 6px; margin-right: 6px; font-size: 12px; }
+.smart-details { margin-top: 14px; }
+.smart-details summary { cursor: pointer; color: #1976d2; font-size: 13px; }
+.smart-raw { max-height: 300px; overflow: auto; background: #f7f7f7; border: 1px solid #eee; border-radius: 4px; padding: 10px; font-size: 12px; margin-top: 8px; }
 
 .bucket-link {
   background: none; border: none; padding: 0; cursor: pointer;
@@ -4690,6 +4821,7 @@ h2 {
 .access-banner.secret { background: #e8f5e9; border: 1px solid #a5d6a7; color: #1b5e20; display: flex; flex-direction: column; gap: 8px; }
 .access-banner.banner-standalone { margin: 0 18px 4px; }
 .write-warn { color: #c62828; font-weight: 600; }
+.delete-protected { color: #2e7d32; font-weight: 600; }
 .secret-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .secret-row code { background: #fff; padding: 4px 8px; border-radius: 4px; border: 1px solid #c8e6c9; word-break: break-all; }
 

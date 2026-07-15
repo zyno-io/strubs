@@ -305,11 +305,11 @@ export class Database {
         return this.contentRepository.listBuckets();
     }
 
-    async listAllContainers(): Promise<Array<{ id: string; cid: string | null; name: string }>> {
+    async listAllContainers(): Promise<Array<{ id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean; dp?: boolean }>> {
         return this.contentRepository.listAllContainers();
     }
 
-    async restoreContainer(r: { id: string; cid: string | null; name: string; bucketId: string | null; pr?: boolean; pw?: boolean }): Promise<void> {
+    async restoreContainer(r: { id: string; cid: string | null; name: string; bucketId: string | null; pr?: boolean; pw?: boolean; dp?: boolean }): Promise<void> {
         return this.contentRepository.restoreContainer(r);
     }
 
@@ -443,7 +443,7 @@ export class Database {
         return this.contentRepository.resolveContainerStrict(path);
     }
 
-    async setBucketPolicy(id: ObjectIdentifier, policy: { publicRead?: boolean; publicWrite?: boolean }): Promise<boolean> {
+    async setBucketPolicy(id: ObjectIdentifier, policy: { publicRead?: boolean; publicWrite?: boolean; deleteProtected?: boolean }): Promise<boolean> {
         return this.contentRepository.setBucketPolicy(id, policy);
     }
 

@@ -1069,7 +1069,7 @@ export class ContentRepository {
         return removed;
     }
 
-    async restoreContainer(r: { id: string; cid: string | null; name: string; bucketId: string | null; pr?: boolean; pw?: boolean }): Promise<void> {
+    async restoreContainer(r: { id: string; cid: string | null; name: string; bucketId: string | null; pr?: boolean; pw?: boolean; dp?: boolean }): Promise<void> {
         const id = new ObjectId(r.id);
         const containerId = r.cid ? new ObjectId(r.cid) : null;
 
@@ -1094,6 +1094,9 @@ export class ContentRepository {
 
         if (r.pw === undefined) unset.publicWrite = '';
         else set.publicWrite = !!r.pw;
+
+        if (r.dp === undefined) unset.deleteProtected = '';
+        else set.deleteProtected = !!r.dp;
 
         // Mongo rejects an empty `$unset`, so it is only included when it has something to say.
         await this.collection.updateOne(
@@ -1146,13 +1149,14 @@ export class ContentRepository {
         for await (const doc of cursor) yield String(doc._id);
     }
 
-    async listAllContainers(): Promise<Array<{ id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean }>> {
-        // publicRead/publicWrite come along because a bucket's ACCESS POLICY is part of the namespace. Leave
-        // them behind and every restored bucket comes back private -- the safe direction, and still a namespace
-        // that does not match the one we lost, with the restore reporting success either way.
+    async listAllContainers(): Promise<Array<{ id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean; dp?: boolean }>> {
+        // publicRead/publicWrite/deleteProtected come along because a bucket's ACCESS POLICY is part of the
+        // namespace. Leave them behind and every restored bucket comes back private and unprotected -- the safe
+        // direction for the public flags, but for deleteProtected that would DROP protection, so it must ride
+        // along too or a snapshot silently un-protects a bucket.
         const docs = await this.collection
             .find({ isContainer: true },
-                { projection: { _id: 1, containerId: 1, name: 1, publicRead: 1, publicWrite: 1 } })
+                { projection: { _id: 1, containerId: 1, name: 1, publicRead: 1, publicWrite: 1, deleteProtected: 1 } })
             .toArray();
         return docs.map(doc => ({
             id: String(doc._id),
@@ -1162,7 +1166,8 @@ export class ContentRepository {
             // other 55,000 folders would be 55,000 lines of noise asserting something that was never true.
             ...(doc.containerId ? {} : {
                 ...(doc.publicRead === undefined ? {} : { pr: !!doc.publicRead }),
-                ...(doc.publicWrite === undefined ? {} : { pw: !!doc.publicWrite })
+                ...(doc.publicWrite === undefined ? {} : { pw: !!doc.publicWrite }),
+                ...(doc.deleteProtected === undefined ? {} : { dp: !!doc.deleteProtected })
             })
         }));
     }
@@ -1216,7 +1221,7 @@ export class ContentRepository {
 
     async listBuckets(): Promise<ContentDocument[]> {
         const docs = await this.collection
-            .find({ containerId: null, isContainer: true }, { projection: { _id: 1, name: 1, publicRead: 1, publicWrite: 1 } })
+            .find({ containerId: null, isContainer: true }, { projection: { _id: 1, name: 1, publicRead: 1, publicWrite: 1, deleteProtected: 1 } })
             .toArray();
         return docs.map(doc => this.normalize(doc));
     }
@@ -1225,12 +1230,13 @@ export class ContentRepository {
     // an explicit operator action (admin API/UI) -- never automatically -- so it does not mutate existing
     // data as a side effect of the rollout. Scoped to top-level containers so a nested path can't be
     // mistaken for a bucket.
-    async setBucketPolicy(id: ObjectIdentifier, policy: { publicRead?: boolean; publicWrite?: boolean }): Promise<boolean> {
+    async setBucketPolicy(id: ObjectIdentifier, policy: { publicRead?: boolean; publicWrite?: boolean; deleteProtected?: boolean }): Promise<boolean> {
         const mongoId = this.toMongoId(id);
         if (!mongoId) return false;
         const set: Record<string, boolean> = {};
         if (policy.publicRead !== undefined) set.publicRead = policy.publicRead;
         if (policy.publicWrite !== undefined) set.publicWrite = policy.publicWrite;
+        if (policy.deleteProtected !== undefined) set.deleteProtected = policy.deleteProtected;
         if (!Object.keys(set).length) return false;
         const res = await this.collection.updateOne(
             { _id: mongoId, containerId: null, isContainer: true },

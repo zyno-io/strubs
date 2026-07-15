@@ -37,7 +37,7 @@ export type SnapshotRecord =
     // publicRead/publicWrite and it comes back PRIVATE -- which is the safe direction, and still wrong: every
     // anonymous reader of a public bucket breaks, and the restore reports success while they do. Only top-level
     // containers are buckets, so `pr`/`pw` are absent on everything else.
-    | { op: 'container'; id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean }
+    | { op: 'container'; id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean; dp?: boolean }
     | { op: 'put'; id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number }
     // The last line, and the reason a truncated snapshot cannot be mistaken for a complete one. A gzip
     // stream that was cut off mid-write still decompresses to something that parses perfectly, line after
@@ -55,7 +55,7 @@ export type SnapshotStats = {
 export type SnapshotDeps = {
     // Every container, in any order. Small enough to hold (tens of thousands): they have to be sorted
     // parent-first before they can be written, and you cannot sort a stream you have not seen the end of.
-    listContainers: () => Promise<Array<{ id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean }>>;
+    listContainers: () => Promise<Array<{ id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean; dp?: boolean }>>;
     // Every object, streamed. There are millions, so this must never be materialised.
     streamObjects: () => AsyncIterable<{ id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number }>;
     now: () => Date;
@@ -180,7 +180,8 @@ export class SnapshotBuilder {
             const line = serialise({
                 op: 'container', id: c.id, cid: c.cid, name: c.name,
                 ...(c.pr === undefined ? {} : { pr: c.pr }),
-                ...(c.pw === undefined ? {} : { pw: c.pw })
+                ...(c.pw === undefined ? {} : { pw: c.pw }),
+                ...(c.dp === undefined ? {} : { dp: c.dp })
             });
             hash.update(line);
             if (!gzip.write(line)) await drain();

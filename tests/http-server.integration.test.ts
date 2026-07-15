@@ -332,6 +332,8 @@ const createDatabaseMock = () => {
             if (!record) notFound();
             return { ...record };
         }),
+        getBucketById: vi.fn(async () => null),     // no bucket policy in these tests -> never delete-protected
+        getBucketByName: vi.fn(async () => null),   // (the delete guard resolves the bucket by path name)
         reset: () => {
             storedRecords.clear();
             objectPathsById.clear();
