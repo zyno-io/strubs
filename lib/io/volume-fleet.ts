@@ -1,4 +1,3 @@
-import _ from 'lodash';
 
 import { database } from '../database';
 import { createLogger } from '../log';
@@ -73,8 +72,9 @@ export class VolumeFleet {
     // partition is the wrong size. Separated from initVolume so the reconciler and Enable path can
     // (re)bind an EXISTING volume object in place, preserving its counters/reservations.
     bindVolumeDevice(volume: Volume, devices: CachedDevice[]): boolean {
-        const partitionMatch = this.findPartitionByUuid(devices, volume.partitionUuid ?? undefined);
-        if (!partitionMatch) {
+        const matches = this.partitionsWithUuid(devices, volume.partitionUuid ?? undefined);
+
+        if (matches.length === 0) {
             this.deps.log.error?.(
                 'volume%d: partition with uuid %s was not found on any discovered device',
                 volume.id,
@@ -83,7 +83,23 @@ export class VolumeFleet {
             return false;
         }
 
-        const { device: onlineDevice, partition } = partitionMatch;
+        // ⚠️ A UUID IS ONLY UNIQUE AMONG DISKS NOBODY HAS CLONED. A dd copy of a STRUBS disk carries the same
+        // partition uuid, nameplate and .identity as the original -- and binding to "whichever the enumeration
+        // listed first" could mount the clone, then serve its stale data or write new slices onto it. The
+        // keyslot and wipe paths already refuse a duplicate uuid; the MOUNT path must too. Exactly one, or the
+        // volume stays unbound (offline) until the operator detaches the copy. Refusing to mount is the safe
+        // answer; mounting the wrong disk is not.
+        if (matches.length > 1) {
+            this.deps.log.error?.(
+                'volume%d: %d attached partitions carry uuid %s -- a clone is attached. Refusing to bind: '
+                + 'mounting either could serve or overwrite the wrong disk. Detach the copy and the volume will '
+                + 'bind on its own.',
+                volume.id, matches.length, volume.partitionUuid
+            );
+            return false;
+        }
+
+        const { device: onlineDevice, partition } = matches[0];
         if (partition.size !== volume.bytesTotal) {
             this.deps.log.error?.(
                 'volume%d: partition with uuid %s on device %s has size %d, expected %d',
@@ -314,13 +330,20 @@ export class VolumeFleet {
                         throw new Error('failed to initialize volume from configuration');
                     this._volumes[id] = volume;
                 }
-                else if (!volume.blockPath) {
-                    // Existing but unbound: a disk that was absent or still enumerating at boot (e.g. a
-                    // slow DAS enclosure) leaves an unbound Volume object. Enabling refreshes the device
-                    // list, so re-bind in place rather than starting with a null blockPath (which throws
-                    // "mount path not configured"). Rebinding in place preserves the object's counters.
+                else if (!volume.isStarted) {
+                    // About to (re)start an existing STOPPED volume. RE-BIND against the CURRENT device list
+                    // first -- which re-validates that its partition uuid still resolves to EXACTLY ONE attached
+                    // disk (no clone), whether or not it was bound before.
+                    //
+                    // ⚠️ This used to only re-bind when blockPath was null (unbound at boot). But `stop()`
+                    // unmounts WITHOUT clearing blockPath, so a disabled-but-bound volume kept its old binding --
+                    // and enabling it would `start()` on the cached path with the exact-one check never running.
+                    // A clone attached while the volume was disabled would then be mounted. Re-binding every stop
+                    // -> start closes that, and also picks up a device that was renamed while it was off.
                     if (!this.bindVolumeDevice(volume, devices))
-                        throw new Error(`volume ${id}: backing disk is not present; cannot enable`);
+                        throw new Error(
+                            `volume ${id}: backing disk is not present, or a clone makes its partition uuid `
+                            + `ambiguous; cannot enable. If a copy of this disk is attached, detach it.`);
                 }
                 if (!volume.isStarted) {
                     await volume.start();
@@ -450,7 +473,11 @@ export class VolumeFleet {
         if (!source)
             return true;
 
-        const match = this.findPartitionByUuid(devices, volume.partitionUuid ?? undefined);
+        // Exactly one match gives a live path; zero (gone) or more than one (a clone is attached) leaves it null,
+        // which this function treats as stale -- so a clone appearing takes the volume offline (remount will
+        // refuse to bind an ambiguous uuid) rather than risk following the mapper onto the wrong disk.
+        const matches = this.partitionsWithUuid(devices, volume.partitionUuid ?? undefined);
+        const match = matches.length === 1 ? matches[0] : null;
         const livePath = match ? (match.partition.path ?? `/dev/${match.partition.name}`) : null;
 
         // WHAT THE KERNEL SAYS IS MOUNTED THERE IS THE MAPPER, NOT THE PARTITION.
@@ -484,17 +511,19 @@ export class VolumeFleet {
         return source !== livePath;
     }
 
-    private findPartitionByUuid(devices: CachedDevice[], partitionUuid?: string): { device: CachedDevice; partition: CachedPartition } | undefined {
+    // ALL attached partitions carrying this uuid. Callers require EXACTLY ONE -- more than one means a clone is
+    // in the rack, and a uuid that names two disks names none for the purpose of deciding what to mount.
+    private partitionsWithUuid(devices: CachedDevice[], partitionUuid?: string): Array<{ device: CachedDevice; partition: CachedPartition }> {
         if (!partitionUuid)
-            return undefined;
+            return [];
 
-        for (const device of devices) {
-            const partition = _.find(device.partitions, { uuid: partitionUuid });
-            if (partition)
-                return { device, partition };
-        }
+        const matches: Array<{ device: CachedDevice; partition: CachedPartition }> = [];
+        for (const device of devices)
+            for (const partition of device.partitions ?? [])
+                if (partition.uuid === partitionUuid)
+                    matches.push({ device, partition });
 
-        return undefined;
+        return matches;
     }
 }
 

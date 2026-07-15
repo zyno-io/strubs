@@ -112,6 +112,55 @@ describe('VolumeFleet.reconcile', () => {
         expect(volume.isStarted).toBe(true);
     });
 
+    // ⚠️ A CLONE MUST NOT BE MOUNTED AS THE VOLUME. A dd copy carries the same partition uuid; binding to
+    // "whichever the enumeration listed first" could serve the clone's stale data or write onto it. Exactly one,
+    // or the volume stays offline until the copy is detached.
+    it('REFUSES to bind when a clone carries the same partition uuid, leaving the volume unbound', async () => {
+        const fleet = await makeFleet([{ id: 13, uuid: 'u13', enabled: true, partition_uuid: 'p13', partition_size: 1000 }]);
+        fleet.initializeVolumes([]);
+        const volume = fleet.getVolume(13)!;
+
+        // The real disk AND a clone are both attached, both carrying partition uuid p13.
+        const transitions = await fleet.reconcile([
+            device('sdf', part('p13', 'sdf1')),
+            device('sdx', part('p13', 'sdx1'))   // <- the clone
+        ]);
+
+        expect(transitions).toEqual([]);        // not restored to either
+        expect(volume.blockPath).toBeNull();
+        expect(volume.isPresent).toBe(false);
+    });
+
+    // ...and once the clone is detached, the volume binds on its own.
+    it('binds normally once exactly one partition carries the uuid', async () => {
+        const fleet = await makeFleet([{ id: 13, uuid: 'u13', enabled: true, partition_uuid: 'p13', partition_size: 1000 }]);
+        fleet.initializeVolumes([]);
+
+        const transitions = await fleet.reconcile([device('sdf', part('p13', 'sdf1'))]);
+
+        expect(transitions).toEqual([{ volumeId: 13, kind: 'restored', deviceName: 'sdf' }]);
+        expect(fleet.getVolume(13)!.blockPath).toBe('/dev/sdf1');
+    });
+
+    // ⚠️ RE-ENABLE MUST RE-VALIDATE, NOT TRUST THE CACHED BINDING. stop() unmounts but leaves blockPath set, so
+    // a disabled-but-bound volume that is enabled while a clone is attached would otherwise mount the cached
+    // path with the exact-one check never running. Enabling re-binds against the current rack, which refuses.
+    it('REFUSES to enable a stopped-but-bound volume while a clone carries its uuid', async () => {
+        const fleet = await makeFleet([{ id: 13, uuid: 'u13', enabled: true, partition_uuid: 'p13', partition_size: 1000 }]);
+        fleet.initializeVolumes([device('sdf', part('p13', 'sdf1'))]);
+        const volume = fleet.getVolume(13)!;
+        volume.isStarted = false;   // disabled: stopped, but blockPath is still '/dev/sdf1'
+        expect(volume.blockPath).toBe('/dev/sdf1');
+
+        // Enable while the real disk AND a clone are both attached.
+        await expect(fleet.updateVolumeFlags(13, { isEnabled: true }, [
+            device('sdf', part('p13', 'sdf1')),
+            device('sdx', part('p13', 'sdx1'))   // <- the clone
+        ])).rejects.toThrow(/clone makes its partition uuid ambiguous/);
+
+        expect(volume.isStarted).toBe(false);   // it did NOT mount either
+    });
+
     it('heals a stale mount when the disk was re-added under a new kernel name (vol 57 case)', async () => {
         const fleet = await makeFleet([{ id: 57, uuid: 'u57', enabled: true, partition_uuid: 'p57', partition_size: 1000 }]);
         // Started on /dev/sdan1, mounted at the strubs mountpoint.
