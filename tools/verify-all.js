@@ -277,29 +277,49 @@ remediationService.reportSliceFault = (f) => {
       if (Object.keys(set).length) update.$set = set;
       if (Object.keys(unset).length) update.$unset = unset;
       batch.push({ updateOne: { filter: { _id: doc._id }, update } });
-      if (batch.length >= 500) await flush();
+      // Flush often (not every 500): with multi-GB objects a 500-wide batch is ~an hour of work, so a crash
+      // would re-read ~1 TB and the fullVerifiedAt progress marker would sit still for that whole time. A small
+      // batch keeps the checkpoint tight and progress visible; the extra bulkWrites are negligible.
+      if (batch.length >= 25) await flush();
     }
   };
 
-  // ---- worklist cursor ----------------------------------------------------------------------------------
+  // ---- worklist iteration -------------------------------------------------------------------------------
   const proj = { dataVolumes: 1, parityVolumes: 1, chunkSize: 1, size: 1, md5: 1, name: 1, containerId: 1 };
-  let cur;
-  if (SAMPLE > 0) {
-    cur = C.aggregate([{ $match: { isFile: true } }, { $sample: { size: SAMPLE } }, { $project: proj }], { allowDiskUse: true }).batchSize(200);
-  } else {
-    cur = C.find({ isFile: true, $or: [{ fullVerifiedAt: { $exists: false } }, { fullVerifiedAt: { $lt: boundary } }] }, { projection: proj }).batchSize(500).addCursorFlag('noCursorTimeout', true);
-  }
-
   const inflight = new Set(); const t0 = Date.now();
-  for await (const doc of cur) {
-    if (s.objs >= LIMIT) break; s.objs++;
+  const logProgress = () => {
+    if (s.objs % 5000 !== 0) return;
+    const rate = (s.objs / ((Date.now() - t0) / 1000)).toFixed(1);
+    console.log(`  ...${s.objs} (${rate}/s) healthy ${s.healthy} hdr-stale ${s.headerStale} degraded ${s.degraded} corrupt ${s.corrupt} belowQ ${s.belowQuorum} incomplete ${s.incomplete} badParity ${s.badParity} hdrSuspect ${s.hdrSuspect} err ${s.error}`);
+  };
+  const dispatch = async (doc) => {
+    s.objs++;
     const p = verify(doc).catch(e => { s.error++; console.error('verify', doc._id.toString(), e && (e.stack || e.message)); }).finally(() => inflight.delete(p));
     inflight.add(p);
     if (PACE) await sleep(PACE);
     if (inflight.size >= CONC) await Promise.race(inflight);
-    if (s.objs % 5000 === 0) {
-      const rate = (s.objs / ((Date.now() - t0) / 1000)).toFixed(1);
-      console.log(`  ...${s.objs} (${rate}/s) healthy ${s.healthy} hdr-stale ${s.headerStale} degraded ${s.degraded} corrupt ${s.corrupt} belowQ ${s.belowQuorum} incomplete ${s.incomplete} badParity ${s.badParity} hdrSuspect ${s.hdrSuspect} err ${s.error}`);
+    logProgress();
+  };
+
+  if (SAMPLE > 0) {
+    const cur = C.aggregate([{ $match: { isFile: true } }, { $sample: { size: SAMPLE } }, { $project: proj }], { allowDiskUse: true }).batchSize(200);
+    for await (const doc of cur) { if (s.objs >= LIMIT) break; await dispatch(doc); }
+  } else {
+    // _id-RANGE PAGINATION rather than one long-lived streaming cursor. A single find() streamed for hours gets
+    // reaped server-side ("cursor id not found"); each SHORT batch query cannot. Sorted by _id and advancing
+    // `lastId`, the _id index seeks PAST the already-verified prefix instead of re-scanning it, so this stays
+    // O(n) even as the worklist shrinks. The fullVerifiedAt filter still drops verified docs, so a
+    // transiently-skipped object is picked up on a later sweep (and a crash just re-sweeps forward, cheaply).
+    const BATCH = 500;
+    let lastId = null;
+    for (;;) {
+      if (s.objs >= LIMIT) break;
+      const q = { isFile: true, $or: [{ fullVerifiedAt: { $exists: false } }, { fullVerifiedAt: { $lt: boundary } }] };
+      if (lastId) q._id = { $gt: lastId };
+      const batch = await C.find(q, { projection: proj }).sort({ _id: 1 }).limit(BATCH).toArray();
+      if (!batch.length) break;
+      lastId = batch[batch.length - 1]._id;
+      for (const doc of batch) { if (s.objs >= LIMIT) break; await dispatch(doc); }
     }
   }
   await Promise.all(inflight); await flush();
