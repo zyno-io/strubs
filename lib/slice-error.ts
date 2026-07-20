@@ -10,7 +10,8 @@ const CODE_CATEGORY: Record<string, SliceErrorCategory> = {
     ENOENT: 'missing',
     EIO: 'io',
     ETIMEOUT: 'timeout',
-    EPARITY: 'parity-mismatch'
+    EPARITY: 'parity-mismatch',
+    EHDRSUM: 'header-checksum'
 };
 
 // IOABORT (io-shutdown.ts) is raised when our own shutdown cancels in-flight I/O. It is

@@ -10,6 +10,8 @@ describe('categorizeSliceError', () => {
         expect(categorizeSliceError('ENOENT')).toBe('missing');
         expect(categorizeSliceError('EIO')).toBe('io');
         expect(categorizeSliceError('ETIMEOUT')).toBe('timeout');
+        expect(categorizeSliceError('EPARITY')).toBe('parity-mismatch');
+        expect(categorizeSliceError('EHDRSUM')).toBe('header-checksum');
     });
 
     it('prefers the code over the message', () => {

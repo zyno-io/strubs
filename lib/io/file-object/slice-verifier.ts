@@ -12,6 +12,8 @@ type FileObjectSliceVerifierDeps = {
     // 'full' (default) reads and checksums every chunk; 'light' only opens the
     // slice (existence + 48-byte header validation) and skips the chunk reads.
     mode: VerifyMode;
+    // Opt-in: also check the advisory header md5 (off until every legacy header is re-stamped).
+    checkHeaderMd5: boolean;
 };
 
 const defaultDeps: FileObjectSliceVerifierDeps = {
@@ -20,7 +22,8 @@ const defaultDeps: FileObjectSliceVerifierDeps = {
         const timer = setTimeout(resolve, ms);
         timer.unref?.();
     }),
-    mode: 'full'
+    mode: 'full',
+    checkHeaderMd5: config.verifyHeaderMd5
 };
 
 export class FileObjectSliceVerifier extends Base {
@@ -59,6 +62,14 @@ export class FileObjectSliceVerifier extends Base {
             // mode also reads (and checksums) every chunk.
             await slice.open();
             opened = true;
+            // Advisory header-md5 check (opt-in). open() computed the result; a mismatch here -- once every
+            // legacy header has been re-stamped -- is genuine header corruption, flagged EHDRSUM for repair.
+            // Runs in both light and full mode (it is a header, not a chunk, check).
+            if (this.deps.checkHeaderMd5 && slice.advisoryHeaderMd5Ok === false) {
+                const err = new Error('slice header advisory md5 mismatch') as Error & { code?: string };
+                err.code = 'EHDRSUM';
+                throw err;
+            }
             if (this.mode === 'full')
                 await this.verifyOpenSlice(sliceIndex, slice);
             this.logger('%s slice %s verified (%s)', descriptor.type, descriptor.key, this.mode);

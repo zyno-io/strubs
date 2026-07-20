@@ -50,6 +50,7 @@ export type SliceErrorCategory =
     | 'io'                  // EIO and other native read errors
     | 'timeout'             // ETIMEOUT — slice I/O timed out
     | 'parity-mismatch'     // EPARITY — parity self-consistent but != recomputed (foreign/stale)
+    | 'header-checksum'     // EHDRSUM — advisory header md5 mismatch (post-restamp = genuine header corruption)
     | 'unknown';            // EOPEN/unclassified
 
 export type SliceErrorInfo = {

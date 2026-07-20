@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import type { FileHandle } from 'fs/promises';
 
 import { hash } from '../../async-bridges/crypto-async';
@@ -47,6 +48,8 @@ export class Slice {
     private _writeBuf: Buffer | null = null;
     private _readBuf: Buffer | null = null;
     private _hashBuf: Buffer | null = null;
+    // Result of the advisory header-md5 check, set on open(): true=matches, false=mismatch, null=not opened.
+    private _advisoryHeaderMd5Ok: boolean | null = null;
     private _outputFh: FileHandle | null = null;
     private _inputFh: FileHandle | null = null;
     private _priorityRelease: (() => void) | null = null;
@@ -171,6 +174,12 @@ export class Slice {
         return this._volume.isReadable && !this.fileObject.unavailableSliceIdxs?.includes(this.sliceIndex);
     }
 
+    // Advisory header-md5 result from the last open(): true=matches current scheme, false=mismatch, null=not
+    // yet opened. Advisory only -- the read path ignores it; the verify path may flag a mismatch (EHDRSUM).
+    get advisoryHeaderMd5Ok(): boolean | null {
+        return this._advisoryHeaderMd5Ok;
+    }
+
     async open(): Promise<void> {
         ioShutdown.throwIfAborted();
         this._readBuf = Buffer.allocUnsafe(this.fileObject.chunkSize);
@@ -212,6 +221,16 @@ export class Slice {
                     throw shortErr;
                 }
                 this._validateHeader(this._readBuf as Buffer);
+                // Advisory header-md5 (bytes 7..22 = md5 of the descriptive fields 23..47). The live read path
+                // ignores this -- it is advisory and the scheme changed mid-2015 -- but the verify path can opt
+                // in to flag a mismatch (genuine header corruption, once every legacy header is re-stamped).
+                // Cheap 25-byte hash, computed once per open; verifiers read it via advisoryHeaderMd5Ok. Guarded
+                // so this advisory extra can NEVER fail a read -- e.g. if md5 is unavailable (FIPS), it stays
+                // null and the verify gate ('=== false') simply does not fire.
+                try {
+                    const hdr = this._readBuf as Buffer;
+                    this._advisoryHeaderMd5Ok = hdr.subarray(7, 23).equals(createHash('md5').update(hdr.subarray(23, 48)).digest());
+                } catch { this._advisoryHeaderMd5Ok = null; }
             } catch (err) {
                 // Release priority hold on error to prevent deadlock
                 this._releasePriorityHold();
