@@ -79,6 +79,8 @@ Same headers as `GET`, no body.
 
 **Immediate and irreversible.** Deletes every data and parity slice and the record. No soft delete, no confirmation.
 
+If the object's bucket has **delete protection** enabled, the delete is refused with **403** (`bucket is delete-protected`) and nothing is touched — a per-bucket lock that blocks *every* object delete in the bucket. It's independent of the read/write auth flags (it still applies on a dark, unauthenticated array), though an unauthorized caller may hit the auth check first. Toggle it with the bucket policy endpoint (below).
+
 ## `OPTIONS /{path}`
 
 Returns **204** with `Allow` and CORS headers. Note it requires the object to *exist* (a non-existent path 404s), and CORS headers are emitted **only** here — actual `GET`/`PUT` responses carry no `Access-Control-Allow-Origin`, so browser cross-origin use doesn't currently work.
@@ -180,6 +182,18 @@ volume 13 still holds 41027 live object slice(s); drain it first: POST /$/volume
 ```
 
 `bytesToMove` is recomputed from live volume fills rather than remembered, so it stays honest across restarts and doubles as a progress denominator. `currentMinObjectSize` is the size tier being shed — the rebalance works biggest-objects-first.
+
+## Buckets
+
+A **bucket** is a top-level container (the first path segment). These endpoints manage its policy flags.
+
+| | |
+|---|---|
+| `GET /$/buckets` | List buckets with policy (`publicRead`, `publicWrite`, `deleteProtected`) and request activity. Object counts are **not** here — they're a `$group` over millions of documents, so the UI fetches them separately from `/$/buckets/stats`. |
+| `PUT /$/buckets/{id}/policy` | Set any of `publicRead`, `publicWrite`, `deleteProtected` (booleans). |
+| `GET /$/buckets/stats` | Per-bucket object count and logical size (cached; the expensive aggregation). |
+
+`deleteProtected: true` blocks **every** object delete in the bucket — a `DELETE /{path}` on a contained object returns 403 — independent of the read/write flags. There is no bucket-*delete* endpoint at all (delete acts on objects), so this protects the objects inside it. Like the public flags it rides the durability rails: it's journalled, snapshotted, and restored. On recovery the two paths differ — journal replay only ever *adds* protection (it refuses to clear a flag the live bucket has set), while a snapshot restore rewrites policy to match the snapshot exactly, so it can also clear it.
 
 ## Maintenance freeze
 

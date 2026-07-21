@@ -226,7 +226,8 @@ export class Config {
             process.env.STRUBS_VERIFY_READ_DELAY_MS,
             DEFAULT_VERIFY_READ_DELAY_MS
         );
-        // Full-mode scrub also validates parity (recompute-and-compare); disable with =false.
+        // The per-object verify (verify-file) recomputes-and-compares parity in full mode; disable
+        // with =false. The rolling verify-volumes scrub does NOT recompute parity, only per-chunk MD5s.
         this.verifyParity = process.env.STRUBS_VERIFY_PARITY !== 'false';
         this.verifyHeaderMd5 = process.env.STRUBS_VERIFY_HEADER_MD5 !== 'false';
         this.fuseEnabled = process.env.STRUBS_FUSE_ENABLED === 'true';

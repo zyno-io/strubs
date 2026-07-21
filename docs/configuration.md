@@ -29,7 +29,8 @@ Every setting has a working default. A stock install needs at most `STRUBS_MONGO
 | Variable | Default | Meaning |
 |---|---|---|
 | `STRUBS_SCRUB_INTERVAL_MS` | `7776000000` (90 days) | Rolling background scrub cadence. `0` disables the scheduler; manual verification still works. |
-| `STRUBS_VERIFY_PARITY` | `true` | In `full` mode, also recompute parity and compare it to what's stored. Set `false` to disable. This is the only check that catches foreign parity — see [Data integrity](data-integrity.md). |
+| `STRUBS_VERIFY_PARITY` | `true` | In the **per-object verify** (`POST /$/verify-file`, and fleet-wide sweeps of it), `full` mode also recomputes parity and compares it to what's stored; the rolling background scrub does **not**. Set `false` to disable. This is the only check that catches foreign parity — see [Data integrity](data-integrity.md). |
+| `STRUBS_VERIFY_HEADER_MD5` | `true` | Verify each slice's advisory header MD5 (bytes 7–22) and flag a mismatch as `EHDRSUM`. Safe since the 2026-07 fleet-wide header re-stamp; set `false` to disable. The live read path never checks it (advisory). |
 | `STRUBS_VERIFY_READ_DELAY_MS` | `2` | Pause between chunk reads. Trades scrub throughput for lower contention with foreground reads. |
 | `STRUBS_VERIFY_PARALLEL` | number of enabled volumes, capped at CPU count | Objects verified concurrently. |
 

@@ -78,7 +78,7 @@ dataLen(k)    = S0    for k = 0
 | 0–3 | 4 | magic `01 C3 BB 02` | **not** `01 FB 02 FB` — see below |
 | 4 | 1 | version (`1`) | |
 | 5–6 | 2 | header length (48), uint16 LE | |
-| 7–22 | 16 | header MD5 | covers bytes 23–47 — **but only on slices written after ~2015**; see below |
+| 7–22 | 16 | header MD5 | covers bytes 23–47; re-stamped fleet-wide to the current scheme in 2026-07 and now checked by `verify` — see below |
 | **23–34** | **12** | **object id** | raw 12-byte Mongo ObjectId; hex form is the 24-char id |
 | 35–39 | 5 | file size, int LE | so ~512 GiB max per object |
 | 40 | 1 | dataN | |
@@ -110,9 +110,15 @@ The scheme changed part-way through 2015. Every one of those "failures" is a **p
 
 So: **a matching checksum is strong evidence the header is sound; a mismatch proves nothing at all.** Any tool that treats this checksum as a verdict will condemn a large fraction of the oldest data on the array as unrecoverable while it sits there, intact, on six disks. A recovery tool that condemns healthy data is worse than no recovery tool, because it will be believed.
 
-What a reader can trust instead, on a slice of any age, is the **structure**: the magic, the id matching the filename, a geometry that can actually be true (`dataN > 0`, `sliceIndex < dataN + parityN`, sane `chunkSize`). `readSliceHeader()` in `lib/recovery/recovery.ts` gates on exactly that, logs the checksum mismatch, and accepts the slice.
+What a reader can trust instead, on a slice of any age, is the **structure**: the magic, the id matching the filename, a geometry that can actually be true (`dataN > 0`, `sliceIndex < dataN + parityN`, sane `chunkSize`). `readSliceHeader()` in `lib/recovery/recovery.ts` gates on exactly that, logs the checksum mismatch, and accepts the slice. **A disaster-recovery tool should still do the same** — it may be handed pre-restamp slices from an old backup or un-restamped media, where a mismatch still proves nothing.
 
-> **Known gap (live read path):** on a normal read, the magic bytes, the version, and the header MD5 are written but **never verified** — only the identity fields are compared against Mongo. A corrupt header is caught by the field comparison, not by its checksum. Given the above, tightening this to *reject* on checksum is not a safe change.
+#### …but on the live array it is now uniform, and `verify` enforces it
+
+The scheme-mix above is history for the running array. A 2026-07 fleet-wide pass (`tools/restamp-header-md5.js`) recomputed the current-scheme MD5 in place for **every** legacy slice — a 16-byte overwrite of bytes 7–22, no data touched. So on the live platters the header MD5 is now uniform, and a mismatch means genuine header corruption rather than an old scheme.
+
+The **verify path** therefore checks it: a mismatch is flagged `EHDRSUM` (category `header-checksum`) and the slice is rebuilt (which writes a fresh, correct header). This is on by default (opt out with `STRUBS_VERIFY_HEADER_MD5=false`) and runs in both light and full verify.
+
+> **Still advisory on the live READ/serve path.** A normal read compares only the identity fields against Mongo; it does **not** check the header MD5, so serving a slice with a corrupt-but-structurally-valid header still works and the corruption is caught by the next verify, not the read. Reads gate on structure; verify gates on the checksum.
 
 ### Chunk header — 16 bytes
 

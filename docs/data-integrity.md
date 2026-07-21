@@ -9,9 +9,10 @@ Most of what's here was learned by having it go wrong.
 | Layer | Catches | Runs |
 |---|---|---|
 | **Chunk MD5** | Bit rot, bad sectors, short reads, torn writes | On every read of every chunk |
-| **Slice header** | A slice on the wrong disk, or mis-stamped at write time | On every slice open |
+| **Slice header (structure)** | A slice on the wrong disk, or mis-stamped at write time | On every slice open |
+| **Slice header MD5** | A corrupted header (its descriptive fields) | Every verify, opt-out (`STRUBS_VERIFY_HEADER_MD5`) |
 | **Whole-object MD5** | A slice that is internally consistent but *not this object's data* | Only where it matters: before committing a reconstruction |
-| **Parity recompute** | Parity that is silently wrong | Full scrub only |
+| **Parity recompute** | Parity that is silently wrong | Per-object verify only (`verify-file`), not the rolling scrub |
 
 The interesting rows are the last two, because they cover the cases the first two structurally cannot.
 
@@ -47,22 +48,25 @@ Here's the uncomfortable part: **a healthy read never opens the parity slices.**
 
 This is the failure mode that turns a survivable incident into data loss. Lose one data slice: fine, that's what parity is for. Lose one data slice *and* discover both parity slices were garbage all along: the object is gone, and it was gone long before the disk failed.
 
-So a **full** scrub does something a plain checksum pass can't: it *recomputes* the parity from the data and compares it with what's stored on disk. Mismatched parity is flagged (`EPARITY` / category `parity-mismatch`) and repaired in place — the repair recomputes correct parity from verified data.
+So the **per-object verify** does something a plain checksum pass can't: it *recomputes* the parity from the data and compares it with what's stored on disk. Mismatched parity is flagged (`EPARITY` / category `parity-mismatch`) and repaired in place — the repair recomputes correct parity from verified data. This recompute is the only check that catches foreign parity, and it lives in the per-object verify (`POST /$/verify-file`, and a fleet-wide sweep of every object) — **not** the rolling background scrub, which reads and per-chunk-MD5s every slice (parity included) but never rebuilds parity to check it is *correct*.
 
-A byte-copy of a parity slice therefore preserves a wrong one. This is why **relocation never copies parity** — during a drain or a rebalance, parity is always *recomputed* from the data, never moved. It costs more I/O. It is not optional.
+A byte-copy of a parity slice preserves a wrong one — a foreign parity slice is self-consistent, so the copy's per-chunk validation can't see it. For years relocation therefore **always recomputed** parity from the data during a drain or rebalance, never moving it, to keep a foreign parity slice from riding along. A 2026-07 full-fleet verify (the per-object parity recompute over all ~3.5M objects) confirmed **zero** foreign parity remains, and the write path produces correct parity while every reconstruction is whole-object-MD5-gated — so foreign parity can't reappear. Relocation now **copies parity too**, validating every chunk (and the header MD5) of the copy — the source is only removed once that validation passes — and falling back to a recompute when it fails. It is much cheaper. The residual it leans on: catching any *newly*-created foreign parity still requires that periodic per-object recompute; the rolling scrub won't.
 
-> If you take one operational lesson from this page: run a **full** scrub, not just a light one, and don't disable `STRUBS_VERIFY_PARITY`. A light verify will tell you every slice is present and correctly attributed while your parity is worthless.
+> If you take one operational lesson from this page: periodically run the **per-object parity recompute** across the fleet (`POST /$/verify-file`, or a fleet-wide sweep of it) and don't disable `STRUBS_VERIFY_PARITY`. The rolling scrub — even in `full` mode — reads every byte and checks every chunk's MD5, but it does **not** recompute parity, so on its own it will tell you every slice is present and its bytes survived while your parity is silently worthless.
 
 ## Verification modes
 
 | Mode | Reads | Catches | Cost |
 |---|---|---|---|
 | **light** | Slice existence + the 48-byte header | Missing slices, mis-stamped or misfiled slices | Hours on a large fleet. Near-zero disk stress. |
-| **full** | Every chunk of every slice, plus a parity recompute | Everything above, plus bit rot, plus wrong parity | Weeks on a large fleet. Reads everything. |
+| **full** | Every chunk of every slice | Everything above, plus bit rot | Weeks on a large fleet. Reads everything. |
+| **full, per-object verify** | Every chunk, **plus a parity recompute** | Everything above, plus foreign/wrong parity | Same read cost, plus the recompute. |
+
+The `mode` (`light`/`full`) is shared by both entry points, but the parity recompute is **not**: only the per-object verify (`POST /$/verify-file`, and a fleet-wide sweep of it) rebuilds parity from the data. The rolling `verify-volumes` scrub, even in `full` mode, reads and per-chunk-MD5s every slice — parity included — but never recomputes parity.
 
 Light verification exists for a specific situation: when the fleet is fragile and you need answers *now*, a full read of every byte is exactly the stress you can't afford. Light gives you "is everything present and correctly labelled?" in hours instead of weeks.
 
-But be clear about the trade: **light verification cannot see corrupt parity, and it cannot see a self-consistent-but-wrong slice.** It is a triage tool, not a substitute.
+But be clear about the trade: **light verification cannot see corrupt parity, and it cannot see a self-consistent-but-wrong slice** — and neither can the rolling scrub see *foreign* parity, which only the per-object recompute catches. Light is a triage tool, not a substitute.
 
 The default scrub is quarterly and full. On a large array a full pass takes weeks, so four passes a year is roughly continuous — and reads already checksum hot data all the time.
 
