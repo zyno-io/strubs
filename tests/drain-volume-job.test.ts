@@ -144,7 +144,7 @@ describe('DrainVolumeJob', () => {
         expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalled();
     });
 
-    it('recomputes (reconstructs) a parity slice instead of copying it', async () => {
+    it('copy-first for a parity slice too, when the copy validates (foreign parity is verified gone)', async () => {
         const parityDoc = objectDoc({ dataVolumes: [10, 11, 12, 15], parityVolumes: [5, 14] });
         const { job, deps } = makeJob({
             database: { findObjectsOnVolume: vi.fn().mockResolvedValueOnce([parityDoc]).mockResolvedValue([]), replaceObjectVolumeRef: vi.fn().mockResolvedValue(true), getObjectById: vi.fn(), countObjectsOnVolume: vi.fn().mockResolvedValue(0) },
@@ -152,8 +152,21 @@ describe('DrainVolumeJob', () => {
             tryCopyRelocate: vi.fn().mockResolvedValue(true)
         });
         await runDrain(job, 5);
-        expect(deps.tryCopyRelocate).not.toHaveBeenCalled();   // parity never byte-copied
-        expect(deps.repairSlice).toHaveBeenCalledTimes(1);
+        expect(deps.tryCopyRelocate).toHaveBeenCalledTimes(1);   // parity is now byte-copied first, like data
+        expect(deps.repairSlice).not.toHaveBeenCalled();          // valid copy -> no recompute
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, 21);
+    });
+
+    it('falls back to reconstruct when a parity copy is unavailable/invalid', async () => {
+        const parityDoc = objectDoc({ dataVolumes: [10, 11, 12, 15], parityVolumes: [5, 14] });
+        const { job, deps } = makeJob({
+            database: { findObjectsOnVolume: vi.fn().mockResolvedValueOnce([parityDoc]).mockResolvedValue([]), replaceObjectVolumeRef: vi.fn().mockResolvedValue(true), getObjectById: vi.fn(), countObjectsOnVolume: vi.fn().mockResolvedValue(0) },
+            loadObject: vi.fn().mockResolvedValue({ dataSliceVolumeIds: [10, 11, 12, 15], paritySliceVolumeIds: [5, 14], dataSliceCount: 4, sliceSize: 1000 }),
+            tryCopyRelocate: vi.fn().mockResolvedValue(false)     // copy declines (offline/invalid)
+        });
+        await runDrain(job, 5);
+        expect(deps.tryCopyRelocate).toHaveBeenCalledTimes(1);
+        expect(deps.repairSlice).toHaveBeenCalledTimes(1);        // -> md5-gated reconstruct
         expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 5, 21);
     });
 

@@ -67,13 +67,23 @@ describe('RebalanceJob', () => {
         expect(deps.recordRelocated).toHaveBeenCalledWith(1, 2, 160, 40, false); // stats: source 1 -> dest 2
     });
 
-    it('recomputes (reconstructs) parity slices instead of copying them', async () => {
+    it('copy-first for parity slices too, when the copy validates (foreign parity is verified gone)', async () => {
         const doc = objectDoc(1, 'parity'); // slice on volume 1 is a parity slice (index 4)
-        const { job, deps } = makeJob(pool(), doc);
+        const { job, deps } = makeJob(pool(), doc);   // default tryCopyRelocate -> resolves true
         await run(job);
 
-        expect(deps.tryCopyRelocate).not.toHaveBeenCalled();            // parity is never byte-copied
-        expect(deps.repairSlice).toHaveBeenCalledTimes(1);
+        expect(deps.tryCopyRelocate).toHaveBeenCalledTimes(1);          // parity now byte-copied first, like data
+        expect(deps.repairSlice).not.toHaveBeenCalled();                // valid copy -> no recompute
+        expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 1, 2);
+    });
+
+    it('falls back to reconstruct when a parity copy is invalid/unavailable', async () => {
+        const doc = objectDoc(1, 'parity');
+        const { job, deps } = makeJob(pool(), doc, { tryCopyRelocate: vi.fn().mockResolvedValue(false) });
+        await run(job);
+
+        expect(deps.tryCopyRelocate).toHaveBeenCalledTimes(1);
+        expect(deps.repairSlice).toHaveBeenCalledTimes(1);              // -> md5-gated reconstruct
         expect(deps.database.replaceObjectVolumeRef).toHaveBeenCalledWith('obj1', 1, 2);
     });
 

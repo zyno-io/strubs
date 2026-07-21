@@ -71,8 +71,8 @@ type RebalanceJobDeps = {
     getVolumes: () => Volume[];
     getVolume: (id: number) => Volume | undefined;
     loadObject: (record: unknown) => Promise<LoadedObject>;
-    // data slice: fast copy of a checksum-clean original. parity: never copied (would preserve
-    // known-bad parity) -> the caller forces reconstruct for parity.
+    // both data and parity: fast copy of a checksum-clean original, validated before commit; the caller
+    // falls back to reconstruct when the copy is unavailable/invalid.
     tryCopyRelocate: (object: LoadedObject, sliceIndex: number, fileName: string, sourceVol: Volume, targetVol: Volume) => Promise<boolean>;
     repairSlice: (object: LoadedObject, sliceIndex: number) => Promise<void>;   // recompute/reconstruct, md5-gated
     deleteSourceSlice: (sourceVol: Volume, fileName: string) => Promise<boolean>;
@@ -114,7 +114,7 @@ const defaultDeps: RebalanceJobDeps = {
 // Even out fill across the pool: move slices off over-full disks onto under-full ones. Balances by
 // FILL RATIO (used/capacity, heterogeneous drives) with a deadband. ASYMMETRIC health policy: failing
 // disks are never TARGETS (data only lands on healthy disks) but are ordinary SOURCES only for their
-// over-target excess. Relocation reuses the drain engine (copy-first for data, recompute for parity,
+// over-target excess. Relocation reuses the drain engine (copy-first for data and parity, recompute-fallback,
 // whole-object md5-gated) then DELETES the source slice (that's the point — free space). Gated by the
 // maintenance freeze (optional housekeeping); paced, cancellable, cursor-resumable.
 export class RebalanceJob {
@@ -399,16 +399,17 @@ export class RebalanceJob {
         const release = () => { if (reserved) { dest.releaseReservation(sliceBytes); reserved = false; } };
         try {
             const object = await this.deps.loadObject(doc);
-            const isParity = idx >= object.dataSliceCount;
+            const isParity = idx >= object.dataSliceCount;   // still needed for per-volume storage-stats accounting
             if (idx < object.dataSliceCount) object.dataSliceVolumeIds[idx] = dest.id;
             else object.paritySliceVolumeIds[idx - object.dataSliceCount] = dest.id;
 
             const fileName = `${(doc as { id: string }).id}.${idx}`;
             let placed = false;
-            // Parity is always recomputed from verified data (copying preserves known-bad parity); data
-            // slices try the fast copy first, then reconstruct.
-            if (!isParity)
-                placed = await this.deps.tryCopyRelocate(object, idx, fileName, source, dest);
+            // Copy-first for BOTH data and parity: the fast validated copy (per-chunk md5 + header md5), then
+            // md5-gated reconstruct on any failure. Parity was formerly always recomputed to purge FOREIGN
+            // parity; the full-fleet verify confirmed none remains, and a bit-rotted parity chunk still fails
+            // the copy's validation and falls back to reconstruct.
+            placed = await this.deps.tryCopyRelocate(object, idx, fileName, source, dest);
             if (placed) s.copied++;
             if (!placed) {
                 try { await this.deps.repairSlice(object, idx); placed = true; s.reconstructed++; }

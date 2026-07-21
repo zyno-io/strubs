@@ -363,18 +363,21 @@ export class DrainVolumeJob {
         if (!target) { s.noDest++; this.log('no relocation target for object %s (all healthy volumes in use or full)', (doc as { id?: string }).id); return; }
 
         const object = await this.deps.loadObject(doc);
-        const isParity = idx >= object.dataSliceCount;
+        const isParity = idx >= object.dataSliceCount;   // still needed for per-volume storage-stats accounting
         if (idx < object.dataSliceCount)
             object.dataSliceVolumeIds[idx] = target.id;
         else
             object.paritySliceVolumeIds[idx - object.dataSliceCount] = target.id;
 
-        // Copy-first for DATA (fast); PARITY is always RECOMPUTED (a byte-copy would preserve known-bad
-        // /foreign parity). Reconstruct is whole-object md5-gated and works even when the source is offline.
+        // Copy-first for BOTH data and parity: byte-copy the slice off an online source, then validate it
+        // (per-chunk md5 + the advisory header md5); an invalid/failed copy falls back to md5-gated
+        // reconstruct, which also covers an offline source. Parity was formerly ALWAYS recomputed to purge
+        // FOREIGN parity (self-consistent but wrong); the full-fleet verify confirmed none remains, so the
+        // faster validated copy is now safe -- and a bit-rotted parity chunk still fails validation -> recompute.
         const fileName = `${(doc as { id: string }).id}.${idx}`;
         const sourceVol = this.deps.getVolume(volumeId);
         let placed = false;
-        if (sourceVol && !isParity)
+        if (sourceVol)
             placed = await this.deps.tryCopyRelocate(object, idx, fileName, sourceVol, target);
         if (!placed) {
             try {

@@ -140,10 +140,10 @@ export class Config {
     // scrub throughput for lower foreground-read contention.
     verifyReadDelayMs: number;
     verifyParity: boolean;
-    // When true, the verify path also checks each slice's ADVISORY header md5 (bytes 7..22 = md5 of the
-    // header's descriptive fields) and flags a mismatch as EHDRSUM. OPT-IN (off by default) because it can
-    // only be enabled once every legacy pre-2015-scheme header has been re-stamped to the current scheme --
-    // otherwise every un-restamped slice flags. The live READ path never checks it (advisory only).
+    // When true (the default), the verify path also checks each slice's ADVISORY header md5 (bytes 7..22 =
+    // md5 of the header's descriptive fields) and flags a mismatch as EHDRSUM. Now on by default: every legacy
+    // pre-2015-scheme header has been re-stamped to the current scheme (2026-07 full-fleet pass), so nothing
+    // false-flags. Opt out with STRUBS_VERIFY_HEADER_MD5=false. The live READ path never checks it (advisory).
     verifyHeaderMd5: boolean;
 
     // Mount the read-only FUSE filesystem at /run/strubs/data. OPT-IN (off by default): it is a second,
@@ -228,7 +228,7 @@ export class Config {
         );
         // Full-mode scrub also validates parity (recompute-and-compare); disable with =false.
         this.verifyParity = process.env.STRUBS_VERIFY_PARITY !== 'false';
-        this.verifyHeaderMd5 = process.env.STRUBS_VERIFY_HEADER_MD5 === 'true';
+        this.verifyHeaderMd5 = process.env.STRUBS_VERIFY_HEADER_MD5 !== 'false';
         this.fuseEnabled = process.env.STRUBS_FUSE_ENABLED === 'true';
         this.httpPort = parsePositiveInt(process.env.STRUBS_HTTP_PORT, 80);
         this.adminPort = parsePositiveInt(process.env.STRUBS_ADMIN_PORT, 443);

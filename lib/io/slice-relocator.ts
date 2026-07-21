@@ -35,10 +35,11 @@ async function copyFile(sourceVol: Volume, targetVol: Volume, fileName: string):
 }
 
 // Copy-first relocation of a slice: copy the file off an ONLINE source to the target, then validate
-// the copy (open + checksum every chunk via the slice verifier). The object's ref for this slice must
-// already point at the target so validation reads the copy. Returns true iff the target now holds a
-// valid copy; false (drop it, fall back to reconstruct) otherwise. Suitable for DATA slices only --
-// parity should be recomputed, never copied (a byte-copy preserves known-bad parity).
+// the copy (open + checksum every chunk via the slice verifier, plus the advisory header md5). The
+// object's ref for this slice must already point at the target so validation reads the copy. Returns true
+// iff the target now holds a valid copy; false (drop it, fall back to reconstruct) otherwise. Used for both
+// data AND parity: the per-chunk validation catches a bit-rotted copy, and the fleet is verified free of
+// FOREIGN parity (self-consistent-but-wrong, which a byte-copy would preserve and validation cannot see).
 export async function relocateByCopy(object: FileObject, sliceIndex: number, fileName: string, sourceVol: Volume, targetVol: Volume): Promise<boolean> {
     if (!sourceVol.isReadable || !targetVol.isWritable)
         return false;
