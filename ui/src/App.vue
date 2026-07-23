@@ -171,6 +171,30 @@ const verifyActionPending = ref<boolean>(false);
 const stopRequested = ref<boolean>(false);
 let verifyPollTimer: ReturnType<typeof setInterval> | null = null;
 
+// Verify run history — durable, unlike verifyStatus above (which only ever shows the run in flight
+// right now). Answers "why did this run start" after the fact: a fault-driven run carries the device,
+// signal kind, and kernel/smartd detail line that armed it.
+type VerifyRunTrigger =
+  | { source: 'syslog-watcher'; device: string; volumeId: number; kind: 'pending' | 'ioerror'; detail: string }
+  | { source: 'manual' }
+  | { source: 'scheduled' };
+interface VerifyRunDocument {
+  _id: string;
+  startedAt: string;
+  finishedAt?: string;
+  scope: 'full' | 'targeted';
+  mode: 'light' | 'full';
+  volumeIds: number[];
+  trigger: VerifyRunTrigger;
+  status: 'running' | 'completed' | 'stopped';
+  objectsVerified?: number;
+  checksumErrors?: number;
+  totalErrors?: number;
+}
+const verifyRuns = ref<VerifyRunDocument[]>([]);
+const verifyRunsLoading = ref<boolean>(false);
+const expandedVerifyRunId = ref<string | null>(null);
+
 // Rebalance: evens out fill across the pool by relocating slices off over-full drives onto under-full
 // ones. bytesToMove is how far the pool still is from the balance point, so it doubles as progress.
 const rebalanceStatus = ref<RebalanceStatus | null>(null);
@@ -419,6 +443,7 @@ async function startVerify(): Promise<void> {
       throw new Error(msg);
     }
     await fetchVerifyStatus();
+    await fetchVerifyRuns();
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to start verify';
   } finally {
@@ -434,6 +459,42 @@ async function stopVerify(): Promise<void> {
   if (!confirm('Stop the running verify job?')) return;
   stopRequested.value = true;
   apiFetch(`${apiBaseUrl}/$/verify-volumes`, { method: 'DELETE' }).catch(() => {});
+}
+
+// History is on-demand (only fetched while the Maintenance tab is open, see startApp/accessPollTimer)
+// rather than on the 3s verify-status cadence — it changes only when a run starts, finishes, or stops.
+async function fetchVerifyRuns(): Promise<void> {
+  verifyRunsLoading.value = true;
+  try {
+    const res = await apiFetch(`${apiBaseUrl}/$/verify-runs`);
+    if (!res.ok) return;
+    verifyRuns.value = (await res.json()).runs ?? [];
+  } catch {
+    // Ignore transient polling errors
+  } finally {
+    verifyRunsLoading.value = false;
+  }
+}
+
+function toggleVerifyRunDetail(id: string): void {
+  expandedVerifyRunId.value = expandedVerifyRunId.value === id ? null : id;
+}
+
+// One line describing why a run started, for the collapsed row.
+function verifyRunTriggerSummary(trigger: VerifyRunTrigger): string {
+  if (trigger.source === 'syslog-watcher') return `${trigger.device} · ${trigger.kind}`;
+  if (trigger.source === 'scheduled') return 'Scheduled';
+  return 'Manual';
+}
+
+function verifyRunTriggerClass(trigger: VerifyRunTrigger): string {
+  return trigger.source === 'syslog-watcher' ? 'fault' : trigger.source;
+}
+
+function verifyRunScopeLabel(run: VerifyRunDocument): string {
+  return run.scope === 'targeted' && run.volumeIds.length > 0
+    ? `vol ${run.volumeIds.join(', ')}`
+    : 'Full scrub';
 }
 
 // Format an ISO timestamp for display
@@ -1963,6 +2024,7 @@ function copySecret(secret: string): void {
 function startApp(): void {
   fetchData();
   fetchVerifyStatus();
+  fetchVerifyRuns();
   fetchStorageStats();
   fetchFreezeStatus();
   fetchRebalanceStatus();
@@ -1987,6 +2049,7 @@ function startApp(): void {
     accessPollTimer = setInterval(() => {
       if (activeTab.value === 'buckets') { void fetchBuckets(); void fetchBucketStats(); }
       if (activeTab.value === 'credentials') void fetchCredentials();
+      if (activeTab.value === 'maintenance') void fetchVerifyRuns();
     }, 15000);
   }
 }
@@ -2390,6 +2453,83 @@ onUnmounted(() => {
         >
           vol {{ entry.volumeId }}: {{ entry.count.toLocaleString() }}
         </span>
+      </div>
+
+      <div class="verify-subheader">
+        <h3>Verify History</h3>
+        <button @click="fetchVerifyRuns" :disabled="verifyRunsLoading" class="refresh-btn">
+          {{ verifyRunsLoading ? 'Loading...' : 'Refresh' }}
+        </button>
+      </div>
+      <p v-if="verifyRuns.length === 0" class="volumes-empty">
+        {{ verifyRunsLoading ? 'Loading…' : 'No verify runs recorded yet.' }}
+      </p>
+      <div v-else class="run-history-table-wrap">
+        <table class="run-history-table">
+          <thead>
+            <tr>
+              <th>Started</th>
+              <th>Trigger</th>
+              <th>Scope</th>
+              <th>Status</th>
+              <th>Objects</th>
+              <th>Errors</th>
+              <th>Finished</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template v-for="run in verifyRuns" :key="run._id">
+              <tr class="run-row" @click="toggleVerifyRunDetail(run._id)">
+                <td>{{ formatDateTime(run.startedAt) }}</td>
+                <td>
+                  <span class="run-trigger-badge" :class="verifyRunTriggerClass(run.trigger)">
+                    {{ verifyRunTriggerSummary(run.trigger) }}
+                  </span>
+                </td>
+                <td>{{ verifyRunScopeLabel(run) }}</td>
+                <td>
+                  <span class="run-status-badge" :class="run.status">{{ run.status }}</span>
+                </td>
+                <td>{{ (run.objectsVerified ?? 0).toLocaleString() }}</td>
+                <td :class="{ 'error-text': (run.totalErrors ?? 0) > 0 }">
+                  {{ (run.totalErrors ?? 0).toLocaleString() }}
+                </td>
+                <td>{{ run.finishedAt ? formatDateTime(run.finishedAt) : '—' }}</td>
+              </tr>
+              <tr v-if="expandedVerifyRunId === run._id" class="run-detail-row">
+                <td colspan="7">
+                  <div class="run-detail">
+                    <div class="run-detail-item">
+                      <span class="verify-stat-label">Mode</span>
+                      <span class="verify-stat-value">{{ run.mode }}</span>
+                    </div>
+                    <div class="run-detail-item">
+                      <span class="verify-stat-label">Checksum errors</span>
+                      <span class="verify-stat-value">{{ (run.checksumErrors ?? 0).toLocaleString() }}</span>
+                    </div>
+                    <div class="run-detail-item" v-if="run.volumeIds.length > 0">
+                      <span class="verify-stat-label">Volumes</span>
+                      <span class="verify-stat-value">{{ run.volumeIds.join(', ') }}</span>
+                    </div>
+                    <div class="run-detail-item run-detail-trigger">
+                      <span class="verify-stat-label">Trigger</span>
+                      <span class="verify-stat-value" v-if="run.trigger.source === 'syslog-watcher'">
+                        Device {{ run.trigger.device }} (volume {{ run.trigger.volumeId }}) reported
+                        {{ run.trigger.kind }}: “{{ run.trigger.detail }}”
+                      </span>
+                      <span class="verify-stat-value" v-else-if="run.trigger.source === 'scheduled'">
+                        Automatic rolling scrub
+                      </span>
+                      <span class="verify-stat-value" v-else>
+                        Started manually from the API/UI
+                      </span>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
       </div>
 
       </template>
@@ -3929,6 +4069,106 @@ h2 {
   border-radius: 12px;
   font-size: 12px;
   font-weight: 600;
+}
+
+/* Verify run history */
+.run-history-table-wrap {
+  overflow-x: auto;
+}
+
+.run-history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.run-history-table th {
+  text-align: left;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.run-history-table td {
+  padding: 6px 10px;
+  color: #333;
+  border-bottom: 1px solid #eee;
+}
+
+.run-row {
+  cursor: pointer;
+}
+
+.run-row:hover {
+  background-color: #f0f0f0;
+}
+
+.run-detail-row td {
+  background-color: #f5f5f5;
+  padding: 12px 10px;
+}
+
+.run-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.run-detail-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.run-detail-trigger {
+  flex: 1 1 260px;
+}
+
+.run-trigger-badge {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: white;
+  white-space: nowrap;
+}
+
+.run-trigger-badge.fault {
+  background-color: #e64a19;
+}
+
+.run-trigger-badge.manual {
+  background-color: #1565c0;
+}
+
+.run-trigger-badge.scheduled {
+  background-color: #757575;
+}
+
+.run-status-badge {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: white;
+  white-space: nowrap;
+  text-transform: capitalize;
+}
+
+.run-status-badge.running {
+  background-color: #4caf50;
+}
+
+.run-status-badge.completed {
+  background-color: #5c6bc0;
+}
+
+.run-status-badge.stopped {
+  background-color: #f9a825;
 }
 
 /* Rebalance */
