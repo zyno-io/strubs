@@ -248,11 +248,16 @@ curl -X POST localhost/\$/verify-file/6a4e9b8f3b1e7a0049000001 \
 
 curl -s localhost/\$/verify-volumes | jq
 curl -X DELETE localhost/\$/verify-volumes
+
+# History: every run ever started, most recent first — including why it started
+curl -s localhost/\$/verify-runs | jq
 ```
 
 A scrub runs automatically every 90 days by default. **Use `full`.** A light verify will happily tell you every slice is present and correctly labelled while your parity is worthless — only a full pass recomputes parity and compares it. See [Data integrity](data-integrity.md).
 
 If a rebalance is running, a verify request is **queued**, not rejected: the response carries `deferred: true` and it starts when the rebalance finishes. The UI shows it as *Waiting for rebalance*.
+
+`/$/verify-volumes` only ever shows the run in flight right now. `/$/verify-runs` is the durable history: one record per run (`scheduled`, `manual`, or `syslog-watcher`-triggered), with the `trigger` that started it — for a fault-driven run, the device, the signal kind (`pending`/`ioerror`), and the kernel/smartd detail line that armed it — plus `status` (`running`/`completed`/`stopped`) and its error totals once finished. This is what to check when a targeted verify is running and the question is "why."
 
 ---
 

@@ -47,6 +47,7 @@ const storageStatsTrackerMock = {
 };
 const databaseSoftDeleteMock = vi.fn();
 const databaseUpdateFlagsMock = vi.fn();
+const databaseListVerifyRunsMock = vi.fn();
 const volumeSmartMonitorMock = {
     getSummary: vi.fn(),
     getInfo: vi.fn()
@@ -166,6 +167,7 @@ vi.mock('../lib/database', () => ({
         countObjectsOnVolume: databaseCountOnVolumeMock,
         classifySlicesOnVolume: databaseClassifySlicesMock,
         getVolumes: databaseGetVolumesMock,
+        listVerifyRuns: databaseListVerifyRunsMock,
         ...databaseBucketAuthMock
     }
 }));
@@ -255,6 +257,7 @@ beforeEach(() => {
     ioManagerMock.reloadBlockDevices.mockReset();
     databaseSoftDeleteMock.mockReset();
     databaseUpdateFlagsMock.mockReset();
+    databaseListVerifyRunsMock.mockReset();
     deviceProvisionerProvisionMock.mockReset();
     verifyVolumesJobMock.start.mockReset();
     verifyVolumesJobMock.stop.mockReset();
@@ -1187,7 +1190,7 @@ describe('HttpMgmt.handle', () => {
         verifyVolumesJobMock.start.mockResolvedValue({ startedAt: '2024-01-02T00:00:00.000Z' });
         const response = await HttpMgmt.handle(17, createRequest('POST', '/$/verify-volumes', { volumeIds: [3, 3, 4] }), nullResponse);
         expect(response).toEqual({ startedAt: '2024-01-02T00:00:00.000Z' });
-        expect(verifyVolumesJobMock.start).toHaveBeenCalledWith({ volumeIds: [3, 4], mode: 'full' });
+        expect(verifyVolumesJobMock.start).toHaveBeenCalledWith({ volumeIds: [3, 4], mode: 'full', trigger: { source: 'manual' } });
     });
 
     it('rejects invalid volume filter payloads', async () => {
@@ -1208,6 +1211,22 @@ describe('HttpMgmt.handle', () => {
         const response = await HttpMgmt.handle(14, createRequest('GET', '/$/verify-volumes'), nullResponse);
         expect(response).toEqual({ running: true, startedAt: 't', objectsVerified: 5, errors: { total: 2, volumes: { '1': 2 } }, concurrency: 3, scope: 'targeted', volumeIds: [1] });
         expect(verifyVolumesJobMock.getStatus).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns verify run history via GET', async () => {
+        const runs = [{
+            _id: '2026-07-14T00:03:00.455Z',
+            startedAt: new Date('2026-07-14T00:03:00.455Z'),
+            scope: 'targeted',
+            mode: 'full',
+            volumeIds: [58],
+            trigger: { source: 'syslog-watcher', device: 'sdak', volumeId: 58, kind: 'ioerror', detail: 'i/o error' },
+            status: 'completed'
+        }];
+        databaseListVerifyRunsMock.mockResolvedValue(runs);
+        const response = await HttpMgmt.handle(20, createRequest('GET', '/$/verify-runs'), nullResponse);
+        expect(response).toEqual({ runs });
+        expect(databaseListVerifyRunsMock).toHaveBeenCalledTimes(1);
     });
 
     it('verifies a file via POST', async () => {

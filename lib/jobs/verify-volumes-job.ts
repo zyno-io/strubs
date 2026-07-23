@@ -1,6 +1,6 @@
 import os from 'os';
 import PQueue from 'p-queue';
-import { database, type SliceErrorInfo } from '../database';
+import { database, type SliceErrorInfo, type VerifyRunTrigger } from '../database';
 import { categorizeSliceError, isIOAbort } from '../slice-error';
 import { runtimeConfig } from '../runtime-config';
 import { fileObjectService, type FileObjectService } from '../io/file-object/service';
@@ -183,7 +183,7 @@ export class VerifyVolumesJob {
         this.log = this.deps.createLogger('verify-job');
     }
 
-    async start(options?: { volumeIds?: number[]; mode?: VerifyMode }): Promise<VerifyStartResult> {
+    async start(options?: { volumeIds?: number[]; mode?: VerifyMode; trigger?: VerifyRunTrigger }): Promise<VerifyStartResult> {
         if (await isMaintenanceFrozen()) {
             this.log('maintenance freeze active: not starting verify run');
             return { startedAt: this.startedAt ?? '', accepted: false };
@@ -218,6 +218,13 @@ export class VerifyVolumesJob {
 
             const startedAt = new Date().toISOString();
             await this.deps.runtimeConfig.set('verifyStartedAt', startedAt);
+            await this.deps.database.recordVerifyRunStart({
+                startedAt,
+                scope: requestedFilter && requestedFilter.length ? 'targeted' : 'full',
+                mode: requestedMode,
+                volumeIds: requestedFilter ?? [],
+                trigger: options?.trigger ?? { source: 'manual' }
+            });
             // Persisted above, so the request is not lost — the rebalance resumes it when it finishes.
             if (this.deferForRebalance())
                 return { startedAt, accepted: true, deferred: true };
@@ -300,6 +307,11 @@ export class VerifyVolumesJob {
         this.log('stop requested');
         run.cancelled = true;
 
+        // Captured before a wedged run's abandonment (below) nulls this.startedAt out from under us.
+        const stoppedRunStartedAt = this.startedAt;
+        const stoppedRunObjectsVerified = this.progress.objectsVerified;
+        const stoppedRunTotalErrors = this.progress.errors.total;
+
         const drained = await this.awaitWithTimeout(running, STOP_DRAIN_TIMEOUT_MS);
         if (!drained && this.activeRun === run) {
             // The run is wedged — almost certainly an in-flight read against a
@@ -322,8 +334,17 @@ export class VerifyVolumesJob {
             this.volumeFilter = null;
         }
 
-        if (!options?.preserveState)
+        if (!options?.preserveState) {
+            if (stoppedRunStartedAt) {
+                await this.deps.database.recordVerifyRunFinish(stoppedRunStartedAt, {
+                    finishedAt: new Date().toISOString(),
+                    status: 'stopped',
+                    objectsVerified: stoppedRunObjectsVerified,
+                    totalErrors: stoppedRunTotalErrors
+                }).catch(err => this.log.error('failed to record verify run stop for %s: %s', stoppedRunStartedAt, err instanceof Error ? err.message : String(err)));
+            }
             await this.clearPersistedRun();
+        }
     }
 
     private async clearPersistedRun(): Promise<void> {
@@ -516,14 +537,24 @@ export class VerifyVolumesJob {
                 await this.deps.runtimeConfig.delete(VERIFY_CURSOR_ID_KEY);
                 await this.deps.runtimeConfig.delete(VERIFY_MODE_KEY);
             }
-            if (shouldFinalize && !this.isTargetedRun) {
+            if (shouldFinalize) {
                 const finishedAt = new Date().toISOString();
-                await this.deps.runtimeConfig.set('lastVerify', {
-                    startedAt,
+                await this.deps.database.recordVerifyRunFinish(startedAt, {
                     finishedAt,
+                    status: 'completed',
+                    objectsVerified: this.progress.objectsVerified,
                     checksumErrors,
                     totalErrors
-                });
+                }).catch(err => this.log.error('failed to record verify run completion for %s: %s', startedAt, err instanceof Error ? err.message : String(err)));
+
+                if (!this.isTargetedRun) {
+                    await this.deps.runtimeConfig.set('lastVerify', {
+                        startedAt,
+                        finishedAt,
+                        checksumErrors,
+                        totalErrors
+                    });
+                }
                 this.log(
                     'verification complete: startedAt=%s finishedAt=%s objects=%d checksumErrors=%d totalErrors=%d',
                     startedAt,

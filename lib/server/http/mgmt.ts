@@ -54,6 +54,7 @@ import { repairWorker } from '../../remediation/repair-worker';
 import { config } from '../../config';
 import { isMaintenanceFrozen, setMaintenanceFrozen } from '../../maintenance';
 import { database } from '../../database';
+import type { VerifyRunDocument } from '../../database/verify-run-repository';
 import type { HttpRequest, HttpResponse, HttpContentPayload } from './server';
 import type { Volume } from '../../io/volume';
 import { volumeSmartMonitor, type VolumeSmartInfo, type VolumeSmartSummary } from '../../io/volume-smart-monitor';
@@ -835,7 +836,11 @@ export class HttpMgmt {
         const payload = await this.parseJsonBody<{ volumeIds?: unknown; mode?: unknown }>(req);
         const volumeIds = this.normalizeVolumeIdFilter(payload.volumeIds);
         const mode = this.normalizeVerifyMode(payload.mode);
-        return verifyVolumesJob.start({ volumeIds: volumeIds ?? undefined, mode });
+        return verifyVolumesJob.start({ volumeIds: volumeIds ?? undefined, mode, trigger: { source: 'manual' } });
+    }
+
+    private static async handleVerifyRunsRequest(): Promise<{ runs: VerifyRunDocument[] }> {
+        return { runs: await database.listVerifyRuns() };
     }
 
     private static normalizeVerifyMode(raw: unknown): 'light' | 'full' {
@@ -2389,6 +2394,11 @@ export class HttpMgmt {
                 method: 'GET',
                 match: url => url === '/$/verify-volumes' ? {} : null,
                 handler: async () => this.handleVerifyVolumesJobStatusRequest()
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/verify-runs' ? {} : null,
+                handler: async () => this.handleVerifyRunsRequest()
             },
             {
                 method: 'DELETE',

@@ -185,7 +185,10 @@ export class SystemLogWatcher {
         });
 
         try {
-            const result = await this.deps.verifyVolumesJob.start({ volumeIds: [volumeId] });
+            const result = await this.deps.verifyVolumesJob.start({
+                volumeIds: [volumeId],
+                trigger: { source: 'syslog-watcher', device: signal.device, volumeId, kind: signal.kind, detail: signal.detail }
+            });
             if (result.accepted === false) {
                 this.log('targeted verify for volume %d was not accepted; leaving it out of cooldown', volumeId);
                 return;

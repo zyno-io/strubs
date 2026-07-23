@@ -71,7 +71,7 @@ export class VerifyScheduler {
         if (this.deps.verifyVolumesJob.isRunning())
             return;
         this.log('triggering scheduled rolling scrub');
-        void Promise.resolve(this.deps.verifyVolumesJob.start()).catch(err => {
+        void Promise.resolve(this.deps.verifyVolumesJob.start({ trigger: { source: 'scheduled' } })).catch(err => {
             this.log.error('scheduled scrub failed to start: %s', err instanceof Error ? err.message : String(err));
         });
     }

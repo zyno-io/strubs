@@ -21,7 +21,9 @@ const createDeps = () => {
         findObjectsOnVolumesNeedingVerification: vi.fn().mockResolvedValue([]),
         updateObjectVerificationState: vi.fn().mockResolvedValue(undefined),
         setVolumeVerifyErrors: vi.fn().mockResolvedValue(undefined),
-        countObjectsVerifiedSince: vi.fn().mockResolvedValue(0)
+        countObjectsVerifiedSince: vi.fn().mockResolvedValue(0),
+        recordVerifyRunStart: vi.fn().mockResolvedValue(undefined),
+        recordVerifyRunFinish: vi.fn().mockResolvedValue(undefined)
     };
     const runtimeConfig = {
         get: vi.fn(),
@@ -193,6 +195,99 @@ describe('VerifyVolumesJob', () => {
             totalErrors: 0
         }));
         expect(deps.runtimeConfig.delete.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining(['verifyStartedAt', 'verifyVolumeIds', 'verifyCursorId']));
+        expect(deps.database.recordVerifyRunStart).toHaveBeenCalledWith({
+            startedAt,
+            scope: 'full',
+            mode: 'full',
+            volumeIds: [],
+            trigger: { source: 'manual' }
+        });
+        expect(deps.database.recordVerifyRunFinish).toHaveBeenCalledWith(startedAt, {
+            finishedAt: expect.any(String),
+            status: 'completed',
+            objectsVerified: 1,
+            checksumErrors: 0,
+            totalErrors: 0
+        });
+    });
+
+    it('records the caller-supplied trigger with a targeted run, and finalizes a targeted run in history', async () => {
+        const deps = createDeps();
+        const record = {
+            id: 'trig',
+            size: 1,
+            dataVolumes: [1],
+            parityVolumes: [],
+            chunkSize: 1,
+            dataSliceVolumeIds: [1],
+            paritySliceVolumeIds: [],
+            unavailableSlices: [],
+            damagedSlices: [],
+            isFile: true,
+            name: 'file',
+            md5: null
+        };
+
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+        deps.database.findObjectsOnVolumesNeedingVerification
+            .mockResolvedValueOnce([record])
+            .mockResolvedValueOnce([]);
+        deps.fileObjectService.load.mockResolvedValue({} as any);
+        deps.createSliceVerifier.mockReturnValue({ verifySlice: vi.fn().mockResolvedValue(undefined) });
+
+        const trigger = { source: 'syslog-watcher' as const, device: 'sdak', volumeId: 1, kind: 'ioerror' as const, detail: 'i/o error' };
+        const job = new VerifyVolumesJob(deps);
+        const { startedAt } = await job.start({ volumeIds: [1], trigger });
+        const running = (job as unknown as { running: Promise<void> | null }).running;
+        if (running)
+            await running;
+
+        expect(deps.database.recordVerifyRunStart).toHaveBeenCalledWith({
+            startedAt,
+            scope: 'targeted',
+            mode: 'full',
+            volumeIds: [1],
+            trigger
+        });
+        // Targeted runs previously got no completion record at all -- this is the gap being closed.
+        expect(deps.database.recordVerifyRunFinish).toHaveBeenCalledWith(startedAt, {
+            finishedAt: expect.any(String),
+            status: 'completed',
+            objectsVerified: 1,
+            checksumErrors: 0,
+            totalErrors: 0
+        });
+    });
+
+    it('records a stopped run in history without touching a later run', async () => {
+        const deps = createDeps();
+        deps.runtimeConfig.get.mockResolvedValueOnce(null);
+
+        let releaseBatch: (() => void) | null = null;
+        let batchReadyResolve: (() => void) | null = null;
+        const batchReady = new Promise<void>(resolve => {
+            batchReadyResolve = resolve;
+        });
+        deps.database.findObjectsNeedingVerification.mockImplementationOnce(() => new Promise(resolve => {
+            releaseBatch = () => resolve([]);
+            batchReadyResolve?.();
+        }));
+        deps.database.findObjectsNeedingVerification.mockResolvedValue([]);
+
+        const job = new VerifyVolumesJob(deps);
+        const { startedAt } = await job.start({ trigger: { source: 'scheduled' } });
+        await batchReady;
+
+        const stopPromise = job.stop();
+        releaseBatch?.();
+        await stopPromise;
+
+        expect(deps.database.recordVerifyRunFinish).toHaveBeenCalledWith(startedAt, {
+            finishedAt: expect.any(String),
+            status: 'stopped',
+            objectsVerified: 0,
+            totalErrors: 0
+        });
     });
 
     it('verifies multiple objects in parallel batches', async () => {

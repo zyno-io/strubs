@@ -32,7 +32,9 @@ const createVerifyDeps = () => {
         findObjectsOnVolumesNeedingVerification: vi.fn().mockResolvedValue([]),
         updateObjectVerificationState: vi.fn().mockResolvedValue(undefined),
         setVolumeVerifyErrors: vi.fn().mockResolvedValue(undefined),
-        countObjectsVerifiedSince: vi.fn().mockResolvedValue(0)
+        countObjectsVerifiedSince: vi.fn().mockResolvedValue(0),
+        recordVerifyRunStart: vi.fn().mockResolvedValue(undefined),
+        recordVerifyRunFinish: vi.fn().mockResolvedValue(undefined)
     };
     const runtimeConfig = {
         get: vi.fn().mockResolvedValue(undefined),

@@ -38,8 +38,8 @@ describe('VerifyScheduler', () => {
 
         await vi.advanceTimersByTimeAsync(1000);
         expect(deps.verifyVolumesJob.start).toHaveBeenCalledTimes(1);
-        // start() with no args = rolling scrub (no volume filter).
-        expect(deps.verifyVolumesJob.start).toHaveBeenCalledWith();
+        // no volume filter = rolling scrub, tagged as scheduled rather than manual/fault-driven.
+        expect(deps.verifyVolumesJob.start).toHaveBeenCalledWith({ trigger: { source: 'scheduled' } });
         scheduler.stop();
     });
 

@@ -8,6 +8,7 @@ import { ContentRepository } from './database/content-repository';
 import { VolumeRepository, type VolumeVerifyErrors } from './database/volume-repository';
 import { RuntimeConfigRepository } from './database/runtime-config';
 import { FaultRepository, type FaultDocument, type FaultUpsert } from './database/fault-repository';
+import { VerifyRunRepository, type VerifyRunDocument, type VerifyRunStart, type VerifyRunFinish } from './database/verify-run-repository';
 import { StorageStatsRepository } from './database/storage-stats-repository';
 import { AdminTokenRepository, type AdminTokenDocument } from './database/admin-token-repository';
 import { CredentialRepository, type CredentialDocument, type Grant } from './database/credential-repository';
@@ -44,6 +45,7 @@ const NAMESPACE_RESTORE_IN_FLIGHT = 'namespace-restore-in-flight';
 export type { ContentDocument, ObjectVerificationStateUpdate, SliceErrorInfo, SliceErrorCategory, SliceVerificationTimes } from './database/types';
 export type { CredentialDocument, Grant } from './database/credential-repository';
 export type { FaultDocument, FaultUpsert } from './database/fault-repository';
+export type { VerifyRunDocument, VerifyRunStart, VerifyRunFinish, VerifyRunTrigger } from './database/verify-run-repository';
 export type { StorageStatsDelta, StorageStatsSnapshot } from './storage/stats';
 
 const log = createLogger('database');
@@ -56,6 +58,7 @@ export class Database {
         content: Collection<ContentDocument> | null;
         runtimeConfig: Collection<{ key: string; value: unknown }> | null;
         faults: Collection<FaultDocument> | null;
+        verifyRuns: Collection<VerifyRunDocument> | null;
         storageStats: Collection<any> | null;
         adminTokens: Collection<AdminTokenDocument> | null;
         credentials: Collection<CredentialDocument> | null;
@@ -64,6 +67,7 @@ export class Database {
         content: null,
         runtimeConfig: null,
         faults: null,
+        verifyRuns: null,
         storageStats: null,
         adminTokens: null,
         credentials: null
@@ -74,6 +78,7 @@ export class Database {
         content: ContentRepository | null;
         runtimeConfig: RuntimeConfigRepository | null;
         faults: FaultRepository | null;
+        verifyRuns: VerifyRunRepository | null;
         storageStats: StorageStatsRepository | null;
         adminTokens: AdminTokenRepository | null;
         credentials: CredentialRepository | null;
@@ -82,6 +87,7 @@ export class Database {
         content: null,
         runtimeConfig: null,
         faults: null,
+        verifyRuns: null,
         storageStats: null,
         adminTokens: null,
         credentials: null
@@ -103,6 +109,7 @@ export class Database {
             this._collections.content = this._db.collection('content');
             this._collections.runtimeConfig = this._db.collection('runtimeConfig');
             this._collections.faults = this._db.collection('faults');
+            this._collections.verifyRuns = this._db.collection('verifyRuns');
             this._collections.storageStats = this._db.collection('storageStats');
             this._collections.adminTokens = this._db.collection('adminTokens');
             this._collections.credentials = this._db.collection('credentials');
@@ -126,12 +133,14 @@ export class Database {
                 ),
                 runtimeConfig: new RuntimeConfigRepository(this._collections.runtimeConfig),
                 faults: new FaultRepository(this._collections.faults),
+                verifyRuns: new VerifyRunRepository(this._collections.verifyRuns),
                 storageStats: new StorageStatsRepository(this._collections.storageStats),
                 adminTokens: new AdminTokenRepository(this._collections.adminTokens),
                 credentials: new CredentialRepository(this._collections.credentials)
             };
             await this.ensureContentIndexes();
             await this.ensureFaultIndexes();
+            await this.ensureVerifyRunIndexes();
             await this.ensureRuntimeConfigIndexes();
             await this.adminTokenRepository.ensureIndexes();
             await this.credentialRepository.ensureIndexes();
@@ -533,6 +542,18 @@ export class Database {
         await this.faultRepository.delete(key);
     }
 
+    async recordVerifyRunStart(run: VerifyRunStart): Promise<void> {
+        await this.verifyRunRepository.start(run);
+    }
+
+    async recordVerifyRunFinish(startedAt: string, update: VerifyRunFinish): Promise<void> {
+        await this.verifyRunRepository.finish(startedAt, update);
+    }
+
+    async listVerifyRuns(limit?: number): Promise<VerifyRunDocument[]> {
+        return this.verifyRunRepository.list(limit);
+    }
+
     async getContainer(path: ContainerPath, shouldCreateIfNotExists = false): Promise<string | null> {
         return this.contentRepository.resolveContainer(path, shouldCreateIfNotExists);
     }
@@ -687,6 +708,18 @@ export class Database {
         }
     }
 
+    private async ensureVerifyRunIndexes(): Promise<void> {
+        try {
+            await this.verifyRunsCollection.createIndexes([
+                { key: { startedAt: -1 }, name: 'startedAt' }
+            ]);
+        }
+        catch (err) {
+            log.error('failed to ensure verifyRuns indexes', err);
+            throw err;
+        }
+    }
+
     private _normalizeObject<T extends ContentDocument>(object: T): T & { id: string; containerId?: string | null } {
         const normalized = { ...object } as T & { id: string; containerId?: string | null };
 
@@ -812,6 +845,19 @@ export class Database {
             this._repositories.faults = new FaultRepository(this.faultsCollection);
         }
         return this._repositories.faults;
+    }
+
+    private get verifyRunsCollection(): Collection<VerifyRunDocument> {
+        if (!this._collections.verifyRuns)
+            throw new Error('database not initialized');
+        return this._collections.verifyRuns;
+    }
+
+    private get verifyRunRepository(): VerifyRunRepository {
+        if (!this._repositories.verifyRuns) {
+            this._repositories.verifyRuns = new VerifyRunRepository(this.verifyRunsCollection);
+        }
+        return this._repositories.verifyRuns;
     }
 
     private get runtimeConfigRepository(): RuntimeConfigRepository {
