@@ -74,4 +74,5 @@ production since 2017, currently holding 130+ TB across ~30 disks of assorted si
 - **[On-disk format](/on-disk-format)** — the exact byte layout of a slice, and how to read your data with nothing but `dd` and a Reed–Solomon library.
 - **[Running STRUBS](/operations)** — deployment, adding and removing drives, rebalancing, and disaster recovery.
 - **[Encryption](/encryption)** — the full LUKS story: keyfile, recovery passphrase, the identity model, and the guarantees.
+- **[Access control](/access-control)** — the two origins, admin sessions and bearer tokens, TLS, and the object-API credential system.
 - **[HTTP API](/api)** — the object API and the management API.

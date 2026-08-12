@@ -29,10 +29,11 @@ export default defineConfig({
       { text: 'Guide', link: '/architecture', activeMatch: '/(architecture|data-integrity|on-disk-format)' },
       {
         text: 'Operations',
-        activeMatch: '/(operations|encryption|configuration)',
+        activeMatch: '/(operations|encryption|access-control|configuration)',
         items: [
           { text: 'Running STRUBS', link: '/operations' },
           { text: 'Encryption (LUKS)', link: '/encryption' },
+          { text: 'Access control', link: '/access-control' },
           { text: 'Configuration', link: '/configuration' }
         ]
       },
@@ -61,6 +62,7 @@ export default defineConfig({
         items: [
           { text: 'Running STRUBS', link: '/operations' },
           { text: 'Encryption (LUKS)', link: '/encryption' },
+          { text: 'Access control', link: '/access-control' },
           { text: 'Configuration', link: '/configuration' }
         ]
       },

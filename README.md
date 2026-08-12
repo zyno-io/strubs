@@ -87,7 +87,7 @@ The other side of the trade, stated plainly:
 
 - **One host.** STRUBS survives disks, not buildings. It is not a substitute for an off-site backup.
 - **Not fast.** Erasure coding on write; reads reassemble from several spinning disks. It is built for bulk media, archives, and backups — not for a database's working set.
-- **MongoDB is a hard dependency, and it is the weak link.** Every object's metadata lives there, and the slices on disk are useless without the records saying which volumes hold them. **Back Mongo up.** Losing it loses the array even though every disk is perfectly healthy.
+- **MongoDB is a hard dependency.** Every object's metadata lives there, and a slice on disk is an anonymous blob without the record saying which object it belongs to. STRUBS mitigates this by writing the namespace back onto the platters (a replicated journal plus periodic snapshots), so a lost database is recoverable rather than terminal — but that's the bad day's path. **Back Mongo up.**
 - **Small project.** Production-proven, but by a small number of people. Read the code before you trust it with something irreplaceable.
 
 ---
@@ -105,7 +105,7 @@ The other side of the trade, stated plainly:
 | **Drive replacement** | Drain a disk — every slice relocated, every reference rewritten — then pull it. No data loss, no downtime. |
 | **Rebalancing** | Level fill across mismatched disks after adding or removing drives. |
 | **Find the bay** | Flash a drive's activity LED, so you pull the right one out of a 30-disk chassis. |
-| **Two front doors** | An HTTP object API, and a FUSE mount so existing tools can treat it as a directory. |
+| **Two front doors** | An HTTP object API, and an optional FUSE mount so existing tools can treat it as a directory. |
 | **Web UI** | Fleet status, per-drive health, and the maintenance operations above. |
 
 ---
@@ -129,7 +129,13 @@ export STRUBS_MONGO_URL='mongodb://user:pass@127.0.0.1:27017/strubs?authSource=a
 yarn start                 # node dist/service.js
 ```
 
-Then open **`http://<host>/$/ui`** and add your disks.
+Then open **`https://<host>/$/ui`** and add your disks. The admin UI is HTTPS on port 443 with a certificate
+STRUBS issues itself, so expect a browser warning until you trust `/var/lib/strubs/tls/ca.crt`. It also
+generates an admin password on first start and prints it to the log **once**:
+
+```bash
+journalctl -u strubs | grep -A2 'NO ADMIN PASSWORD'
+```
 
 > **Adding a disk wipes it.** Provisioning partitions and formats the device. Be certain about the path.
 
@@ -137,7 +143,12 @@ You'll want at least `dataSlices + paritySlices` disks — 6 by default — befo
 
 For a real deployment — the systemd unit, adding and replacing drives, and what to do when one starts failing — see **[Operations](docs/operations.md)**.
 
-> **There is no authentication.** None of the HTTP endpoints — object API, management API, or UI — authenticate anything. STRUBS is built to sit on a trusted network behind something that does. Do not expose it to the internet.
+> **Know which surface is protected.** The management API and UI always authenticate — password session or
+> bearer token, HTTPS-only on port 443, on a separate origin from object content so a stored XSS can't reach
+> the disk-wipe endpoints. **The object API on port 80 is a different story:** it has credentials and
+> per-bucket grants, but they are *dark by default* until you set `authEnforced`, and it has no TLS of its own.
+> Until you turn enforcement on, anyone who can reach port 80 can read, overwrite, and delete your objects.
+> See [Access control](docs/access-control.md).
 
 ---
 
@@ -154,6 +165,7 @@ VitePress from the `docs/` directory and deployed on every push to `main`. Run i
 | [Encryption](docs/encryption.md) | The full LUKS story: keyfile, recovery passphrase, rotation, audit, and recovery. |
 | [Data integrity](docs/data-integrity.md) | What "verified" means here, the quorum rules, and the failure modes checksums alone don't catch. |
 | [HTTP API](docs/api.md) | The object API, the management API, and the FUSE mount. |
+| [Access control](docs/access-control.md) | The two origins, admin sessions and bearer tokens, TLS, and the object-API credential system. |
 | [Configuration](docs/configuration.md) | Every environment variable and runtime setting. |
 | [On-disk format](docs/on-disk-format.md) | Slice headers, chunk layout, and the Mongo schema — enough to recover data without STRUBS. |
 | [Development](docs/development.md) | Building, testing, and the shape of the codebase. |

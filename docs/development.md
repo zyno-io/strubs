@@ -28,7 +28,15 @@ STRUBS mounts filesystems and reads raw block devices, so it needs root:
 yarn dev          # sudo + ts-node + --watch + --inspect (port 9229)
 ```
 
-It will try to bind **port 80** and mount FUSE at `/run/strubs/data`. Without disks it starts, reports zero volumes, and does nothing useful — which is fine for working on the HTTP layer.
+It binds **port 80** (object API) and **port 443** (admin API + UI over HTTPS, with a self-issued certificate
+in `/var/lib/strubs/tls`), and opens the root-only admin socket at `/run/strubs/admin.sock`. FUSE is *not*
+mounted unless you set `STRUBS_FUSE_ENABLED=true`. Without disks it starts, reports zero volumes, and does
+nothing useful — which is fine for working on the HTTP layer.
+
+Two things to know on a fresh dev box: the admin password is **generated on first start and logged once**
+(grep the output for `NO ADMIN PASSWORD`), and the admin socket is the shortcut around all of it —
+`curl --unix-socket /run/strubs/admin.sock http://localhost/\$/status` needs no credential and no TLS.
+See [Access control](access-control.md).
 
 To exercise the real data path you need actual volumes. Loopback devices work:
 

@@ -1,6 +1,21 @@
 # Operations
 
-The runbook. Most of this is doable from the web UI at `/$/ui`; the `curl` equivalents are given because they're what you'll want in a script or over SSH.
+The runbook. Most of this is doable from the web UI at **`https://<host>/$/ui`**; the `curl` equivalents are given because they're what you'll want in a script or over SSH.
+
+**The management API is authenticated and HTTPS-only** (port 443, separate origin from the object API on port 80). Every example below therefore goes through the **root-only admin Unix socket** instead — from a root shell on the box it needs no password and no certificate:
+
+```bash
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/status | jq
+```
+
+To drive the same endpoints over the network, use HTTPS with a bearer token:
+
+```bash
+curl -s --cacert /var/lib/strubs/tls/ca.crt \
+     -H "Authorization: Bearer $STRUBS_TOKEN" https://strubs/\$/status | jq
+```
+
+Issuing tokens, the generated first-boot password, and the object API's own credential system are all in [Access control](access-control.md).
 
 Throughout, `$` is escaped in URLs (`localhost/\$/volumes`) so your shell doesn't eat it.
 
@@ -52,9 +67,10 @@ Worth knowing before you try to sandbox it, because it explains why it needs roo
 
 | | |
 |---|---|
-| **Binaries** | `lsblk`, `parted`, `mkfs.ext4`, `partprobe`, `mount`, `umount`, `smartctl`, `journalctl`, `udevadm` |
+| **Binaries** | `lsblk`, `parted`, `mkfs.ext4`, `partprobe`, `wipefs`, `mount`, `umount`, `e2fsck`, `dumpe2fs`, `smartctl`, `journalctl`, `udevadm`, and **`openssl`** — which issues the admin listener's certificate, so without it the admin API and UI cannot start at all. Encryption additionally needs `cryptsetup` and `sgdisk`. |
 | **Syscalls** | `mount`/`umount` — it mounts each volume itself |
-| **Devices** | Raw reads on `/dev/sd*` (identity, SMART, LED flashing), and `/dev/fuse` |
+| **Devices** | Raw reads on `/dev/sd*` (identity, SMART, LED flashing), plus `/dev/fuse` if `STRUBS_FUSE_ENABLED=true` |
+| **Ports** | 80 (object API) and 443 (admin API + UI, HTTPS) |
 | **Hotplug** | udev events, with a periodic scan as backstop |
 | **Logs** | The systemd journal, for the kernel/smartd watcher |
 
@@ -62,7 +78,7 @@ Worth knowing before you try to sandbox it, because it explains why it needs roo
 
 You can. Be clear about what it does and doesn't buy you.
 
-STRUBS needs the host's block devices, the `mount` syscall, raw device access, and `/dev/fuse`. Once you've handed a container all of that, **it is no longer a security boundary** — it's a packaging format. That's a perfectly good reason to do it (a pinned Node version, and the native modules here are the fiddly kind: `fuse-native`, `@ronomon/reed-solomon`, `diskusage`), just not the reason people usually reach for a container.
+STRUBS needs the host's block devices, the `mount` syscall, raw device access, and — if you enable FUSE — `/dev/fuse`. Once you've handed a container all of that, **it is no longer a security boundary** — it's a packaging format. That's a perfectly good reason to do it (a pinned Node version, and the native modules here are the fiddly kind: `fuse-native`, `@ronomon/reed-solomon`, `diskusage`), just not the reason people usually reach for a container.
 
 What it takes:
 
@@ -74,17 +90,18 @@ docker run -d --name strubs \
   -v /run/udev:/run/udev:ro \             # udevadm
   -v /var/log/journal:/var/log/journal:ro \   # journalctl (kernel + smartd watcher)
   --mount type=bind,source=/run/strubs,target=/run/strubs,bind-propagation=rshared \
-  -v /var/lib/strubs:/var/lib/strubs \    # instance identity
-  -p 80:80 \
+  -v /var/lib/strubs:/var/lib/strubs \    # instance identity, TLS material, LUKS keyfile
+  -p 80:80 \                              # object API
+  -p 443:443 \                            # admin API + UI (HTTPS)
   strubs
 ```
 
 Two of those are easy to get wrong:
 
 - **`-v /dev:/dev`, not `--device=/dev/sdb`.** `--device` maps a *fixed* node. STRUBS is built around disks appearing and vanishing; a static mapping means hotplug never works and a replaced drive never shows up.
-- **`bind-propagation=rshared` on `/run/strubs`.** Every volume STRUBS mounts lands under `/run/strubs/mounts/`, and the FUSE mount is at `/run/strubs/data`. Without shared propagation those mounts exist only inside the container's namespace — the host, and anything else on it, sees an empty directory.
+- **`bind-propagation=rshared` on `/run/strubs`.** Every volume STRUBS mounts lands under `/run/strubs/mounts/`, and the FUSE mount, if you enable it, is at `/run/strubs/data`. Without shared propagation those mounts exist only inside the container's namespace — the host, and anything else on it, sees an empty directory. It's also where the admin socket lives, so the `--unix-socket` examples in this document only work from inside the container without it.
 
-The image needs `smartmontools`, `parted`, `e2fsprogs`, `util-linux`, and `fuse`.
+The image needs `smartmontools`, `parted`, `e2fsprogs`, `util-linux`, `openssl`, `cryptsetup` and `gdisk` (if you encrypt), and `fuse` (if you enable the mount).
 
 If you *don't* grant everything, two features degrade rather than crash — both have an off switch:
 
@@ -98,11 +115,11 @@ If you *don't* grant everything, two features degrade rather than crash — both
 ## Watching it
 
 ```bash
-curl -s localhost/\$/status          | jq     # capacity, volumes by state
-curl -s localhost/\$/volumes         | jq     # every drive: flags, SMART, fill
-curl -s localhost/\$/faults          | jq     # outstanding slice faults
-curl -s localhost/\$/verify-volumes  | jq     # scrub progress
-curl -s localhost/\$/rebalance       | jq     # rebalance progress
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/status          | jq     # capacity, volumes by state
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/volumes         | jq     # every drive: flags, SMART, fill
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/faults          | jq     # outstanding slice faults
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/verify-volumes  | jq     # scrub progress
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/rebalance       | jq     # rebalance progress
 journalctl -u strubs -f
 ```
 
@@ -117,12 +134,12 @@ Notifications go to the log always, and to Slack if `STRUBS_SLACK_WEBHOOK_URL` i
 Find the device, sanity-check its SMART, then provision it:
 
 ```bash
-curl -s localhost/\$/blockDevices?sort=sysfsPath | jq '.[] | {name, size, model, serial, volumeId}'
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/blockDevices?sort=sysfsPath | jq '.[] | {name, size, model, serial, volumeId}'
 smartctl -d sat -H -A /dev/sdx
 ```
 
 ```bash
-curl -X POST localhost/\$/volumes -H 'Content-Type: application/json' \
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/volumes -H 'Content-Type: application/json' \
   -d "{\"blockPath\":\"/dev/sdx\",\"wipe\":$(date +%s%3N)}"
 ```
 
@@ -147,7 +164,7 @@ The sequence is: **drain → confirm empty → identify → pull.**
 ### 1. Drain it
 
 ```bash
-curl -X POST localhost/\$/volumes/13/drain
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/volumes/13/drain
 ```
 
 This marks the volume read-only + draining and relocates **every** slice it holds onto healthy volumes, rewriting object references as it goes. It's move-then-flip: a slice is written and verified on its new home, the reference is flipped, and only then is the source copy deleted. Cancelling or crashing mid-drain loses nothing.
@@ -157,7 +174,7 @@ It works on a **dead disk too** — with the drive offline it reconstructs each 
 Watch it:
 
 ```bash
-curl -s localhost/\$/volumes | jq '.[] | select(.id==13) | {isDraining, bytesFree, bytesTotal}'
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/volumes | jq '.[] | select(.id==13) | {isDraining, bytesFree, bytesTotal}'
 journalctl -u strubs -f | grep -i drain
 ```
 
@@ -168,7 +185,7 @@ Slices that genuinely can't be rebuilt (below quorum) are **left in place and re
 Do not skip this. Drain reports "complete" when its scan finishes, and a scan that skipped objects (because of an error mid-run) can still report complete.
 
 ```bash
-curl -s localhost/\$/volumes/13 | jq '{isDraining, bytesFree, bytesTotal}'
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/volumes/13 | jq '{isDraining, bytesFree, bytesTotal}'
 ```
 
 The authoritative check is that nothing references it any more:
@@ -184,8 +201,8 @@ db.content.countDocuments({ $or: [{ dataVolumes: 13 }, { parityVolumes: 13 }] })
 In a 30-bay chassis, the difference between `sdf` and `sdg` is somebody's afternoon. Flash its LED:
 
 ```bash
-curl -X POST localhost/\$/volumes/13/identify     # re-POST every ~1s to keep it going
-curl -X DELETE localhost/\$/volumes/13/identify   # stop
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/volumes/13/identify     # re-POST every ~1s to keep it going
+curl -X DELETE --unix-socket /run/strubs/admin.sock localhost/\$/volumes/13/identify   # stop
 ```
 
 The UI does the heartbeat for you — open the volume menu and pick **Identify**. Reads stop by themselves ~3 seconds after the last ping, so a closed tab can't leave a drive spinning.
@@ -193,7 +210,7 @@ The UI does the heartbeat for you — open the volume menu and pick **Identify**
 ### 4. Remove it
 
 ```bash
-curl -X DELETE localhost/\$/volumes/13    # soft-delete; refused if slices remain
+curl -X DELETE --unix-socket /run/strubs/admin.sock localhost/\$/volumes/13    # soft-delete; refused if slices remain
 ```
 
 Then physically pull it. Keep the drive on a shelf until a full verify confirms the relocated copies are good — it costs nothing and it's the difference between an inconvenience and an incident.
@@ -205,9 +222,9 @@ Then physically pull it. Keep the drive on a shelf until a full verify confirms 
 After adding or removing drives, fill is uneven. Rebalance levels it.
 
 ```bash
-curl -X POST localhost/\$/rebalance -H 'Content-Type: application/json' -d '{}'
-curl -s localhost/\$/rebalance | jq
-curl -X DELETE localhost/\$/rebalance      # cancel any time; safe
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/rebalance -H 'Content-Type: application/json' -d '{}'
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/rebalance | jq
+curl -X DELETE --unix-socket /run/strubs/admin.sock localhost/\$/rebalance      # cancel any time; safe
 ```
 
 It computes a capacity-weighted target fill across the pool, sheds from volumes above it, and lands on volumes below it. Some things worth knowing:
@@ -222,7 +239,7 @@ It computes a capacity-weighted target fill across the pool, sheds from volumes 
 Concurrency is a **live setting** — it applies to a running job at the next batch, no restart:
 
 ```bash
-curl -X PUT localhost/\$/rebalance -H 'Content-Type: application/json' -d '{"concurrency":8}'
+curl -X PUT --unix-socket /run/strubs/admin.sock localhost/\$/rebalance -H 'Content-Type: application/json' -d '{"concurrency":8}'
 ```
 
 Relocation is latency-bound (open, read, write, commit, ref flip, delete), not bandwidth-bound, so concurrency is the lever that matters. Raise it in steps and watch `bytesPerSec` in the status. Back off if the drives start thrashing or kernel I/O errors appear — seek-bound disks in external enclosures have a real ceiling.
@@ -233,24 +250,24 @@ Relocation is latency-bound (open, read, write, commit, ref flip, delete), not b
 
 ```bash
 # Full scrub of everything (reads every byte; takes a long time)
-curl -X POST localhost/\$/verify-volumes -H 'Content-Type: application/json' -d '{"mode":"full"}'
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/verify-volumes -H 'Content-Type: application/json' -d '{"mode":"full"}'
 
 # Light pass — existence + headers only. Hours, not weeks. Low stress.
-curl -X POST localhost/\$/verify-volumes -H 'Content-Type: application/json' -d '{"mode":"light"}'
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/verify-volumes -H 'Content-Type: application/json' -d '{"mode":"light"}'
 
 # Just one drive
-curl -X POST localhost/\$/verify-volumes -H 'Content-Type: application/json' \
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/verify-volumes -H 'Content-Type: application/json' \
      -d '{"volumeIds":[13],"mode":"full"}'
 
 # One object
-curl -X POST localhost/\$/verify-file/6a4e9b8f3b1e7a0049000001 \
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/verify-file/6a4e9b8f3b1e7a0049000001 \
      -H 'Content-Type: application/json' -d '{"mode":"full"}'
 
-curl -s localhost/\$/verify-volumes | jq
-curl -X DELETE localhost/\$/verify-volumes
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/verify-volumes | jq
+curl -X DELETE --unix-socket /run/strubs/admin.sock localhost/\$/verify-volumes
 
-# History: every run ever started, most recent first — including why it started
-curl -s localhost/\$/verify-runs | jq
+# History: the 50 most recent runs, newest first — including why each one started
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/verify-runs | jq
 ```
 
 A scrub runs automatically every 90 days by default. **Use `full`.** A light verify will happily tell you every slice is present and correctly labelled while your parity is worthless — only a full pass recomputes parity and compares it. See [Data integrity](data-integrity.md).
@@ -266,7 +283,7 @@ If a rebalance is running, a verify request is **queued**, not rejected: the res
 ### First: consider freezing
 
 ```bash
-curl -X PUT localhost/\$/maintenance-freeze -H 'Content-Type: application/json' -d '{"frozen":true}'
+curl -X PUT --unix-socket /run/strubs/admin.sock localhost/\$/maintenance-freeze -H 'Content-Type: application/json' -d '{"frozen":true}'
 ```
 
 The freeze stops **all** background maintenance — scrub, repair, drain, rebalance — while reads and writes carry on normally. It's persisted and survives restarts.
@@ -278,7 +295,7 @@ Reach for it when you don't yet understand what's happening. Automatic repair is
 ```bash
 journalctl -k | grep -iE 'i/o error|medium error|offline'
 smartctl -d sat -H -A /dev/sdx
-curl -s localhost/\$/volumes/13 | jq .smartInfo
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/volumes/13 | jq .smartInfo
 ```
 
 Distinguish two very different things:
@@ -291,7 +308,7 @@ STRUBS itself treats a kernel error as a **hint**: the log watcher triggers a ta
 ### Objects are flagged
 
 ```bash
-curl -s localhost/\$/faults | jq '.faults[] | {objectId, sliceIndex, volumeId, code, repairStatus, repairBlockedReason}'
+curl -s --unix-socket /run/strubs/admin.sock localhost/\$/faults | jq '.faults[] | {objectId, sliceIndex, volumeId, code, repairStatus, repairBlockedReason}'
 ```
 
 ```js
@@ -345,8 +362,22 @@ The `parity-*.js` scripts are forensic tools from a specific incident. They're k
 
 ## Backups
 
-Say it once more: **back up MongoDB.**
+Say it once more: **back up MongoDB.** `mongodump` on a schedule, off the box.
 
-The slices are useless without the `content` records that say which volumes hold them. Every disk can be perfectly healthy and the array still lost. `mongodump` on a schedule, off the box.
+The slices are useless without the `content` records that say which volumes hold them — which is why STRUBS also writes the namespace back onto the platters, as a replicated journal plus a periodic snapshot (both on by default; see [Configuration](configuration.md#namespace-durability-journal-and-snapshot)). So a lost database is **recoverable** rather than terminal:
 
-And STRUBS survives disks, not buildings. It is not an off-site backup.
+```bash
+# 1. Rebuild the volume table by asking the disks who they are.
+#    Works on a bare host — it's the only thing that doesn't need the fleet.
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/recover-fleet
+
+# 2. Rebuild the namespace from the snapshot on the platters + the journal.
+#    Dry run first: `apply` defaults to false and only reports what it would do.
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/restore
+curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/restore \
+     -H 'Content-Type: application/json' -d '{"apply":true}'
+```
+
+While the namespace is missing, the management API refuses everything outside a small recovery allowlist — because anything that asks an empty database a question ("how many objects are on this volume?") gets an answer that would destroy data if acted on. That's the guard doing its job, not an obstacle to route around.
+
+Restoring a `mongodump` is still hours faster and loses nothing, so keep taking them. And STRUBS survives disks, not buildings: it is not an off-site backup.

@@ -1,16 +1,40 @@
 # HTTP API
 
-STRUBS exposes one HTTP server on **port 80, on all interfaces** (not configurable), plus a read-only FUSE mount.
+STRUBS exposes **two** HTTP listeners on **separate origins**, plus an optional read-only FUSE mount:
 
-> ## There is no authentication
->
-> Not on the object API, not on the management API, not on the UI. Anyone who can reach port 80 can read, overwrite, and delete your data — and can also call `POST /$/volumes` to **repartition and format a disk**. The only protection is where you put it on the network. Put it behind a reverse proxy that authenticates, or on a network where everything is trusted, and never on the public internet.
+| | Listener | Serves |
+|---|---|---|
+| **Object API** | HTTP on `STRUBS_HTTP_PORT` (**80**) | everything that isn't `/$/…` |
+| **Admin surface** | **HTTPS** on `STRUBS_ADMIN_PORT` (**443**) | the management API (`/$/…`) and the UI |
+| **Admin socket** | Unix socket `/run/strubs/admin.sock`, root-only | the management API, with no credential |
 
 Routing is simple: any path starting with **`/$/`** is the management API; everything else is an object path.
+Crossing between the two origins fails on purpose — an object path on the admin listener is a 404, and a `/$/`
+path on the plain-HTTP object listener returns **421 Misdirected Request** naming the HTTPS URL (a top-level
+browser navigation is redirected instead, so typing the bare hostname reaches the login page).
+
+> ## Authentication: on for the admin API, off by default for objects
+>
+> **The management API and UI always authenticate** — an admin password session (cookie) or a bearer token,
+> over HTTPS only. On first start STRUBS generates a random admin password and prints it to the log once.
+>
+> **The object API ships dark.** It has a full credential-and-grants system, but it is inert until an operator
+> sets the `authEnforced` runtime flag; until then every object request is allowed and merely counted. Note
+> also that the object listener is plain HTTP, so Basic credentials would cross the wire in cleartext — put TLS
+> in front of it before relying on enforcement.
+>
+> See **[Access control](access-control.md)** for the whole story: TLS material, sessions, bearer tokens,
+> credentials, bucket policy, and the lockout-recovery socket.
 
 ---
 
 # Object API
+
+Served over plain HTTP on port 80. When `authEnforced` is off (the default) no request needs a credential.
+When it's on, present one with HTTP Basic — `curl -u <accessKeyId>:<secret>` — unless the bucket is marked
+`publicRead`/`publicWrite`. A denied request is **401** (with `WWW-Authenticate: Basic`), **403** (credential
+valid, not granted for that bucket), or **503** (authorization couldn't be evaluated — it fails closed).
+See [Access control](access-control.md).
 
 ## Addressing
 
@@ -88,13 +112,51 @@ Returns **204** with `Allow` and CORS headers. Note it requires the object to *e
 ## Not supported
 
 - **`POST`** — returns 400.
-- **Listing.** There is no HTTP endpoint that enumerates a container. `GET` on a container path returns 404. (The FUSE mount *can* list — see below.)
+- **Listing.** The *object* API cannot enumerate a container — `GET` on a container path returns 404. Listing lives on the authenticated management API instead (`GET /$/browse`), and the FUSE mount can list if you've enabled it.
 
 ---
 
 # Management API
 
-All under `/$/`. Bodies are JSON; an empty body is treated as `{}`.
+All under `/$/`, **on the HTTPS admin listener** (port 443) or the root-only Unix socket. Bodies are JSON; an
+empty body is treated as `{}`.
+
+Every endpoint below requires authentication except `GET /$/ui*`, `POST`/`DELETE /$/session`, and
+`GET /$/auth/status` — the three that *are* how you authenticate. Mutating requests are also rejected if the
+browser reports them as cross-site.
+
+```bash
+# session cookie
+curl -k -c jar -X POST https://strubs/\$/session \
+     -H 'Content-Type: application/json' -d '{"password":"…"}'
+curl -k -b jar https://strubs/\$/status
+
+# or a bearer token
+curl -k -H 'Authorization: Bearer <selector>.<secret>' https://strubs/\$/status
+
+# or, as root on the box, no credential at all
+curl --unix-socket /run/strubs/admin.sock http://localhost/\$/status
+```
+
+## Authentication and access control
+
+| | |
+|---|---|
+| `GET /$/auth/status` | `{authenticated, passwordSet}`. Auth-exempt — it's what the SPA reads to decide login-vs-dashboard. |
+| `POST /$/session` | Log in. Body: `password`. Sets the `strubs_admin` cookie. **429** when throttled, **401** on a bad password. |
+| `DELETE /$/session` | Log out — clears the cookie **and revokes every outstanding session**. |
+| `PUT /$/admin/password` | Body: `currentPassword`, `newPassword` (≥8 chars). Invalidates all sessions. Over the admin socket, `currentPassword` is not required — that's the lockout-recovery path. |
+| `GET /$/admin/tokens` | List bearer tokens (never the secrets). |
+| `POST /$/admin/tokens` | Create one. Body: `name`. Returns `{token, selector}` — **the token is shown once**. |
+| `DELETE /$/admin/tokens/{selector}` | Revoke one. |
+| `DELETE /$/admin/tokens` | Revoke **all** of them. |
+| `GET /$/credentials` | Object-API credentials with their grants (never the secrets). |
+| `POST /$/credentials` | Create. Body: `name`, `grants` (`[{bucket, read, write}]`, `bucket` may be `*`). Returns `{accessKeyId, secret}` — **secret shown once**. |
+| `PUT /$/credentials/{accessKeyId}` | Set `grants` and/or `enabled`. Effective immediately. |
+| `POST /$/credentials/{accessKeyId}/rotate` | New secret, shown once; the old one stops working at once. |
+| `DELETE /$/credentials/{accessKeyId}` | Remove it. |
+| `GET /$/auth/settings` | `{authEnforced}`. |
+| `PUT /$/auth/settings` | `{authEnforced: bool}` — the object-API switch. Off by default. |
 
 ## Fleet and status
 
@@ -104,6 +166,8 @@ All under `/$/`. Bodies are JSON; an empty body is treated as `{}`.
 | `GET /$/volumes/{id}` | One volume, plus full SMART attribute detail. |
 | `GET /$/status` | Volume ids by state, plus GB stored / capacity / free. |
 | `GET /$/storage-stats` | Object and byte counters, system-wide and per volume. *(If no snapshot exists yet this triggers a full reconciliation scan — expensive.)* |
+| `POST /$/storage-stats` | Force a full reconciliation from content aggregation, then return the fresh snapshot. Expensive; the scheduler does this every 6 hours anyway. |
+| `GET /$/browse` | Walk the path namespace: `?path=`, `?after=` (cursor), `?limit=`. Returns `{path, entries, hasMore}`. This is what the UI's file browser uses — and the only way to *list* over HTTP, since the object API has no enumeration endpoint. |
 | `GET /$/blockDevices` | Block devices as discovered, with their partitions and which volume each maps to. `?sort=name\|sysfsPath\|size\|volumeId\|volumeLabel`. |
 | `POST /$/blockDevices/reload` | Rescan block devices. |
 | `GET /$/faults` | Outstanding slice faults and their repair state. |
@@ -121,6 +185,7 @@ All under `/$/`. Bodies are JSON; an empty body is treated as `{}`.
 | `DELETE /$/volumes/{id}/drain` | Cancel the drain. **Leaves the volume read-only** — clear that separately. |
 | `POST /$/volumes/{id}/identify` | Flash the drive's activity LED so you can find its bay. |
 | `DELETE /$/volumes/{id}/identify` | Stop. |
+| `POST /$/volumes/{id}/encrypt` | Convert a volume to LUKS in place — **this wipes it**, so it refuses unless the volume is already read-only *and* holds no slices (i.e. you drained it first). One conversion at a time, fleet-wide. Body: `recoveryPassphrase`, normally omitted since STRUBS holds it sealed. See [Encryption](encryption.md). |
 
 ### `POST /$/volumes` — the dangerous one
 
@@ -150,6 +215,7 @@ volume 13 still holds 41027 live object slice(s); drain it first: POST /$/volume
 | `GET /$/verify-volumes` | Progress, error counts, scope, and whether it's `waiting` on a rebalance. |
 | `DELETE /$/verify-volumes` | Stop. |
 | `POST /$/verify-file/{objectId}` | Verify one object. Body: `mode`. Returns a per-slice result map. |
+| `GET /$/verify-runs` | The **50 most recent** verify runs, newest first: `scope`, `mode`, `volumeIds`, `status` (`running`/`completed`/`stopped`), error counts, and the `trigger` that started each one (`manual`, `scheduled`, or `syslog-watcher` with the device and kernel detail). |
 
 `POST /$/verify-volumes` returns `{startedAt, accepted, deferred?}`. Note the quiet cases:
 
@@ -204,18 +270,49 @@ A **bucket** is a top-level container (the first path segment). These endpoints 
 
 Persisted, and enforced across restarts. See [Configuration](configuration.md#the-maintenance-freeze).
 
+## Encryption
+
+Covered in full by [Encryption](encryption.md); the endpoints are:
+
+| | |
+|---|---|
+| `PUT /$/encryption/settings` | Set `encryptNewVolumes` — whether newly provisioned disks are LUKS. |
+| `PUT /$/encryption/passphrase` | Set the fleet recovery passphrase. Writes it to every attached encrypted disk, so it **refuses to run with any disk missing**. |
+| `POST /$/encryption/audit` | Prove the recovery passphrase against every encrypted disk and record the result. |
+| `POST /$/encryption/seal` | Re-seal the recovery passphrase under the keyfile. |
+
+## Namespace and disaster recovery
+
+The bad-day endpoints. See [Operations](operations.md) for when and how to use them.
+
+| | |
+|---|---|
+| `GET /$/snapshot` | The current namespace-snapshot pointer, and whether a snapshot job is running. |
+| `POST /$/snapshot` | Take a namespace snapshot now and publish its pointer to every disk. **Refused while the namespace is unrestored** — it would publish an empty namespace over a good one. |
+| `POST /$/recover-fleet` | Step one of a total database loss: read every disk, work out by majority which array this is, adopt that identity, and rebuild the volume table. Body: `force`, `recoveryPassphrase`. |
+| `POST /$/restore` | Rebuild the namespace from the snapshot on the platters plus the journal. Body: `apply` (**false = dry run**, the default), `force`. |
+| `POST /$/drift` | Scrub for drift between the database and what's actually on the disks. |
+
+While the namespace is missing, the management API drops to an **allowlist** — these recovery routes, the auth
+routes needed to reach them, and read-only status. Everything else returns 400 with an explanation, because
+anything that asks an empty database a question ("how many objects are on this volume?") would get a
+catastrophically wrong answer.
+
 ## Other
 
 | | |
 |---|---|
 | `POST /$/notify/test` | Actually sends a notification. Body: `severity` (`info`/`warning`/`critical`, default `warning`), `title`, `body`. |
-| `GET /$/ui`, `GET /$/ui/*` | The web UI bundle. |
+| `GET /$/ui`, `GET /$/ui/*` | The web UI bundle. Auth-exempt — it's the login page. |
 
 ---
 
 # FUSE mount
 
-Mounted at **`/run/strubs/data`** (hardcoded), started alongside the HTTP server.
+**Off by default.** Set `STRUBS_FUSE_ENABLED=true` to mount it at **`/run/strubs/data`** (hardcoded), alongside
+the HTTP listeners. It's opt-in for two reasons: it is a second, *unauthenticated* read path to every object,
+and it needs the native `fuse-native` binding plus `/dev/fuse`. While it's off the binding is never even
+loaded, so STRUBS runs on a host that has neither. The HTTP object API is unaffected either way.
 
 **It is read-only.** Writes return `EROFS`; `create`, `unlink`, `mkdir`, `rename`, `truncate`, `chmod` and friends are not implemented. Supported: `getattr`, `readdir`, `open` (read-only), `read`, `release`.
 
