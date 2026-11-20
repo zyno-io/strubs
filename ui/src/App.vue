@@ -1702,6 +1702,21 @@ function focusMain(): void {
   mainEl.value?.focus();
 }
 
+// The top bar's height depends on whether the tabs wrap onto their own row. Publish it as --header-h so the
+// sticky page header sits directly beneath it at every width.
+const topbarEl = ref<HTMLElement | null>(null);
+let topbarObserver: ResizeObserver | null = null;
+watch(topbarEl, el => {
+  topbarObserver?.disconnect();
+  topbarObserver = null;
+  if (!el) return;
+  topbarObserver = new ResizeObserver(() => {
+    document.documentElement.style.setProperty('--header-h', `${el.getBoundingClientRect().height}px`);
+  });
+  topbarObserver.observe(el);
+});
+onUnmounted(() => topbarObserver?.disconnect());
+
 function selectTab(tab: MainTab): void {
   // An error from the Volumes tab has nothing to say about Buckets. It used to scroll out of sight on its own;
   // now that it is pinned, leaving it up would follow the operator around the whole app.
@@ -2145,7 +2160,7 @@ onUnmounted(() => {
 
   <div v-else class="shell">
     <a class="skip-link" href="#main" @click.prevent="focusMain">Skip to content</a>
-    <header class="topbar">
+    <header ref="topbarEl" class="topbar">
       <div class="topbar-inner">
         <span class="brand">
           <span class="brand-mark" aria-hidden="true"><i class="fa-solid fa-layer-group"></i></span>
@@ -4103,7 +4118,9 @@ onUnmounted(() => {
 // ---- Modals ----
 
 .device-list {
-  overflow: hidden;
+  // Scrolls inside the modal, which keeps its title and actions in view.
+  min-height: 0;
+  overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }

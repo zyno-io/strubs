@@ -30,7 +30,9 @@
     position: sticky;
     top: 0;
     z-index: 40;
-    height: var(--header-h);
+    // Height is content-driven (the nav wraps onto its own row when narrow); App.vue measures it into
+    // --header-h so the sticky page header and scroll padding follow.
+    min-height: 46px;
     border-bottom: 1px solid var(--border);
     background: color-mix(in srgb, var(--surface) 88%, transparent);
     backdrop-filter: saturate(1.4) blur(10px);
@@ -40,7 +42,7 @@
     display: flex;
     align-items: center;
     gap: 18px;
-    height: 100%;
+    min-height: 45px; // + the 1px hairline = PixelCI's 46px bar
     padding: 0 16px;
 }
 
@@ -67,16 +69,10 @@
 }
 
 .nav {
-    position: relative;
     display: flex;
+    flex-wrap: wrap;
     gap: 2px;
     min-width: 0;
-    overflow-x: auto;
-    scrollbar-width: none;
-
-    &::-webkit-scrollbar {
-        display: none;
-    }
 }
 
 .nav-link {
@@ -151,6 +147,11 @@
         width: 32px;
         padding: 0;
     }
+}
+
+// Keyboard focus and scrolled-to elements land below the sticky top bar and page header.
+html {
+    scroll-padding-top: calc(var(--header-h) + 72px);
 }
 
 main {
@@ -951,26 +952,17 @@ textarea.input {
     }
 }
 
+// Below 900px the tabs no longer fit beside the brand: they take their own row (and wrap), so every tab
+// and its status dot stays visible.
 @media (max-width: 900px) {
     .topbar-inner {
-        gap: 12px;
-    }
-}
-
-@media (max-width: 640px) {
-    :root {
-        --header-h: 84px;
-    }
-
-    .topbar-inner {
         flex-wrap: wrap;
-        gap: 0 10px;
-        padding: 0 12px;
+        gap: 0 12px;
     }
 
     .brand,
     .topbar-right {
-        height: 46px;
+        height: 45px;
     }
 
     .nav {
@@ -978,6 +970,13 @@ textarea.input {
         flex-basis: 100%;
         margin: 0 -4px;
         padding-bottom: 6px;
+    }
+}
+
+@media (max-width: 640px) {
+    .topbar-inner {
+        gap: 0 10px;
+        padding: 0 12px;
     }
 
     .signout-label {
