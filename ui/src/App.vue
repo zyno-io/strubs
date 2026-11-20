@@ -7,6 +7,11 @@ import type { VolumeStatus, BlockDevice, StatusResponse } from '@strubs/server/h
 // saw, because vue-tsc was aborting on a tsconfig deprecation before it checked anything.
 import type { RebalanceStatus } from '@strubs/jobs/rebalance-job';
 
+import ThemeMenu from '@/components/ThemeMenu.vue';
+
+// PixelCI status tones (DESIGN.md "Secondary"): every tone is a soft fill + border + text triplet in base.scss.
+type Tone = 'success' | 'warning' | 'danger' | 'info' | 'release' | 'neutral';
+
 const volumes = ref<VolumeStatus[]>([]);
 const blockDevices = ref<BlockDevice[]>([]);
 const loading = ref<boolean>(true);
@@ -491,6 +496,9 @@ function verifyRunTriggerClass(trigger: VerifyRunTrigger): string {
   return trigger.source === 'syslog-watcher' ? 'fault' : trigger.source;
 }
 
+const VERIFY_TRIGGER_TONE: Record<string, Tone> = { fault: 'danger', manual: 'info', scheduled: 'neutral' };
+const VERIFY_STATUS_TONE: Record<string, Tone> = { running: 'info', completed: 'success', stopped: 'warning' };
+
 function verifyRunScopeLabel(run: VerifyRunDocument): string {
   return run.scope === 'targeted' && run.volumeIds.length > 0
     ? `vol ${run.volumeIds.join(', ')}`
@@ -544,7 +552,8 @@ type StorageVolumeRow = {
   // Hardware-derived bus group (physical enclosure/HBA), present on volumes and
   // unassigned drives alike; used to slot unassigned drives next to their siblings
   busGroup: number | null;
-  color: string;
+  // Status tone of the volume (see getVolumeTone); drives the volume-id tag colour.
+  tone: Tone;
   device: string | null;
   // Underlying sysfs path of the backing block device, when known (used for the
   // "path" sort and as a tile detail). Null for offline/diskless volumes.
@@ -628,8 +637,8 @@ const storageVolumeRows = computed<StorageVolumeRow[]>(() => {
     const volume = volumes.value.find(candidate => candidate.id === volumeId) ?? null;
     // group.index physical label (e.g. "3.3"), kept separate from the numeric id
     const groupLabel = volume?.label ?? null;
-    // Reuse the same per-volume status color as the Block Devices table
-    const color = getVolumeBackgroundColor(volume);
+    // Reuse the same per-volume status tone as the Block Devices table
+    const tone = getVolumeTone(volume);
     // Prefer the matching block device's short name (sda, sdb); fall back to the volume's block path
     const blockDevice = blockDevices.value.find(bd => bd.volumeId === volumeId);
     const device = blockDevice?.name ?? deviceNameFromBlockPath(volume?.blockPath ?? null);
@@ -644,7 +653,7 @@ const storageVolumeRows = computed<StorageVolumeRow[]>(() => {
       id: volumeId,
       groupLabel,
       busGroup: volume?.busGroup ?? blockDevice?.busGroup ?? null,
-      color,
+      tone,
       device,
       sysfsPath: blockDevice?.sysfsPath ?? null,
       unassigned: false,
@@ -674,7 +683,7 @@ const storageVolumeRows = computed<StorageVolumeRow[]>(() => {
       // when null, it falls back to busGroup placement after the labeled volumes.
       groupLabel: bd.derivedGroupLabel ?? null,
       busGroup: bd.busGroup ?? null,
-      color: getVolumeBackgroundColor(null),
+      tone: getVolumeTone(null),
       device: bd.name,
       sysfsPath: bd.sysfsPath,
       unassigned: true,
@@ -776,10 +785,10 @@ const sortedStorageRows = computed<StorageVolumeRow[]>(() => {
 });
 
 // Color band for a fullness bar based on how full the drive is
-function fullnessClass(fraction: number): string {
-  if (fraction >= 0.9) return 'fullness-critical';
-  if (fraction >= 0.7) return 'fullness-warn';
-  return 'fullness-ok';
+function fullnessClass(fraction: number): Tone {
+  if (fraction >= 0.9) return 'danger';
+  if (fraction >= 0.7) return 'warning';
+  return 'success';
 }
 
 // Tooltip text describing used / total capacity for a storage row
@@ -877,19 +886,19 @@ const canCreateVolumes = computed<boolean>(() => {
   return true;
 });
 
-// Get background color based on volume state
-function getVolumeBackgroundColor(volume: VolumeStatus | null): string {
-  if (!volume) return '#888888'; // darker gray for better contrast when faded
-  if (!volume.isEnabled) return '#666666'; // darker gray for disabled
-  if (volume.isReadOnly) return '#f9a825'; // dark yellow (better contrast)
-  if (volume.isEnabled && !volume.isStarted) return '#f44336'; // red
+// Status tone based on volume state (same precedence as the old per-volume colours)
+function getVolumeTone(volume: VolumeStatus | null): Tone {
+  if (!volume) return 'neutral'; // unassigned drive
+  if (!volume.isEnabled) return 'neutral'; // disabled
+  if (volume.isReadOnly) return 'info'; // read-only
+  if (volume.isEnabled && !volume.isStarted) return 'danger'; // enabled but not started
 
   // Check for SMART errors or verify errors
   if (volume.isSmartHealthy === false || (volume.verifyErrors && hasVerifyErrors(volume.verifyErrors))) {
-    return '#ff9800'; // orange for errors
+    return 'warning';
   }
 
-  return '#4caf50'; // green - healthy
+  return 'success'; // healthy
 }
 
 // Check if verify errors object has any errors
@@ -1660,6 +1669,14 @@ async function deleteVolume(): Promise<void> {
 // else that now occupies part of the chain.
 type MainTab = 'overview' | 'maintenance' | 'volumes' | 'encryption' | 'buckets' | 'credentials';
 const MAIN_TABS: MainTab[] = ['overview', 'maintenance', 'volumes', 'encryption', 'buckets', 'credentials'];
+const MAIN_TAB_LABELS: Record<MainTab, string> = {
+  overview: 'Overview',
+  maintenance: 'Maintenance',
+  volumes: 'Volumes',
+  encryption: 'Encryption',
+  buckets: 'Buckets',
+  credentials: 'Credentials'
+};
 const activeTab = ref<MainTab>('overview');
 
 function parseHash(): { tab: MainTab; path: string } {
@@ -1677,6 +1694,12 @@ function writeHash(tab: MainTab, path = ''): void {
   const next = `#/${tab}${suffix}`;
   if (window.location.hash !== next)
     window.location.hash = next;
+}
+
+// Skip link target. The app routes on the URL hash, so the link must not navigate to "#main".
+const mainEl = ref<HTMLElement | null>(null);
+function focusMain(): void {
+  mainEl.value?.focus();
 }
 
 function selectTab(tab: MainTab): void {
@@ -2088,1227 +2111,1408 @@ onUnmounted(() => {
 
 <template>
   <!-- Login gate: nothing renders until we know the auth state, then either the login card or the app. -->
-  <div v-if="!authChecked" class="auth-loading">Loading…</div>
+  <div v-if="!authChecked" class="page-loader">
+    <div class="loader" role="status" aria-label="Loading">
+      <i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i>
+    </div>
+  </div>
 
-  <div v-else-if="!authenticated" class="login-screen">
-    <form class="login-card" @submit.prevent="login">
+  <div v-else-if="!authenticated" class="auth-page">
+    <div class="theme-corner"><ThemeMenu /></div>
+    <form class="card auth-card" @submit.prevent="login">
+      <div class="auth-mark" aria-hidden="true"><i class="fa-solid fa-layer-group"></i></div>
       <h1>STRUBS</h1>
-      <p class="login-sub">Administrator sign in</p>
+      <p class="subtitle">Administrator sign in</p>
+      <div v-if="loginError" class="notice danger" role="alert">
+        <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+        <div class="notice-body">{{ loginError }}</div>
+      </div>
       <input
         v-model="loginPassword"
+        class="input"
         type="password"
         placeholder="Admin password"
+        aria-label="Admin password"
         autocomplete="current-password"
         autofocus
         :disabled="loginPending"
       />
-      <button type="submit" :disabled="loginPending || !loginPassword">
+      <button type="submit" class="btn primary" :disabled="loginPending || !loginPassword">
         {{ loginPending ? 'Signing in…' : 'Sign in' }}
       </button>
-      <p v-if="loginError" class="login-error">{{ loginError }}</p>
     </form>
   </div>
 
-  <div v-else class="container">
-    <header>
-      <h1>STRUBS</h1>
-      <button @click="logout" class="logout-btn" title="Sign out">Sign out</button>
+  <div v-else class="shell">
+    <a class="skip-link" href="#main" @click.prevent="focusMain">Skip to content</a>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <span class="brand">
+          <span class="brand-mark" aria-hidden="true"><i class="fa-solid fa-layer-group"></i></span>
+          <span class="brand-name">STRUBS</span>
+        </span>
+
+        <!-- Top-level navigation. Each tab is its own route (#/volumes, #/buckets/photo/2024), so a refresh
+             puts you back where you were. -->
+        <nav class="nav" role="tablist" aria-label="Sections">
+          <button
+            v-for="tab in MAIN_TABS"
+            :key="tab"
+            type="button"
+            class="nav-link"
+            :class="{ active: activeTab === tab }"
+            role="tab"
+            :aria-selected="activeTab === tab"
+            @click="selectTab(tab)"
+          >
+            {{ MAIN_TAB_LABELS[tab] }}
+            <span v-if="tab === 'maintenance' && maintenanceActive" class="dot info" title="Maintenance is running">
+              <span class="sr-only">(running)</span>
+            </span>
+            <span
+              v-if="tab === 'encryption' && encryptionNeedsAttention"
+              class="dot warning"
+              :title="encryptionAttentionReason ?? undefined"
+            >
+              <span class="sr-only">(needs attention)</span>
+            </span>
+            <span
+              v-if="tab === 'buckets' && authEnforced === false"
+              class="dot warning"
+              title="The object API is unauthenticated"
+            >
+              <span class="sr-only">(unauthenticated)</span>
+            </span>
+          </button>
+        </nav>
+
+        <div class="topbar-right">
+          <ThemeMenu />
+          <button type="button" class="btn ghost" title="Sign out" @click="logout">
+            <i class="fa-solid fa-arrow-right-from-bracket" aria-hidden="true"></i>
+            <span class="signout-label">Sign out</span>
+          </button>
+        </div>
+      </div>
     </header>
 
-    <!-- Top-level navigation. Each tab is its own route (#/volumes, #/buckets/photo/2024), so a refresh
-         puts you back where you were. -->
-    <nav class="main-tabs" role="tablist">
-      <button
-        v-for="tab in MAIN_TABS"
-        :key="tab"
-        type="button"
-        class="main-tab"
-        :class="{ active: activeTab === tab }"
-        role="tab"
-        :aria-selected="activeTab === tab"
-        @click="selectTab(tab)"
-      >
-        {{ tab === 'overview' ? 'Overview'
-         : tab === 'maintenance' ? 'Maintenance'
-         : tab === 'volumes' ? 'Volumes'
-         : tab === 'encryption' ? 'Encryption'
-         : tab === 'buckets' ? 'Buckets'
-         : 'Credentials' }}
-        <span
-          v-if="tab === 'maintenance' && maintenanceActive"
-          class="tab-dot"
-          title="Maintenance is running"
-        >●</span>
-        <span
-          v-if="tab === 'encryption' && encryptionNeedsAttention"
-          class="tab-dot warn"
-          :title="encryptionAttentionReason ?? undefined"
-        >●</span>
-        <span
-          v-if="tab === 'buckets' && authEnforced === false"
-          class="tab-dot warn"
-          title="The object API is unauthenticated"
-        >●</span>
-      </button>
-    </nav>
+    <main id="main" ref="mainEl" tabindex="-1">
+      <div class="page" :class="{ full: activeTab === 'volumes' }">
+        <!-- The page header is sticky under the top bar; it carries the title, the tab's status tags and its
+             actions. -->
+        <div class="header">
+          <div class="header-title">
+            <h1>{{ MAIN_TAB_LABELS[activeTab] }}</h1>
 
-    <!-- PINNED, NOT AT THE BOTTOM OF THE PAGE. It used to render after every section, which on the Volumes tab
-         put it below thirty volume rows -- an error message you have to go looking for is not an error message. -->
-    <div v-if="error" class="error">
-      <span>Error: {{ error }}</span>
-      <button type="button" class="error-dismiss" title="Dismiss" @click="error = null">&times;</button>
-    </div>
-
-    <!-- Everything below the tabs scrolls; the tabs and the error do not. -->
-    <main class="tab-body">
-
-    <!-- ===================== OVERVIEW ===================== -->
-    <!-- Status at a glance: the maintenance BADGES (not its details -- those live on their own tab) and
-         the storage figures. -->
-    <section v-show="activeTab === 'overview'" class="section">
-      <div class="section-header">
-        <h2>Overview</h2>
-        <span v-if="storageStats" class="storage-updated">Updated {{ formatDateTime(String(storageStats.updatedAt)) }}</span>
-      </div>
-
-      <div class="overview-badges">
-        <span
-          class="verify-state"
-          :class="maintenanceActive ? 'running' : 'idle'"
-          :title="maintenanceActivity.length ? maintenanceActivity.join(' · ') : 'Nothing running'"
-        >
-          Maintenance: {{ maintenanceActive ? 'Active' : 'Idle' }}
-        </span>
-        <span
-          v-if="maintenanceFrozen !== null"
-          class="freeze-pill"
-          :class="maintenanceFrozen ? 'frozen' : 'active'"
-        >
-          {{ maintenanceFrozen ? '❄ Frozen' : '● Enabled' }}
-        </span>
-        <span v-if="maintenanceActivity.length" class="overview-activity">
-          {{ maintenanceActivity.join(' · ') }}
-        </span>
-        <button type="button" class="access-mini-btn" @click="selectTab('maintenance')">Details →</button>
-      </div>
-
-      <div v-if="systemStats" class="storage-stats">
-        <div class="storage-stat">
-          <span class="storage-stat-label">Files</span>
-          <span class="storage-stat-value">{{ systemStats.objectCount.toLocaleString() }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Logical Data</span>
-          <span class="storage-stat-value">{{ formatBytes(systemStats.logicalBytes) }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Data Slices</span>
-          <span class="storage-stat-value">{{ formatBytes(systemStats.dataBytes) }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Parity Slices</span>
-          <span class="storage-stat-value">{{ formatBytes(systemStats.parityBytes) }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Physical Total</span>
-          <span class="storage-stat-value">{{ formatBytes(systemStats.physicalBytes) }}</span>
-        </div>
-        <button
-          type="button"
-          class="access-mini-btn"
-          :disabled="statsBusy"
-          title="Recount from the object records. Reads only — no disk is touched, no object is changed."
-          @click="recomputeStorageStats"
-        >{{ statsBusy ? 'Recounting…' : 'Recount' }}</button>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Total Capacity</span>
-          <span class="storage-stat-value">{{ formatBytes(onlineAssignedCapacity) }}</span>
-        </div>
-        <div class="storage-stat">
-          <span class="storage-stat-label">Unavailable</span>
-          <span class="storage-stat-value" :class="{ 'error-text': systemStats.unavailableObjectCount > 0 }">
-            {{ systemStats.unavailableObjectCount.toLocaleString() }} / {{ formatBytes(systemStats.unavailableLogicalBytes) }}
-          </span>
-        </div>
-      </div>
-      <p v-else class="storage-empty">Storage statistics are not available yet.</p>
-    </section>
-
-    <!-- ===================== MAINTENANCE ===================== -->
-    <section v-show="activeTab === 'maintenance'" class="section verify-panel">
-      <div class="verify-header maintenance-summary">
-        <div class="verify-title">
-          <h2>Maintenance</h2>
-          <span
-            class="verify-state"
-            :class="maintenanceActive ? 'running' : 'idle'"
-            :title="maintenanceActivity.length ? maintenanceActivity.join(' · ') : 'Nothing running'"
-          >
-            {{ maintenanceActive ? 'Active' : 'Idle' }}
-          </span>
-          <span
-            v-if="maintenanceFrozen !== null"
-            class="freeze-pill"
-            :class="maintenanceFrozen ? 'frozen' : 'active'"
-            :title="maintenanceFrozen ? 'Verify, repair, drain and rebalance are paused' : 'Verify, repair, drain and rebalance run automatically'"
-          >
-            {{ maintenanceFrozen ? '❄ Frozen' : '● Enabled' }}
-          </span>
-        </div>
-        <div class="verify-actions">
-          <button
-            v-if="maintenanceFrozen !== null"
-            @click="toggleFreeze"
-            :disabled="freezePending"
-            :class="maintenanceFrozen ? 'unfreeze-btn' : 'freeze-btn'"
-          >
-            {{ maintenanceFrozen
-              ? (freezePending ? 'Unfreezing…' : 'Unfreeze')
-              : (freezePending ? 'Freezing…' : 'Freeze') }}
-          </button>
-        </div>
-      </div>
-
-      <template v-if="true">
-      <div v-if="maintenanceFrozen === true" class="freeze-banner">
-        Maintenance is <strong>frozen</strong> — verify, repair, drain, and rebalance are paused.
-      </div>
-      <div class="verify-subheader">
-        <h3>Rebalance</h3>
-        <div class="verify-actions">
-          <label class="concurrency-control" title="Slices relocated at once. Takes effect immediately, even mid-rebalance. Higher is faster on disks that can absorb the parallel I/O, but seek-bound drives thrash — raise it in small steps and watch the rate.">
-            <span class="verify-stat-label">Concurrency</span>
-            <input
-              type="number"
-              min="1"
-              max="64"
-              step="1"
-              class="concurrency-input"
-              :value="rebalanceStatus?.concurrency ?? ''"
-              :disabled="concurrencyPending"
-              @change="applyConcurrency($event)"
-            />
-          </label>
-          <!--
-            STOPPING IS NOT STOPPED, and the operator is watching.
-
-            Cancelling stops the job taking NEW work immediately, but up to `concurrency` slice relocations are
-            already in the air, and each is drained to a safe boundary: a slice is only unlinked from its source
-            after the copy is fsynced and the database reference flipped. Interrupt that and you leave a
-            duplicate, or a record pointing at a slice not yet fully on the platter.
-
-            So for a while after the click the job is still running and the logs still scroll. Saying
-            "Cancel Rebalance" through all of that makes the array look like it ignored you. It did not -- it is
-            finishing what it had already started, which is the only safe thing it can do. Say THAT.
-          -->
-          <button
-            @click="toggleRebalance"
-            :disabled="rebalancePending || rebalanceStatus?.stopping === true || maintenanceFrozen === true"
-            :class="rebalanceStatus?.running ? 'verify-stop-btn' : 'verify-start-btn'"
-            :title="rebalanceStatus?.stopping === true
-              ? 'Cancelled. Finishing the slice moves already in flight -- a slice is never left half-moved.'
-              : maintenanceFrozen === true ? 'Paused by the maintenance freeze' : ''"
-          >
-            {{ rebalancePending
-              ? 'Working...'
-              : rebalanceStatus?.stopping ? 'Stopping...'
-              : rebalanceStatus?.running ? 'Cancel Rebalance' : 'Start Rebalance' }}
-          </button>
-        </div>
-      </div>
-
-      <div v-if="rebalanceStatus?.running" class="rebalance-progress">
-        <div class="rebalance-bar">
-          <div class="rebalance-bar-fill" :style="{ width: `${(rebalanceProgress * 100).toFixed(1)}%` }"></div>
-        </div>
-        <span class="rebalance-progress-label">
-          {{ formatBytes(rebalanceStatus.bytesMoved) }} moved,
-          {{ formatBytes(rebalanceStatus.bytesToMove) }} to go
-          ({{ (rebalanceProgress * 100).toFixed(1) }}%)
-        </span>
-      </div>
-
-      <div class="verify-stats">
-        <div class="verify-stat">
-          <span class="verify-stat-label">Target Fill</span>
-          <span class="verify-stat-value">
-            {{ rebalanceStatus ? `${(rebalanceStatus.targetFill * 100).toFixed(1)}%` : '—' }}
-          </span>
-        </div>
-        <div class="verify-stat">
-          <span class="verify-stat-label">Left To Move</span>
-          <span class="verify-stat-value">{{ rebalanceStatus ? formatBytes(rebalanceStatus.bytesToMove) : '—' }}</span>
-        </div>
-        <div class="verify-stat">
-          <span class="verify-stat-label">Rate</span>
-          <span class="verify-stat-value">
-            {{ rebalanceStatus?.running ? `${formatBytes(rebalanceStatus.bytesPerSec)}/s` : '—' }}
-          </span>
-        </div>
-        <div class="verify-stat">
-          <span class="verify-stat-label">ETA</span>
-          <span class="verify-stat-value">{{ rebalanceStatus?.running ? rebalanceEta : '—' }}</span>
-        </div>
-        <div class="verify-stat">
-          <span class="verify-stat-label">Slices Moved</span>
-          <span class="verify-stat-value">
-            {{ (rebalanceStatus?.moves ?? 0).toLocaleString() }}
-            <span v-if="rebalanceStatus" class="rebalance-submetric">
-              ({{ rebalanceStatus.copied.toLocaleString() }} copied / {{ rebalanceStatus.reconstructed.toLocaleString() }} rebuilt)
-            </span>
-          </span>
-        </div>
-        <div class="verify-stat">
-          <span class="verify-stat-label">Now Draining</span>
-          <span class="verify-stat-value">
-            {{ rebalanceStatus?.currentSourceVolumeId != null
-              ? `vol ${rebalanceStatus.currentSourceVolumeId} · ${rebalanceTierLabel}`
-              : '—' }}
-          </span>
-        </div>
-      </div>
-
-      <div v-if="rebalanceStatus && rebalanceStatus.sourceVolumeIds.length > 0" class="verify-targets">
-        <span class="verify-stat-label">Over target:</span>
-        <span
-          v-for="id in rebalanceStatus.sourceVolumeIds"
-          :key="id"
-          class="verify-target-badge"
-          :class="{ 'rebalance-active-source': id === rebalanceStatus.currentSourceVolumeId }"
-        >
-          vol {{ id }}
-        </span>
-      </div>
-      <div v-if="rebalanceSkipped.length > 0" class="verify-volume-errors">
-        <span class="verify-stat-label">Skipped:</span>
-        <span v-for="entry in rebalanceSkipped" :key="entry.label" class="verify-volume-badge">
-          {{ entry.count.toLocaleString() }} {{ entry.label }}
-        </span>
-      </div>
-      <div class="verify-subheader">
-        <!-- Grouped: the subheader is space-between, so a bare sibling would float to the middle. -->
-        <div class="subheader-title">
-          <h3>Verify</h3>
-          <span v-if="verifyStatus?.waiting" class="verify-waiting-pill" title="A rebalance owns the disks; this run is queued and starts when it finishes">
-            Waiting for rebalance
-          </span>
-        </div>
-        <div class="verify-actions">
-          <button
-            @click="startVerify"
-            :disabled="verifyStatus?.running || verifyActionPending"
-            class="verify-start-btn"
-          >
-            {{ verifyActionPending ? 'Starting...' : 'Start Verify' }}
-          </button>
-          <button
-            @click="stopVerify"
-            :disabled="!verifyStatus?.running || stopRequested"
-            class="verify-stop-btn"
-          >
-            {{ stopRequested ? 'Stopping...' : 'Stop' }}
-          </button>
-        </div>
-      </div>
-      <div class="verify-stats">
-        <div class="verify-stat">
-          <span class="verify-stat-label">Started</span>
-          <span class="verify-stat-value">{{ formatDateTime(verifyStatus?.startedAt ?? null) }}</span>
-        </div>
-        <div class="verify-stat">
-          <span class="verify-stat-label">Objects Verified</span>
-          <span class="verify-stat-value">{{ (verifyStatus?.objectsVerified ?? 0).toLocaleString() }}</span>
-        </div>
-        <div class="verify-stat">
-          <span class="verify-stat-label">Total Errors</span>
-          <span class="verify-stat-value" :class="{ 'error-text': (verifyStatus?.errors?.total ?? 0) > 0 }">
-            {{ (verifyStatus?.errors?.total ?? 0).toLocaleString() }}
-          </span>
-        </div>
-        <div class="verify-stat">
-          <span class="verify-stat-label">Concurrency</span>
-          <span class="verify-stat-value">{{ verifyStatus?.concurrency ?? 0 }}</span>
-        </div>
-        <div class="verify-stat">
-          <span class="verify-stat-label">Scope</span>
-          <span class="verify-stat-value">{{ verifyScopeLabel }}</span>
-        </div>
-      </div>
-      <div v-if="verifyTargetVolumes.length > 0" class="verify-targets">
-        <span class="verify-stat-label">Target Volumes:</span>
-        <span
-          v-for="entry in verifyTargetVolumes"
-          :key="entry.id"
-          class="verify-target-badge"
-        >
-          {{ entry.label }}
-        </span>
-      </div>
-      <div v-if="verifyVolumeErrors.length > 0" class="verify-volume-errors">
-        <span class="verify-stat-label">Errors by volume:</span>
-        <span
-          v-for="entry in verifyVolumeErrors"
-          :key="entry.volumeId"
-          class="verify-volume-badge"
-        >
-          vol {{ entry.volumeId }}: {{ entry.count.toLocaleString() }}
-        </span>
-      </div>
-
-      <div class="verify-subheader">
-        <h3>Verify History</h3>
-        <button @click="fetchVerifyRuns" :disabled="verifyRunsLoading" class="refresh-btn">
-          {{ verifyRunsLoading ? 'Loading...' : 'Refresh' }}
-        </button>
-      </div>
-      <p v-if="verifyRuns.length === 0" class="volumes-empty">
-        {{ verifyRunsLoading ? 'Loading…' : 'No verify runs recorded yet.' }}
-      </p>
-      <div v-else class="run-history-table-wrap">
-        <table class="run-history-table">
-          <thead>
-            <tr>
-              <th>Started</th>
-              <th>Trigger</th>
-              <th>Scope</th>
-              <th>Status</th>
-              <th>Objects</th>
-              <th>Errors</th>
-              <th>Finished</th>
-            </tr>
-          </thead>
-          <tbody>
-            <template v-for="run in verifyRuns" :key="run._id">
-              <tr class="run-row" @click="toggleVerifyRunDetail(run._id)">
-                <td>{{ formatDateTime(run.startedAt) }}</td>
-                <td>
-                  <span class="run-trigger-badge" :class="verifyRunTriggerClass(run.trigger)">
-                    {{ verifyRunTriggerSummary(run.trigger) }}
-                  </span>
-                </td>
-                <td>{{ verifyRunScopeLabel(run) }}</td>
-                <td>
-                  <span class="run-status-badge" :class="run.status">{{ run.status }}</span>
-                </td>
-                <td>{{ (run.objectsVerified ?? 0).toLocaleString() }}</td>
-                <td :class="{ 'error-text': (run.totalErrors ?? 0) > 0 }">
-                  {{ (run.totalErrors ?? 0).toLocaleString() }}
-                </td>
-                <td>{{ run.finishedAt ? formatDateTime(run.finishedAt) : '—' }}</td>
-              </tr>
-              <tr v-if="expandedVerifyRunId === run._id" class="run-detail-row">
-                <td colspan="7">
-                  <div class="run-detail">
-                    <div class="run-detail-item">
-                      <span class="verify-stat-label">Mode</span>
-                      <span class="verify-stat-value">{{ run.mode }}</span>
-                    </div>
-                    <div class="run-detail-item">
-                      <span class="verify-stat-label">Checksum errors</span>
-                      <span class="verify-stat-value">{{ (run.checksumErrors ?? 0).toLocaleString() }}</span>
-                    </div>
-                    <div class="run-detail-item" v-if="run.volumeIds.length > 0">
-                      <span class="verify-stat-label">Volumes</span>
-                      <span class="verify-stat-value">{{ run.volumeIds.join(', ') }}</span>
-                    </div>
-                    <div class="run-detail-item run-detail-trigger">
-                      <span class="verify-stat-label">Trigger</span>
-                      <span class="verify-stat-value" v-if="run.trigger.source === 'syslog-watcher'">
-                        Device {{ run.trigger.device }} (volume {{ run.trigger.volumeId }}) reported
-                        {{ run.trigger.kind }}: “{{ run.trigger.detail }}”
-                      </span>
-                      <span class="verify-stat-value" v-else-if="run.trigger.source === 'scheduled'">
-                        Automatic rolling scrub
-                      </span>
-                      <span class="verify-stat-value" v-else>
-                        Started manually from the API/UI
-                      </span>
-                    </div>
-                  </div>
-                </td>
-              </tr>
-            </template>
-          </tbody>
-        </table>
-      </div>
-
-      </template>
-    </section>
-
-    <!-- ===================== VOLUMES ===================== -->
-    <section v-show="activeTab === 'volumes'" class="section storage-panel">
-      <div class="section-header">
-        <h2>Volumes</h2>
-        <div class="controls">
-          <button @click="refreshDevices" :disabled="loading" class="refresh-btn">
-            {{ loading ? 'Loading...' : 'Refresh' }}
-          </button>
-          <button @click="openModal" :disabled="loading || availableDevices.length === 0" class="add-btn">
-            + Add Volume
-          </button>
-        </div>
-      </div>
-      <!-- A CONVERSION IS RUNNING. It takes minutes and it wipes a disk. Say what it is doing, or a disabled
-           button for two minutes looks exactly like a wedged system -- and the reasonable response to that
-           (reload, click again, restart) is the worst thing you can do to a disk that is mid-wipe. -->
-      <div v-if="conversion" class="access-banner warn conversion-banner">
-        <span class="conversion-spinner" aria-hidden="true"></span>
-        <span>
-          <strong>Encrypting volume {{ conversion.volumeId }}.</strong>
-          {{ conversionLabel }}.
-          <em v-if="conversion.phase === 'scanning'">
-            Nothing has been changed yet — this step exists to make sure nothing on the disk is worth keeping.
-          </em>
-          <em v-else>The disk is being rewritten. Do not pull it, and do not restart STRUBS.</em>
-        </span>
-      </div>
-
-      <div class="volumes-view">
-        <div class="volumes-toolbar">
-          <div class="view-toggle" role="group" aria-label="Volumes view">
-            <button
-              type="button"
-              class="view-toggle-btn"
-              :class="{ active: volumesView === 'table' }"
-              @click="volumesView = 'table'"
-            >
-              Table
-            </button>
-            <button
-              type="button"
-              class="view-toggle-btn"
-              :class="{ active: volumesView === 'grid' }"
-              @click="volumesView = 'grid'"
-            >
-              Grid
-            </button>
-          </div>
-          <div class="sort-controls">
-            <label for="volumes-sort" class="sort-label">Sort by:</label>
-            <select id="volumes-sort" v-model="sortBy" class="sort-select">
-              <option value="volumeLabel">Volume Label</option>
-              <option value="volumeId">Volume ID</option>
-              <option value="name">Device Name</option>
-              <option value="path">Device Path</option>
-            </select>
-          </div>
-        </div>
-
-        <p v-if="sortedStorageRows.length === 0" class="volumes-empty">
-          {{ loading ? 'Loading…' : 'No volumes or drives found.' }}
-        </p>
-
-        <!-- TABLE VIEW -->
-        <div v-else-if="volumesView === 'table'" class="storage-table-wrap">
-          <table class="storage-table">
-            <thead>
-              <tr>
-                <th
-                  class="sortable"
-                  :class="{ 'sort-active': sortBy === 'volumeLabel' }"
-                  @click="setSort('volumeLabel')"
-                >
-                  Volume<span v-if="sortBy === 'volumeLabel'" class="sort-arrow">▲</span>
-                </th>
-                <th
-                  class="sortable"
-                  :class="{ 'sort-active': sortBy === 'name' }"
-                  @click="setSort('name')"
-                >
-                  Device<span v-if="sortBy === 'name'" class="sort-arrow">▲</span>
-                </th>
-                <th>Comment</th>
-                <th>Status</th>
-                <th>Files</th>
-                <th>Data Slices</th>
-                <th>Parity Slices</th>
-                <th>Physical Total</th>
-                <th>Capacity</th>
-                <th>Fullness</th>
-                <th class="actions-col"></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="entry in sortedStorageRows"
-                :key="entry.key"
-                :class="{ 'storage-row-unassigned': entry.unassigned }"
-                @contextmenu="entry.id !== null ? showContextMenu($event, entry.id) : null"
+            <template v-if="activeTab === 'maintenance'">
+              <span
+                class="tag lg"
+                :class="maintenanceActive ? 'info' : 'neutral'"
+                :title="maintenanceActivity.length ? maintenanceActivity.join(' · ') : 'Nothing running'"
               >
-                <td>
-                  <div class="vol-id-cell">
-                    <template v-if="!entry.unassigned">
-                      <span class="vol-id-badge" :style="{ backgroundColor: entry.color }">{{ entry.id }}</span>
-                      <span v-if="entry.groupLabel" class="vol-group-label">{{ entry.groupLabel }}</span>
-                    </template>
-                    <span v-else class="vol-unassigned-badge">unassigned</span>
-                  </div>
-                </td>
-                <td class="device-cell" :title="entry.identityTitle ?? undefined">{{ entry.device ?? '—' }}</td>
-                <td class="comment-cell" :title="entry.volume?.comment ?? undefined">
-                  <span v-if="entry.volume?.comment" class="comment-text">{{ entry.volume.comment }}</span>
-                  <span v-else class="state-muted">—</span>
-                </td>
-                <td>
-                  <div class="status-cell">
-                    <span v-if="entry.volume?.isReadOnly" class="state-badge ro" title="Read-only">RO</span>
-                    <span v-if="entry.volume?.isEncrypted" class="state-badge encrypted" title="LUKS encrypted">🔒</span>
-                    <span v-if="entry.volume?.isDraining" class="state-badge draining" title="Draining (draining slices to other drives)">Draining</span>
-                    <span v-if="entry.volume && !entry.volume.isEnabled" class="state-badge disabled" title="Disabled">Disabled</span>
-                    <span
-                      v-else-if="entry.volume && !entry.blockDevice"
-                      class="state-badge offline"
-                      title="Volume has no online block device"
-                    >Offline</span>
-                    <span v-if="entry.volume?.isSmartHealthy === false" class="state-badge err" title="SMART failed">SMART</span>
-                    <span
-                      v-if="entry.volume && getVerifyErrorCount(entry.volume.verifyErrors) > 0"
-                      class="state-badge err"
-                      :title="getVerifyErrorCount(entry.volume.verifyErrors) + ' verify errors'"
-                    >Errors</span>
-                    <span v-if="!entry.volume" class="state-muted">—</span>
-                  </div>
-                </td>
-                <td>{{ entry.stats.objectCount.toLocaleString() }}</td>
-                <td>{{ entry.stats.dataSliceCount.toLocaleString() }}</td>
-                <td>{{ entry.stats.paritySliceCount.toLocaleString() }}</td>
-                <td>{{ formatBytes(entry.stats.physicalBytes) }}</td>
-                <td>{{ entry.bytesTotal > 0 ? formatBytes(entry.bytesTotal) : '—' }}</td>
-                <td class="fullness-cell">
-                  <div v-if="entry.usedFraction !== null" class="fullness" :title="fullnessTitle(entry)">
-                    <div class="fullness-bar" :class="fullnessClass(entry.usedFraction)">
-                      <div class="fullness-fill" :style="{ width: (entry.usedFraction * 100).toFixed(1) + '%' }"></div>
-                    </div>
-                    <span class="fullness-label">{{ Math.round(entry.usedFraction * 100) }}%</span>
-                  </div>
-                  <span v-else class="fullness-unknown" title="Capacity unknown">—</span>
-                </td>
-                <td class="actions-col">
-                  <button
-                    v-if="entry.id !== null"
-                    type="button"
-                    class="row-action-btn"
-                    title="Volume actions"
-                    @click.stop="openRowMenu($event, entry.id)"
-                  >⋮</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+                <i v-if="maintenanceActive" class="fa-solid fa-rotate" aria-hidden="true"></i>
+                {{ maintenanceActive ? 'Active' : 'Idle' }}
+              </span>
+              <span
+                v-if="maintenanceFrozen !== null"
+                class="tag lg"
+                :class="maintenanceFrozen ? 'warning' : 'success'"
+                :title="maintenanceFrozen ? 'Verify, repair, drain and rebalance are paused' : 'Verify, repair, drain and rebalance run automatically'"
+              >
+                <i :class="maintenanceFrozen ? 'fa-solid fa-snowflake' : 'fa-solid fa-check'" aria-hidden="true"></i>
+                {{ maintenanceFrozen ? 'Frozen' : 'Enabled' }}
+              </span>
+            </template>
+
+            <template v-else-if="activeTab === 'encryption'">
+              <span
+                v-if="encryptionCoverage"
+                class="tag lg"
+                :class="encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext === 0 ? 'success' : 'neutral'"
+              >
+                <i class="fa-solid fa-lock" aria-hidden="true"></i>
+                {{ encryptionCoverage.encrypted }} / {{ encryptionCoverage.total }} encrypted
+              </span>
+              <span v-if="encryptionCoverage?.unknown" class="hint">
+                {{ encryptionCoverage.unknown }} disk(s) absent — encryption state unknown
+              </span>
+            </template>
+
+            <template v-else-if="activeTab === 'buckets'">
+              <span
+                class="tag lg"
+                :class="authEnforced === null ? 'neutral' : (authEnforced ? 'success' : 'warning')"
+              >
+                {{ authEnforced === null ? '—' : (authEnforced ? 'Enforced' : 'Open') }}
+              </span>
+            </template>
+          </div>
+
+          <div class="header-actions">
+            <span v-if="activeTab === 'overview' && storageStats" class="hint">
+              Updated {{ formatDateTime(String(storageStats.updatedAt)) }}
+            </span>
+
+            <button
+              v-if="activeTab === 'maintenance' && maintenanceFrozen !== null"
+              type="button"
+              class="btn"
+              :class="{ primary: maintenanceFrozen }"
+              :disabled="freezePending"
+              @click="toggleFreeze"
+            >
+              <i :class="maintenanceFrozen ? 'fa-solid fa-play' : 'fa-solid fa-snowflake'" aria-hidden="true"></i>
+              {{ maintenanceFrozen
+                ? (freezePending ? 'Unfreezing…' : 'Unfreeze')
+                : (freezePending ? 'Freezing…' : 'Freeze') }}
+            </button>
+
+            <template v-if="activeTab === 'volumes'">
+              <button type="button" class="btn" :disabled="loading" @click="refreshDevices">
+                <i class="fa-solid fa-rotate-right" aria-hidden="true"></i>
+                {{ loading ? 'Loading...' : 'Refresh' }}
+              </button>
+              <button
+                type="button"
+                class="btn primary"
+                :disabled="loading || availableDevices.length === 0"
+                @click="openModal"
+              >
+                <i class="fa-solid fa-plus" aria-hidden="true"></i>
+                Add Volume
+              </button>
+            </template>
+          </div>
+
+          <!-- PINNED, NOT AT THE BOTTOM OF THE PAGE. It used to render after every section, which on the Volumes
+               tab put it below thirty volume rows -- an error message you have to go looking for is not an error
+               message. It rides in the sticky page header now, so it never scrolls away. -->
+          <div v-if="error" class="notice danger" role="alert">
+            <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+            <div class="notice-body">Error: {{ error }}</div>
+            <div class="notice-actions">
+              <button type="button" class="btn ghost sm icon" title="Dismiss" aria-label="Dismiss" @click="error = null">
+                <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+              </button>
+            </div>
+          </div>
         </div>
 
-        <!-- GRID VIEW (tiles) -->
-        <div v-else class="devices-list">
-          <div
-            v-for="entry in sortedStorageRows"
-            :key="entry.key"
-            class="device-card"
-            :class="{ offline: entry.volume && !entry.blockDevice }"
-            :style="{ opacity: entry.unassigned ? 0.6 : 1 }"
-            @contextmenu="entry.id !== null ? showContextMenu($event, entry.id) : null"
-          >
-            <!-- Title and badges stack on the LEFT (badges under the name, so they never wrap around it);
-                 the action button sits alone on the RIGHT, after them. -->
-            <div class="device-header" :style="{ backgroundColor: entry.color }">
-              <div class="device-head-main">
-                <div class="device-name">
-                  <span v-if="entry.groupLabel" class="label-prefix">{{ entry.groupLabel }}</span>
-                  {{ entry.unassigned ? (entry.device ?? 'Drive') : ('Volume ' + entry.id) }}
-                </div>
-                <div class="device-badges">
-                  <div v-if="entry.busGroup !== null" class="badge">Bus {{ entry.busGroup }}</div>
-                  <div class="badge">{{ formatBytes(entry.bytesTotal) }}</div>
-                  <div v-if="entry.volume?.isReadOnly" class="badge ro-badge">READ-ONLY</div>
-                  <div v-if="entry.volume?.isEncrypted" class="badge encrypted-badge" title="LUKS encrypted">🔒 ENCRYPTED</div>
-                  <div v-if="entry.volume?.isDraining" class="badge draining-badge">DRAINING</div>
-                  <div v-if="entry.volume && !entry.volume.isEnabled" class="badge offline-badge">DISABLED</div>
-                  <div v-else-if="entry.volume && !entry.blockDevice" class="badge offline-badge">OFFLINE</div>
-                  <div v-if="entry.unassigned" class="badge offline-badge">UNASSIGNED</div>
-                </div>
+        <!-- ===================== OVERVIEW ===================== -->
+        <!-- Status at a glance: the maintenance BADGES (not its details -- those live on their own tab) and
+             the storage figures. -->
+        <section v-show="activeTab === 'overview'" class="stack">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2>Maintenance</h2>
+                <span
+                  class="tag"
+                  :class="maintenanceActive ? 'info' : 'neutral'"
+                  :title="maintenanceActivity.length ? maintenanceActivity.join(' · ') : 'Nothing running'"
+                >
+                  {{ maintenanceActive ? 'Active' : 'Idle' }}
+                </span>
+                <span v-if="maintenanceFrozen !== null" class="tag" :class="maintenanceFrozen ? 'warning' : 'success'">
+                  <i :class="maintenanceFrozen ? 'fa-solid fa-snowflake' : 'fa-solid fa-check'" aria-hidden="true"></i>
+                  {{ maintenanceFrozen ? 'Frozen' : 'Enabled' }}
+                </span>
               </div>
-              <button
-                v-if="entry.id !== null"
-                type="button"
-                class="tile-action-btn"
-                title="Volume actions"
-                @click.stop="openRowMenu($event, entry.id)"
-              >⋮</button>
+              <div class="card-actions">
+                <button type="button" class="btn ghost sm" @click="selectTab('maintenance')">
+                  Details <i class="fa-solid fa-arrow-right" aria-hidden="true"></i>
+                </button>
+              </div>
             </div>
-            <div class="device-body">
-              <div class="device-info">
-                <div class="info-row">
-                  <span class="label">Device:</span>
-                  <span class="value">{{ entry.device ?? 'N/A' }}</span>
+            <div class="card-section hint">
+              {{ maintenanceActivity.length ? maintenanceActivity.join(' · ') : 'Nothing running' }}
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div><h2>Storage</h2></div>
+              <div v-if="systemStats" class="card-actions">
+                <button
+                  type="button"
+                  class="btn sm"
+                  :disabled="statsBusy"
+                  title="Recount from the object records. Reads only — no disk is touched, no object is changed."
+                  @click="recomputeStorageStats"
+                >
+                  <i class="fa-solid fa-calculator" aria-hidden="true"></i>
+                  {{ statsBusy ? 'Recounting…' : 'Recount' }}
+                </button>
+              </div>
+            </div>
+            <div v-if="systemStats" class="card-body">
+              <div class="stats">
+                <div class="stat">
+                  <span class="stat-label">Files</span>
+                  <span class="stat-value">{{ systemStats.objectCount.toLocaleString() }}</span>
                 </div>
-                <div class="info-row" v-if="!entry.unassigned">
-                  <span class="label">Read Only:</span>
-                  <span class="value">{{ entry.volume?.isReadOnly ? 'Yes' : 'No' }}</span>
+                <div class="stat">
+                  <span class="stat-label">Logical data</span>
+                  <span class="stat-value">{{ formatBytes(systemStats.logicalBytes) }}</span>
                 </div>
-                <div class="info-row" v-if="entry.volume">
-                  <span class="label">Enabled:</span>
-                  <span class="value">{{ entry.volume.isEnabled ? 'Yes' : 'No' }}</span>
+                <div class="stat">
+                  <span class="stat-label">Data slices</span>
+                  <span class="stat-value">{{ formatBytes(systemStats.dataBytes) }}</span>
                 </div>
-                <div class="info-row" v-if="entry.volume">
-                  <span class="label">SMART Status:</span>
-                  <span class="value" :class="{ 'error-text': entry.volume.isSmartHealthy === false }">
-                    {{ formatSmartStatus(entry.volume) }}
+                <div class="stat">
+                  <span class="stat-label">Parity slices</span>
+                  <span class="stat-value">{{ formatBytes(systemStats.parityBytes) }}</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">Physical total</span>
+                  <span class="stat-value">{{ formatBytes(systemStats.physicalBytes) }}</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">Total capacity</span>
+                  <span class="stat-value">{{ formatBytes(onlineAssignedCapacity) }}</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">Unavailable</span>
+                  <span class="stat-value" :class="{ 'text-danger': systemStats.unavailableObjectCount > 0 }">
+                    {{ systemStats.unavailableObjectCount.toLocaleString() }}
+                    <small>/ {{ formatBytes(systemStats.unavailableLogicalBytes) }}</small>
                   </span>
                 </div>
-                <div class="info-row" v-if="entry.volume && getVerifyErrorCount(entry.volume.verifyErrors) > 0">
-                  <span class="label">Verify Errors:</span>
-                  <span class="value error-text">{{ getVerifyErrorCount(entry.volume.verifyErrors) }}</span>
+              </div>
+            </div>
+            <div v-else class="empty">
+              <i class="fa-solid fa-chart-pie" aria-hidden="true"></i>
+              <h2>Storage statistics are not available yet.</h2>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===================== MAINTENANCE ===================== -->
+        <section v-show="activeTab === 'maintenance'" class="stack">
+          <div v-if="maintenanceFrozen === true" class="notice warning">
+            <i class="fa-solid fa-snowflake" aria-hidden="true"></i>
+            <div class="notice-body">
+              Maintenance is <strong>frozen</strong> — verify, repair, drain, and rebalance are paused.
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div><h2>Rebalance</h2></div>
+              <div class="card-actions">
+                <label
+                  class="select-field"
+                  title="Slices relocated at once. Takes effect immediately, even mid-rebalance. Higher is faster on disks that can absorb the parallel I/O, but seek-bound drives thrash — raise it in small steps and watch the rate."
+                >
+                  Concurrency
+                  <input
+                    type="number"
+                    min="1"
+                    max="64"
+                    step="1"
+                    class="input concurrency-input"
+                    :value="rebalanceStatus?.concurrency ?? ''"
+                    :disabled="concurrencyPending"
+                    @change="applyConcurrency($event)"
+                  />
+                </label>
+                <!--
+                  STOPPING IS NOT STOPPED, and the operator is watching.
+
+                  Cancelling stops the job taking NEW work immediately, but up to `concurrency` slice relocations are
+                  already in the air, and each is drained to a safe boundary: a slice is only unlinked from its source
+                  after the copy is fsynced and the database reference flipped. Interrupt that and you leave a
+                  duplicate, or a record pointing at a slice not yet fully on the platter.
+
+                  So for a while after the click the job is still running and the logs still scroll. Saying
+                  "Cancel Rebalance" through all of that makes the array look like it ignored you. It did not -- it is
+                  finishing what it had already started, which is the only safe thing it can do. Say THAT.
+                -->
+                <button
+                  type="button"
+                  class="btn"
+                  :class="{ danger: rebalanceStatus?.running }"
+                  :disabled="rebalancePending || rebalanceStatus?.stopping === true || maintenanceFrozen === true"
+                  :title="rebalanceStatus?.stopping === true
+                    ? 'Cancelled. Finishing the slice moves already in flight -- a slice is never left half-moved.'
+                    : maintenanceFrozen === true ? 'Paused by the maintenance freeze' : ''"
+                  @click="toggleRebalance"
+                >
+                  <i :class="rebalanceStatus?.running ? 'fa-solid fa-stop' : 'fa-solid fa-play'" aria-hidden="true"></i>
+                  {{ rebalancePending
+                    ? 'Working...'
+                    : rebalanceStatus?.stopping ? 'Stopping...'
+                    : rebalanceStatus?.running ? 'Cancel Rebalance' : 'Start Rebalance' }}
+                </button>
+              </div>
+            </div>
+
+            <div v-if="rebalanceStatus?.running" class="card-section progress">
+              <div class="bar">
+                <div class="bar-fill" :style="{ width: `${(rebalanceProgress * 100).toFixed(1)}%` }"></div>
+              </div>
+              <span class="hint">
+                {{ formatBytes(rebalanceStatus.bytesMoved) }} moved,
+                {{ formatBytes(rebalanceStatus.bytesToMove) }} to go
+                ({{ (rebalanceProgress * 100).toFixed(1) }}%)
+              </span>
+            </div>
+
+            <div class="card-section">
+              <div class="stats">
+                <div class="stat">
+                  <span class="stat-label">Target fill</span>
+                  <span class="stat-value">
+                    {{ rebalanceStatus ? `${(rebalanceStatus.targetFill * 100).toFixed(1)}%` : '—' }}
+                  </span>
                 </div>
-                <div class="info-row" v-if="entry.blockDevice?.model ?? entry.volume?.deviceModel">
-                  <span class="label">Model:</span>
-                  <span class="value">{{ entry.blockDevice?.model ?? entry.volume?.deviceModel }}</span>
+                <div class="stat">
+                  <span class="stat-label">Left to move</span>
+                  <span class="stat-value">{{ rebalanceStatus ? formatBytes(rebalanceStatus.bytesToMove) : '—' }}</span>
                 </div>
-                <div class="info-row" v-if="entry.blockDevice?.serial ?? entry.volume?.deviceSerial">
-                  <span class="label">Serial:</span>
-                  <span class="value">{{ entry.blockDevice?.serial ?? entry.volume?.deviceSerial }}</span>
+                <div class="stat">
+                  <span class="stat-label">Rate</span>
+                  <span class="stat-value">
+                    {{ rebalanceStatus?.running ? `${formatBytes(rebalanceStatus.bytesPerSec)}/s` : '—' }}
+                  </span>
                 </div>
-                <div class="info-row">
-                  <span class="label">Files:</span>
-                  <span class="value">{{ entry.stats.objectCount.toLocaleString() }}</span>
+                <div class="stat">
+                  <span class="stat-label">ETA</span>
+                  <span class="stat-value">{{ rebalanceStatus?.running ? rebalanceEta : '—' }}</span>
                 </div>
-                <div class="info-row" v-if="entry.usedFraction !== null">
-                  <span class="label">Fullness:</span>
-                  <span class="value">{{ Math.round(entry.usedFraction * 100) }}%</span>
+                <div class="stat">
+                  <span class="stat-label">Slices moved</span>
+                  <span class="stat-value">
+                    {{ (rebalanceStatus?.moves ?? 0).toLocaleString() }}
+                    <small v-if="rebalanceStatus">
+                      ({{ rebalanceStatus.copied.toLocaleString() }} copied / {{ rebalanceStatus.reconstructed.toLocaleString() }} rebuilt)
+                    </small>
+                  </span>
                 </div>
-                <div class="info-row" v-if="entry.volume?.comment">
-                  <span class="label">Comment:</span>
-                  <span class="value comment-value" :title="entry.volume.comment">{{ entry.volume.comment }}</span>
+                <div class="stat">
+                  <span class="stat-label">Now draining</span>
+                  <span class="stat-value">
+                    {{ rebalanceStatus?.currentSourceVolumeId != null
+                      ? `vol ${rebalanceStatus.currentSourceVolumeId} · ${rebalanceTierLabel}`
+                      : '—' }}
+                  </span>
                 </div>
               </div>
             </div>
-          </div>
-        </div>
-      </div>
-    </section>
 
-    <!-- ===================== BUCKETS ===================== -->
-    <!-- ===================== ENCRYPTION ===================== -->
-    <!-- Its own tab, because it is a property of the FLEET, not of the volume list it used to sit on top of.
-         Deliberately never says "protected" while a single plaintext disk remains: pulling that disk still
-         leaks every slice on it, and a green tick here would be a lie. -->
-    <section v-show="activeTab === 'encryption'" class="section access-panel">
-      <div class="verify-header">
-        <div class="verify-title">
-          <h2>Encryption</h2>
-          <span
-            v-if="encryptionCoverage"
-            class="verify-state"
-            :class="encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext === 0 ? 'running' : 'idle'"
-          >
-            {{ encryptionCoverage.encrypted }} / {{ encryptionCoverage.total }} encrypted
-          </span>
-          <span v-if="encryptionCoverage?.unknown" class="access-hint">
-            {{ encryptionCoverage.unknown }} disk(s) absent — encryption state unknown
-          </span>
-        </div>
-      </div>
-
-      <!-- THE ONE THING WE ACTUALLY WANT FROM THE OPERATOR. Not a nag: nothing here can be encrypted until it
-           exists, and it is the only part of this that a dead OS disk cannot take away from you. -->
-      <div v-if="encryption && !encryption.hasRecoveryPassphrase" class="access-banner secret banner-standalone">
-        <div>
-          <strong>Set a recovery passphrase — encryption starts here.</strong>
-          STRUBS unlocks these disks by itself, with a keyfile on the OS disk, so this is not something you type
-          at boot. It is the <em>only</em> thing that opens your data if that OS disk ever dies — and without it,
-          losing the OS disk would lose every byte on every encrypted platter. That is why STRUBS will not
-          encrypt a single disk until one is set.
-        </div>
-        <div class="secret-row">
-          <button class="access-toggle-btn on" :disabled="encryptionBusy" @click="setRecoveryPassphrase">
-            Set the recovery passphrase
-          </button>
-          <span class="access-hint">Then write it down somewhere that is not this machine. There is no reset.</span>
-        </div>
-      </div>
-
-      <!-- RECORDED, BUT NOT USABLE. The array can recognise the passphrase and cannot produce it, so it cannot
-           write a keyslot -- and nothing else in the UI would ever say so. -->
-      <div
-        v-if="encryption && encryption.hasRecoveryPassphrase && !encryption.passphraseUsable"
-        class="access-banner warn banner-standalone"
-      >
-        <div>
-          <strong>STRUBS cannot use the recovery passphrase it has on record.</strong>
-          It holds a hash — enough to check the passphrase you type, not enough to write it onto a disk (a hash
-          does not run backwards). This happens when the passphrase was set before STRUBS kept a usable copy, or
-          when the keyfile was restored from a different backup. <em>No disk is at risk</em>, and the passphrase
-          you wrote down is still the right one: encryption simply cannot proceed until STRUBS is given it once.
-        </div>
-        <div class="secret-row">
-          <button class="access-toggle-btn on" :disabled="encryptionBusy" @click="sealRecoveryPassphrase">
-            Enter it once
-          </button>
-          <span class="access-hint">Nothing is changed and no keyslot is touched. It is the same passphrase.</span>
-        </div>
-      </div>
-
-      <div class="encryption-bar">
-        <div class="access-enforce-row encryption-default">
-          <div>
-            <div class="access-subtitle">Encrypt new volumes</div>
-            <div class="access-hint">
-              Applies to disks added from now on. <em>It converts nothing that is already in the array</em> —
-              use “Encrypt” on a drained volume for that.
+            <div v-if="rebalanceStatus && rebalanceStatus.sourceVolumeIds.length > 0" class="card-section tag-line">
+              <span class="tag-line-label">Over target:</span>
+              <span
+                v-for="id in rebalanceStatus.sourceVolumeIds"
+                :key="id"
+                class="tag mono"
+                :class="{ info: id === rebalanceStatus.currentSourceVolumeId }"
+                :title="id === rebalanceStatus.currentSourceVolumeId ? 'Draining now' : undefined"
+              >
+                vol {{ id }}
+              </span>
+            </div>
+            <div v-if="rebalanceSkipped.length > 0" class="card-section tag-line">
+              <span class="tag-line-label">Skipped:</span>
+              <span v-for="entry in rebalanceSkipped" :key="entry.label" class="tag warning">
+                {{ entry.count.toLocaleString() }} {{ entry.label }}
+              </span>
             </div>
           </div>
-          <button
-            class="access-toggle-btn"
-            :class="{ on: encryption?.encryptNewVolumes }"
-            :disabled="encryptionBusy || !encryption"
-            @click="setEncryptNewVolumes(!encryption?.encryptNewVolumes)"
-          >
-            {{ encryption?.encryptNewVolumes ? 'On' : 'Off' }}
-          </button>
-        </div>
 
-        <div class="access-enforce-row encryption-default">
-          <div>
-            <div class="access-subtitle">Recovery passphrase</div>
-            <div class="access-hint">
-              The only thing that opens these disks if the OS disk dies. Changing it rewrites the keyslot on
-              every encrypted volume, so <em>attach every disk before you change it</em>.
+          <div class="card">
+            <div class="card-header">
+              <!-- Grouped: the header is space-between, so a bare sibling would float to the middle. -->
+              <div>
+                <h2>Verify</h2>
+                <span
+                  v-if="verifyStatus?.waiting"
+                  class="tag warning"
+                  title="A rebalance owns the disks; this run is queued and starts when it finishes"
+                >
+                  <i class="fa-solid fa-hourglass-half" aria-hidden="true"></i>
+                  Waiting for rebalance
+                </span>
+              </div>
+              <div class="card-actions">
+                <button
+                  type="button"
+                  class="btn"
+                  :disabled="verifyStatus?.running || verifyActionPending"
+                  @click="startVerify"
+                >
+                  <i class="fa-solid fa-play" aria-hidden="true"></i>
+                  {{ verifyActionPending ? 'Starting...' : 'Start Verify' }}
+                </button>
+                <button
+                  type="button"
+                  class="btn danger"
+                  :disabled="!verifyStatus?.running || stopRequested"
+                  @click="stopVerify"
+                >
+                  <i class="fa-solid fa-stop" aria-hidden="true"></i>
+                  {{ stopRequested ? 'Stopping...' : 'Stop' }}
+                </button>
+              </div>
+            </div>
+            <div class="card-section">
+              <div class="stats">
+                <div class="stat">
+                  <span class="stat-label">Started</span>
+                  <span class="stat-value">{{ formatDateTime(verifyStatus?.startedAt ?? null) }}</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">Objects verified</span>
+                  <span class="stat-value">{{ (verifyStatus?.objectsVerified ?? 0).toLocaleString() }}</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">Total errors</span>
+                  <span class="stat-value" :class="{ 'text-danger': (verifyStatus?.errors?.total ?? 0) > 0 }">
+                    {{ (verifyStatus?.errors?.total ?? 0).toLocaleString() }}
+                  </span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">Concurrency</span>
+                  <span class="stat-value">{{ verifyStatus?.concurrency ?? 0 }}</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">Scope</span>
+                  <span class="stat-value">{{ verifyScopeLabel }}</span>
+                </div>
+              </div>
+            </div>
+            <div v-if="verifyTargetVolumes.length > 0" class="card-section tag-line">
+              <span class="tag-line-label">Target volumes:</span>
+              <span v-for="entry in verifyTargetVolumes" :key="entry.id" class="tag">
+                {{ entry.label }}
+              </span>
+            </div>
+            <div v-if="verifyVolumeErrors.length > 0" class="card-section tag-line">
+              <span class="tag-line-label">Errors by volume:</span>
+              <span v-for="entry in verifyVolumeErrors" :key="entry.volumeId" class="tag danger">
+                vol {{ entry.volumeId }}: {{ entry.count.toLocaleString() }}
+              </span>
             </div>
           </div>
-          <button class="access-toggle-btn" :disabled="encryptionBusy" @click="setRecoveryPassphrase">
-            {{ encryption?.hasRecoveryPassphrase ? 'Change' : 'Set' }}
-          </button>
-        </div>
 
-        <div v-if="encryptionCoverage && encryptionCoverage.encrypted > 0" class="access-enforce-row encryption-default">
-          <div>
-            <div class="access-subtitle">Prove it against the disks</div>
-            <div class="access-hint">
-              <template v-if="encryption?.lastAudit?.healthy">
-                Last proven against all {{ encryption.lastAudit.total }} encrypted disk(s)
-                {{ auditAgeDays === 0 ? 'today' : `${auditAgeDays} day(s) ago` }}.
-              </template>
-              <template v-else-if="auditAgeDays === null">
-                <em>Never checked.</em> Nobody has confirmed these disks can actually be recovered.
-              </template>
-              <template v-else>Last checked {{ auditAgeDays }} day(s) ago.</template>
+          <div class="card">
+            <div class="card-header">
+              <div><h2>Verify history</h2></div>
+              <div class="card-actions">
+                <button type="button" class="btn sm" :disabled="verifyRunsLoading" @click="fetchVerifyRuns">
+                  <i class="fa-solid fa-rotate-right" aria-hidden="true"></i>
+                  {{ verifyRunsLoading ? 'Loading...' : 'Refresh' }}
+                </button>
+              </div>
+            </div>
+            <div v-if="verifyRuns.length === 0" class="empty">
+              <i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i>
+              <h2>{{ verifyRunsLoading ? 'Loading…' : 'No verify runs recorded yet.' }}</h2>
+            </div>
+            <div v-else class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Started</th>
+                    <th>Trigger</th>
+                    <th>Scope</th>
+                    <th>Status</th>
+                    <th class="num">Objects</th>
+                    <th class="num">Errors</th>
+                    <th>Finished</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template v-for="run in verifyRuns" :key="run._id">
+                    <tr
+                      class="clickable"
+                      tabindex="0"
+                      :aria-expanded="expandedVerifyRunId === run._id"
+                      @click="toggleVerifyRunDetail(run._id)"
+                      @keydown.enter.prevent="toggleVerifyRunDetail(run._id)"
+                    >
+                      <td class="nowrap">
+                        <i
+                          class="fa-solid row-chevron"
+                          :class="expandedVerifyRunId === run._id ? 'fa-chevron-down' : 'fa-chevron-right'"
+                          aria-hidden="true"
+                        ></i>
+                        {{ formatDateTime(run.startedAt) }}
+                      </td>
+                      <td>
+                        <span class="tag" :class="VERIFY_TRIGGER_TONE[verifyRunTriggerClass(run.trigger)] ?? 'neutral'">
+                          {{ verifyRunTriggerSummary(run.trigger) }}
+                        </span>
+                      </td>
+                      <td>{{ verifyRunScopeLabel(run) }}</td>
+                      <td>
+                        <span class="tag capitalize" :class="VERIFY_STATUS_TONE[run.status] ?? 'neutral'">{{ run.status }}</span>
+                      </td>
+                      <td class="num">{{ (run.objectsVerified ?? 0).toLocaleString() }}</td>
+                      <td class="num" :class="{ 'text-danger': (run.totalErrors ?? 0) > 0 }">
+                        {{ (run.totalErrors ?? 0).toLocaleString() }}
+                      </td>
+                      <td class="nowrap">{{ run.finishedAt ? formatDateTime(run.finishedAt) : '—' }}</td>
+                    </tr>
+                    <tr v-if="expandedVerifyRunId === run._id" class="run-detail-row">
+                      <td colspan="7">
+                        <div class="run-detail">
+                          <div class="stat">
+                            <span class="stat-label">Mode</span>
+                            <span>{{ run.mode }}</span>
+                          </div>
+                          <div class="stat">
+                            <span class="stat-label">Checksum errors</span>
+                            <span>{{ (run.checksumErrors ?? 0).toLocaleString() }}</span>
+                          </div>
+                          <div v-if="run.volumeIds.length > 0" class="stat">
+                            <span class="stat-label">Volumes</span>
+                            <span>{{ run.volumeIds.join(', ') }}</span>
+                          </div>
+                          <div class="stat run-detail-trigger">
+                            <span class="stat-label">Trigger</span>
+                            <span v-if="run.trigger.source === 'syslog-watcher'">
+                              Device <code>{{ run.trigger.device }}</code> (volume {{ run.trigger.volumeId }}) reported
+                              {{ run.trigger.kind }}: “{{ run.trigger.detail }}”
+                            </span>
+                            <span v-else-if="run.trigger.source === 'scheduled'">
+                              Automatic rolling scrub
+                            </span>
+                            <span v-else>
+                              Started manually from the API/UI
+                            </span>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
             </div>
           </div>
-          <button
-            class="access-toggle-btn"
-            :class="{ on: encryption?.lastAudit?.healthy }"
-            :disabled="encryptionBusy"
-            @click="auditRecoveryPassphrase"
-          >
-            Check the disks
-          </button>
-        </div>
-      </div>
+        </section>
 
-      <div
-        v-if="encryptionCoverage && encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext > 0"
-        class="access-banner warn banner-standalone"
-      >
-        <strong>This array is partially encrypted.</strong>
-        {{ encryptionCoverage.plaintext }} volume(s) are still plaintext — pulling any one of them exposes
-        every slice it holds. Encryption protects a disk that leaves the building; it does nothing for the
-        disks that haven't been converted.
-      </div>
+        <!-- ===================== VOLUMES ===================== -->
+        <section v-show="activeTab === 'volumes'" class="stack">
+          <!-- A CONVERSION IS RUNNING. It takes minutes and it wipes a disk. Say what it is doing, or a disabled
+               button for two minutes looks exactly like a wedged system -- and the reasonable response to that
+               (reload, click again, restart) is the worst thing you can do to a disk that is mid-wipe. -->
+          <div v-if="conversion" class="notice warning" role="status">
+            <i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">Encrypting volume {{ conversion.volumeId }}.</strong>
+              {{ conversionLabel }}.
+              <em v-if="conversion.phase === 'scanning'">
+                Nothing has been changed yet — this step exists to make sure nothing on the disk is worth keeping.
+              </em>
+              <em v-else>The disk is being rewritten. Do not pull it, and do not restart STRUBS.</em>
+            </div>
+          </div>
 
-      <!-- THE WORST NEWS THIS PAGE CAN CARRY. Every disk mounts, every disk serves, the array looks perfect --
-           and the passphrase in your safe opens only some of them. Nothing else in the system will ever notice,
-           because STRUBS mounts with the keyfile and never touches the passphrase slot. -->
-      <div
-        v-if="encryption?.lastAudit && encryption.lastAudit.refused.length"
-        class="access-banner error banner-standalone"
-      >
-        <strong>THE RECOVERY PASSPHRASE DOES NOT OPEN EVERY DISK.</strong>
-        Volume{{ encryption.lastAudit.refused.length === 1 ? '' : 's' }}
-        {{ encryption.lastAudit.refused.map(d => d.volumeId).join(', ') }}
-        do not open with it — almost certainly because they were unplugged when the passphrase was last changed.
-        If the keyfile is lost, those disks are lost with it.
-        <strong>Set the passphrase again with every disk attached</strong>, and they will be rewritten.
-      </div>
+          <div class="toolbar">
+            <div class="segmented" role="group" aria-label="Volumes view">
+              <button type="button" :aria-pressed="volumesView === 'table'" @click="volumesView = 'table'">
+                <i class="fa-solid fa-table-list" aria-hidden="true"></i>
+                Table
+              </button>
+              <button type="button" :aria-pressed="volumesView === 'grid'" @click="volumesView = 'grid'">
+                <i class="fa-solid fa-table-cells-large" aria-hidden="true"></i>
+                Grid
+              </button>
+            </div>
+            <label for="volumes-sort" class="select-field">
+              Sort by
+              <select id="volumes-sort" v-model="sortBy" class="select">
+                <option value="volumeLabel">Volume Label</option>
+                <option value="volumeId">Volume ID</option>
+                <option value="name">Device Name</option>
+                <option value="path">Device Path</option>
+              </select>
+            </label>
+          </div>
 
-      <div
-        v-else-if="encryption?.lastAudit && encryption.lastAudit.unreadable.length"
-        class="access-banner warn banner-standalone"
-      >
-        <strong>Some encrypted disks could not be checked.</strong>
-        The LUKS header on {{ encryption.lastAudit.unreadable.map(d => d.path).join(', ') }} would not read, so
-        we cannot say whether the recovery passphrase still opens
-        {{ encryption.lastAudit.unreadable.length === 1 ? 'it' : 'them' }}.
-        That is a disk fault, not a passphrase fault — but it means those volumes' recoverability is unknown.
-      </div>
+          <div v-if="sortedStorageRows.length === 0" class="card">
+            <div class="empty">
+              <i class="fa-solid fa-hard-drive" aria-hidden="true"></i>
+              <h2>{{ loading ? 'Loading…' : 'No volumes or drives found.' }}</h2>
+            </div>
+          </div>
 
-      <!-- An encrypted disk we cannot identify is one the fleet-passphrase check cannot see -- which is how a
-           fleet ends up split. The audit counts it as unhealthy; the UI must not then say "last checked today"
-           and leave it at that. -->
-      <!-- An audit that could not even ASK a disk cannot say the fleet is recoverable. An unplugged volume is
-           the likeliest one to be wrong, because it is the one a rotation could not reach. -->
-      <div
-        v-else-if="encryption?.lastAudit && encryption.lastAudit.notChecked?.length"
-        class="access-banner warn banner-standalone"
-      >
-        <strong>The passphrase was not checked against every disk.</strong>
-        Volume{{ encryption.lastAudit.notChecked.length === 1 ? '' : 's' }}
-        {{ encryption.lastAudit.notChecked.join(', ') }}
-        {{ encryption.lastAudit.notChecked.length === 1 ? 'was' : 'were' }} not attached, so
-        {{ encryption.lastAudit.notChecked.length === 1 ? 'it' : 'they' }} could not be asked — and an unplugged
-        disk is the one most likely to have missed a passphrase change. Attach every disk and check again.
-      </div>
+          <!-- TABLE VIEW -->
+          <div v-else-if="volumesView === 'table'" class="card table-wrap">
+            <table class="data-table volumes-table">
+              <thead>
+                <tr>
+                  <th>
+                    <button
+                      type="button"
+                      class="th-sort"
+                      :class="{ active: sortBy === 'volumeLabel' }"
+                      @click="setSort('volumeLabel')"
+                    >
+                      Volume
+                      <i v-if="sortBy === 'volumeLabel'" class="fa-solid fa-arrow-up" aria-label="sorted"></i>
+                    </button>
+                  </th>
+                  <th>
+                    <button
+                      type="button"
+                      class="th-sort"
+                      :class="{ active: sortBy === 'name' }"
+                      @click="setSort('name')"
+                    >
+                      Device
+                      <i v-if="sortBy === 'name'" class="fa-solid fa-arrow-up" aria-label="sorted"></i>
+                    </button>
+                  </th>
+                  <th>Comment</th>
+                  <th>Status</th>
+                  <th class="num">Files</th>
+                  <th class="num">Data slices</th>
+                  <th class="num">Parity slices</th>
+                  <th class="num">Physical total</th>
+                  <th class="num">Capacity</th>
+                  <th>Fullness</th>
+                  <th class="actions-col"><span class="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="entry in sortedStorageRows"
+                  :key="entry.key"
+                  :class="{ 'muted-row': entry.unassigned }"
+                  @contextmenu="entry.id !== null ? showContextMenu($event, entry.id) : null"
+                >
+                  <td>
+                    <div class="vol-id-cell">
+                      <template v-if="!entry.unassigned">
+                        <span class="tag mono lg" :class="entry.tone">{{ entry.id }}</span>
+                        <span v-if="entry.groupLabel" class="vol-group-label">{{ entry.groupLabel }}</span>
+                      </template>
+                      <span v-else class="tag">unassigned</span>
+                    </div>
+                  </td>
+                  <td class="mono-cell" :title="entry.identityTitle ?? undefined">{{ entry.device ?? '—' }}</td>
+                  <td class="comment-cell" :title="entry.volume?.comment ?? undefined">
+                    <span v-if="entry.volume?.comment" class="comment-text">{{ entry.volume.comment }}</span>
+                    <span v-else class="muted">—</span>
+                  </td>
+                  <td>
+                    <div class="status-cell">
+                      <span v-if="entry.volume?.isReadOnly" class="tag info" title="Read-only">RO</span>
+                      <span v-if="entry.volume?.isEncrypted" class="tag" title="LUKS encrypted">
+                        <i class="fa-solid fa-lock" aria-hidden="true"></i><span class="sr-only">Encrypted</span>
+                      </span>
+                      <span v-if="entry.volume?.isDraining" class="tag warning" title="Draining (draining slices to other drives)">Draining</span>
+                      <span v-if="entry.volume && !entry.volume.isEnabled" class="tag" title="Disabled">Disabled</span>
+                      <span
+                        v-else-if="entry.volume && !entry.blockDevice"
+                        class="tag danger"
+                        title="Volume has no online block device"
+                      >Offline</span>
+                      <span v-if="entry.volume?.isSmartHealthy === false" class="tag danger" title="SMART failed">SMART</span>
+                      <span
+                        v-if="entry.volume && getVerifyErrorCount(entry.volume.verifyErrors) > 0"
+                        class="tag danger"
+                        :title="getVerifyErrorCount(entry.volume.verifyErrors) + ' verify errors'"
+                      >Errors</span>
+                      <span v-if="!entry.volume" class="muted">—</span>
+                    </div>
+                  </td>
+                  <td class="num">{{ entry.stats.objectCount.toLocaleString() }}</td>
+                  <td class="num">{{ entry.stats.dataSliceCount.toLocaleString() }}</td>
+                  <td class="num">{{ entry.stats.paritySliceCount.toLocaleString() }}</td>
+                  <td class="num">{{ formatBytes(entry.stats.physicalBytes) }}</td>
+                  <td class="num">{{ entry.bytesTotal > 0 ? formatBytes(entry.bytesTotal) : '—' }}</td>
+                  <td class="fullness-cell">
+                    <div v-if="entry.usedFraction !== null" class="fullness" :title="fullnessTitle(entry)">
+                      <div class="bar" :class="fullnessClass(entry.usedFraction)">
+                        <div class="bar-fill" :style="{ width: (entry.usedFraction * 100).toFixed(1) + '%' }"></div>
+                      </div>
+                      <span class="fullness-label">{{ Math.round(entry.usedFraction * 100) }}%</span>
+                    </div>
+                    <span v-else class="muted" title="Capacity unknown">—</span>
+                  </td>
+                  <td class="actions-col">
+                    <button
+                      v-if="entry.id !== null"
+                      type="button"
+                      class="btn ghost sm icon"
+                      title="Volume actions"
+                      aria-label="Volume actions"
+                      @click.stop="openRowMenu($event, entry.id)"
+                    >
+                      <i class="fa-solid fa-ellipsis-vertical" aria-hidden="true"></i>
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
 
-      <div
-        v-else-if="encryption?.lastAudit && encryption.lastAudit.unidentified.length"
-        class="access-banner warn banner-standalone"
-      >
-        <strong>An encrypted disk here is not identifiable.</strong>
-        {{ encryption.lastAudit.unidentified.join(', ') }}
-        {{ encryption.lastAudit.unidentified.length === 1 ? 'is a LUKS container' : 'are LUKS containers' }}
-        carrying no STRUBS nameplate, so we cannot tell whether
-        {{ encryption.lastAudit.unidentified.length === 1 ? 'it belongs' : 'they belong' }} to this array.
-        Encryption is blocked until {{ encryption.lastAudit.unidentified.length === 1 ? 'it is' : 'they are' }}
-        identified or detached.
-      </div>
+          <!-- GRID VIEW (tiles) -->
+          <div v-else class="tiles">
+            <div
+              v-for="entry in sortedStorageRows"
+              :key="entry.key"
+              class="card tile"
+              :class="{ offline: entry.volume && !entry.blockDevice, unassigned: entry.unassigned }"
+              @contextmenu="entry.id !== null ? showContextMenu($event, entry.id) : null"
+            >
+              <!-- Title and tags stack on the LEFT (tags under the name, so they never wrap around it);
+                   the action button sits alone on the RIGHT, after them. -->
+              <div class="tile-head">
+                <div class="tile-head-main">
+                  <div class="tile-name">
+                    <span v-if="!entry.unassigned" class="tag mono lg" :class="entry.tone">{{ entry.id }}</span>
+                    <span v-if="entry.groupLabel" class="vol-group-label">{{ entry.groupLabel }}</span>
+                    <span class="tile-title">{{ entry.unassigned ? (entry.device ?? 'Drive') : ('Volume ' + entry.id) }}</span>
+                  </div>
+                  <div class="tile-tags">
+                    <span v-if="entry.busGroup !== null" class="tag">Bus {{ entry.busGroup }}</span>
+                    <span class="tag">{{ formatBytes(entry.bytesTotal) }}</span>
+                    <span v-if="entry.volume?.isReadOnly" class="tag info">Read-only</span>
+                    <span v-if="entry.volume?.isEncrypted" class="tag" title="LUKS encrypted">
+                      <i class="fa-solid fa-lock" aria-hidden="true"></i> Encrypted
+                    </span>
+                    <span v-if="entry.volume?.isDraining" class="tag warning">Draining</span>
+                    <span v-if="entry.volume && !entry.volume.isEnabled" class="tag">Disabled</span>
+                    <span v-else-if="entry.volume && !entry.blockDevice" class="tag danger">Offline</span>
+                    <span v-if="entry.unassigned" class="tag">Unassigned</span>
+                  </div>
+                </div>
+                <button
+                  v-if="entry.id !== null"
+                  type="button"
+                  class="btn ghost sm icon"
+                  title="Volume actions"
+                  aria-label="Volume actions"
+                  @click.stop="openRowMenu($event, entry.id)"
+                >
+                  <i class="fa-solid fa-ellipsis-vertical" aria-hidden="true"></i>
+                </button>
+              </div>
+              <dl class="kv">
+                <div>
+                  <dt>Device</dt>
+                  <dd class="mono">{{ entry.device ?? 'N/A' }}</dd>
+                </div>
+                <div v-if="!entry.unassigned">
+                  <dt>Read only</dt>
+                  <dd>{{ entry.volume?.isReadOnly ? 'Yes' : 'No' }}</dd>
+                </div>
+                <div v-if="entry.volume">
+                  <dt>Enabled</dt>
+                  <dd>{{ entry.volume.isEnabled ? 'Yes' : 'No' }}</dd>
+                </div>
+                <div v-if="entry.volume">
+                  <dt>SMART status</dt>
+                  <dd :class="{ 'text-danger': entry.volume.isSmartHealthy === false }">
+                    {{ formatSmartStatus(entry.volume) }}
+                  </dd>
+                </div>
+                <div v-if="entry.volume && getVerifyErrorCount(entry.volume.verifyErrors) > 0">
+                  <dt>Verify errors</dt>
+                  <dd class="text-danger">{{ getVerifyErrorCount(entry.volume.verifyErrors) }}</dd>
+                </div>
+                <div v-if="entry.blockDevice?.model ?? entry.volume?.deviceModel">
+                  <dt>Model</dt>
+                  <dd>{{ entry.blockDevice?.model ?? entry.volume?.deviceModel }}</dd>
+                </div>
+                <div v-if="entry.blockDevice?.serial ?? entry.volume?.deviceSerial">
+                  <dt>Serial</dt>
+                  <dd class="mono">{{ entry.blockDevice?.serial ?? entry.volume?.deviceSerial }}</dd>
+                </div>
+                <div>
+                  <dt>Files</dt>
+                  <dd>{{ entry.stats.objectCount.toLocaleString() }}</dd>
+                </div>
+                <div v-if="entry.usedFraction !== null">
+                  <dt>Fullness</dt>
+                  <dd class="fullness" :title="fullnessTitle(entry)">
+                    <span class="bar" :class="fullnessClass(entry.usedFraction)">
+                      <span class="bar-fill" :style="{ width: (entry.usedFraction * 100).toFixed(1) + '%' }"></span>
+                    </span>
+                    <span class="fullness-label">{{ Math.round(entry.usedFraction * 100) }}%</span>
+                  </dd>
+                </div>
+                <div v-if="entry.volume?.comment">
+                  <dt>Comment</dt>
+                  <dd class="comment-text" :title="entry.volume.comment">{{ entry.volume.comment }}</dd>
+                </div>
+              </dl>
+            </div>
+          </div>
+        </section>
 
-      <div v-else-if="auditIsStale" class="access-banner warn banner-standalone">
-        <strong>The recovery passphrase has {{ auditAgeDays === null ? 'never been' : 'not been' }} checked
-        against the disks{{ auditAgeDays === null ? '' : ` in ${auditAgeDays} days` }}.</strong>
-        STRUBS unlocks these disks with the keyfile, so a passphrase that has stopped working would not show up
-        anywhere else — until the day you need it. Check it now.
-      </div>
-    </section>
+        <!-- ===================== ENCRYPTION ===================== -->
+        <!-- Its own tab, because it is a property of the FLEET, not of the volume list it used to sit on top of.
+             Deliberately never says "protected" while a single plaintext disk remains: pulling that disk still
+             leaks every slice on it, and a green tick here would be a lie. -->
+        <section v-show="activeTab === 'encryption'" class="stack">
+          <!-- THE ONE THING WE ACTUALLY WANT FROM THE OPERATOR. Not a nag: nothing here can be encrypted until it
+               exists, and it is the only part of this that a dead OS disk cannot take away from you. -->
+          <div v-if="encryption && !encryption.hasRecoveryPassphrase" class="notice info">
+            <i class="fa-solid fa-key" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">Set a recovery passphrase — encryption starts here.</strong>
+              STRUBS unlocks these disks by itself, with a keyfile on the OS disk, so this is not something you type
+              at boot. It is the <em>only</em> thing that opens your data if that OS disk ever dies — and without it,
+              losing the OS disk would lose every byte on every encrypted platter. That is why STRUBS will not
+              encrypt a single disk until one is set.
+              <div class="notice-row">
+                <button type="button" class="btn primary" :disabled="encryptionBusy" @click="setRecoveryPassphrase">
+                  Set the recovery passphrase
+                </button>
+                <span class="hint">Then write it down somewhere that is not this machine. There is no reset.</span>
+              </div>
+            </div>
+          </div>
 
-    <section v-show="activeTab === 'buckets'" class="section access-panel">
-      <div class="verify-header">
-        <div class="verify-title">
-          <h2>Buckets</h2>
-          <span class="verify-state" :class="authEnforced ? 'running' : 'idle'">
-            {{ authEnforced === null ? '—' : (authEnforced ? 'Enforced' : 'Open') }}
-          </span>
-        </div>
-      </div>
+          <!-- RECORDED, BUT NOT USABLE. The array can recognise the passphrase and cannot produce it, so it cannot
+               write a keyslot -- and nothing else in the UI would ever say so. -->
+          <div v-if="encryption && encryption.hasRecoveryPassphrase && !encryption.passphraseUsable" class="notice warning">
+            <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">STRUBS cannot use the recovery passphrase it has on record.</strong>
+              It holds a hash — enough to check the passphrase you type, not enough to write it onto a disk (a hash
+              does not run backwards). This happens when the passphrase was set before STRUBS kept a usable copy, or
+              when the keyfile was restored from a different backup. <em>No disk is at risk</em>, and the passphrase
+              you wrote down is still the right one: encryption simply cannot proceed until STRUBS is given it once.
+              <div class="notice-row">
+                <button type="button" class="btn" :disabled="encryptionBusy" @click="sealRecoveryPassphrase">
+                  Enter it once
+                </button>
+                <span class="hint">Nothing is changed and no keyslot is touched. It is the same passphrase.</span>
+              </div>
+            </div>
+          </div>
 
-      <div v-if="authEnforced === false" class="access-banner warn banner-standalone">
-        <strong>The object API is unauthenticated.</strong>
-        Every bucket is publicly readable and writable regardless of the policy toggles below —
-        they take effect only once enforcement is enabled.
-      </div>
-
-      <!-- ---------- Bucket CONTENTS (file explorer) ---------- -->
-      <div v-if="browsePath" class="access-body">
-        <div class="browse-bar">
-          <nav class="breadcrumbs" aria-label="Breadcrumb">
-            <button type="button" class="crumb" @click="openPath('')">Buckets</button>
-            <template v-for="(crumb, i) in breadcrumbs" :key="crumb.path">
-              <span class="crumb-sep">/</span>
+          <div class="card">
+            <div class="setting-row">
+              <div>
+                <div class="setting-title">Encrypt new volumes</div>
+                <div class="hint">
+                  Applies to disks added from now on. <em>It converts nothing that is already in the array</em> —
+                  use “Encrypt” on a drained volume for that.
+                </div>
+              </div>
               <button
                 type="button"
-                class="crumb"
-                :class="{ current: i === breadcrumbs.length - 1 }"
-                @click="openPath(crumb.path)"
-              >{{ crumb.name }}</button>
-            </template>
-          </nav>
-          <span v-if="browseLoading" class="browse-status">Loading…</span>
-        </div>
+                class="toggle"
+                role="switch"
+                :aria-checked="!!encryption?.encryptNewVolumes"
+                aria-label="Encrypt new volumes"
+                :disabled="encryptionBusy || !encryption"
+                @click="setEncryptNewVolumes(!encryption?.encryptNewVolumes)"
+              >
+                <span class="track" aria-hidden="true"></span>
+                {{ encryption?.encryptNewVolumes ? 'On' : 'Off' }}
+              </button>
+            </div>
 
-        <div v-if="browseError" class="access-banner error">{{ browseError }}</div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-title">Recovery passphrase</div>
+                <div class="hint">
+                  The only thing that opens these disks if the OS disk dies. Changing it rewrites the keyslot on
+                  every encrypted volume, so <em>attach every disk before you change it</em>.
+                </div>
+              </div>
+              <button type="button" class="btn" :disabled="encryptionBusy" @click="setRecoveryPassphrase">
+                <i class="fa-solid fa-key" aria-hidden="true"></i>
+                {{ encryption?.hasRecoveryPassphrase ? 'Change' : 'Set' }}
+              </button>
+            </div>
 
-        <table v-else class="access-table browse-table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th class="num">Size</th>
-              <th>Type</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr
-              v-for="entry in browseEntries"
-              :key="entry.id"
-              :class="{ clickable: entry.isContainer }"
-              @click="entry.isContainer && openPath(browsePath + '/' + entry.name)"
-            >
-              <td>
-                <span class="entry-icon">{{ entry.isContainer ? '📁' : '📄' }}</span>
-                <a
-                  v-if="entry.isFile"
-                  class="entry-name entry-link"
-                  :href="objectUrl(browsePath + '/' + entry.name)"
-                  target="_blank"
-                  rel="noopener"
-                  @click.stop
-                >{{ entry.name }}</a>
-                <span v-else class="entry-name entry-folder">{{ entry.name }}</span>
-              </td>
-              <td class="num">{{ entry.isFile && entry.size !== null ? formatBytes(entry.size) : '—' }}</td>
-              <td class="entry-mime">{{ entry.isContainer ? 'folder' : (entry.mime || 'unknown') }}</td>
-            </tr>
-            <tr v-if="!browseEntries.length && !browseLoading">
-              <td colspan="3" class="access-empty">This folder is empty.</td>
-            </tr>
-          </tbody>
-        </table>
+            <div v-if="encryptionCoverage && encryptionCoverage.encrypted > 0" class="setting-row">
+              <div>
+                <div class="setting-title">
+                  Prove it against the disks
+                  <span v-if="encryption?.lastAudit?.healthy" class="tag success">
+                    <i class="fa-solid fa-check" aria-hidden="true"></i> Proven
+                  </span>
+                </div>
+                <div class="hint">
+                  <template v-if="encryption?.lastAudit?.healthy">
+                    Last proven against all {{ encryption.lastAudit.total }} encrypted disk(s)
+                    {{ auditAgeDays === 0 ? 'today' : `${auditAgeDays} day(s) ago` }}.
+                  </template>
+                  <template v-else-if="auditAgeDays === null">
+                    <em>Never checked.</em> Nobody has confirmed these disks can actually be recovered.
+                  </template>
+                  <template v-else>Last checked {{ auditAgeDays }} day(s) ago.</template>
+                </div>
+              </div>
+              <button type="button" class="btn" :disabled="encryptionBusy" @click="auditRecoveryPassphrase">
+                <i class="fa-solid fa-shield-halved" aria-hidden="true"></i>
+                Check the disks
+              </button>
+            </div>
+          </div>
 
-        <div v-if="browseHasMore" class="browse-more">
-          <button
-            type="button"
-            class="access-mini-btn"
-            :disabled="browseLoading"
-            @click="loadMoreBrowse"
-          >{{ browseLoading ? 'Loading…' : 'Load more' }}</button>
-          <span class="browse-count">{{ browseEntries.length.toLocaleString() }} shown</span>
-        </div>
-        <p v-else-if="browseEntries.length" class="browse-more">
-          <span class="browse-count">{{ browseEntries.length.toLocaleString() }} entries</span>
-        </p>
-      </div>
+          <div
+            v-if="encryptionCoverage && encryptionCoverage.encrypted > 0 && encryptionCoverage.plaintext > 0"
+            class="notice warning"
+          >
+            <i class="fa-solid fa-lock-open" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">This array is partially encrypted.</strong>
+              {{ encryptionCoverage.plaintext }} volume(s) are still plaintext — pulling any one of them exposes
+              every slice it holds. Encryption protects a disk that leaves the building; it does nothing for the
+              disks that haven't been converted.
+            </div>
+          </div>
 
-      <!-- ---------- Bucket LIST ---------- -->
-      <div v-else class="access-body">
-        <!-- Also where a "that path no longer exists" message lands: the browse view it would otherwise
-             have shown in is exactly the view we just left. -->
-        <div v-if="bucketError" class="access-banner error">{{ bucketError }}</div>
+          <!-- THE WORST NEWS THIS PAGE CAN CARRY. Every disk mounts, every disk serves, the array looks perfect --
+               and the passphrase in your safe opens only some of them. Nothing else in the system will ever notice,
+               because STRUBS mounts with the keyfile and never touches the passphrase slot. -->
+          <div v-if="encryption?.lastAudit && encryption.lastAudit.refused.length" class="notice danger" role="alert">
+            <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">THE RECOVERY PASSPHRASE DOES NOT OPEN EVERY DISK.</strong>
+              Volume{{ encryption.lastAudit.refused.length === 1 ? '' : 's' }}
+              {{ encryption.lastAudit.refused.map(d => d.volumeId).join(', ') }}
+              do not open with it — almost certainly because they were unplugged when the passphrase was last changed.
+              If the keyfile is lost, those disks are lost with it.
+              <em>Set the passphrase again with every disk attached</em>, and they will be rewritten.
+            </div>
+          </div>
 
-        <!-- Enforcement switch -->
-        <div class="access-subsection">
-          <div class="access-enforce-row">
-            <div>
-              <div class="access-subtitle">Auth enforcement</div>
-              <div class="access-hint">
-                While off, all object requests are allowed (today's behaviour). Turning it on begins
-                rejecting anonymous access to non-public buckets.
-                <em>The object API is plain HTTP — Basic credentials cross the wire in cleartext.</em>
+          <div v-else-if="encryption?.lastAudit && encryption.lastAudit.unreadable.length" class="notice warning">
+            <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">Some encrypted disks could not be checked.</strong>
+              The LUKS header on <code>{{ encryption.lastAudit.unreadable.map(d => d.path).join(', ') }}</code> would not
+              read, so we cannot say whether the recovery passphrase still opens
+              {{ encryption.lastAudit.unreadable.length === 1 ? 'it' : 'them' }}.
+              That is a disk fault, not a passphrase fault — but it means those volumes' recoverability is unknown.
+            </div>
+          </div>
+
+          <!-- An encrypted disk we cannot identify is one the fleet-passphrase check cannot see -- which is how a
+               fleet ends up split. The audit counts it as unhealthy; the UI must not then say "last checked today"
+               and leave it at that. -->
+          <!-- An audit that could not even ASK a disk cannot say the fleet is recoverable. An unplugged volume is
+               the likeliest one to be wrong, because it is the one a rotation could not reach. -->
+          <div v-else-if="encryption?.lastAudit && encryption.lastAudit.notChecked?.length" class="notice warning">
+            <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">The passphrase was not checked against every disk.</strong>
+              Volume{{ encryption.lastAudit.notChecked.length === 1 ? '' : 's' }}
+              {{ encryption.lastAudit.notChecked.join(', ') }}
+              {{ encryption.lastAudit.notChecked.length === 1 ? 'was' : 'were' }} not attached, so
+              {{ encryption.lastAudit.notChecked.length === 1 ? 'it' : 'they' }} could not be asked — and an unplugged
+              disk is the one most likely to have missed a passphrase change. Attach every disk and check again.
+            </div>
+          </div>
+
+          <div v-else-if="encryption?.lastAudit && encryption.lastAudit.unidentified.length" class="notice warning">
+            <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">An encrypted disk here is not identifiable.</strong>
+              <code>{{ encryption.lastAudit.unidentified.join(', ') }}</code>
+              {{ encryption.lastAudit.unidentified.length === 1 ? 'is a LUKS container' : 'are LUKS containers' }}
+              carrying no STRUBS nameplate, so we cannot tell whether
+              {{ encryption.lastAudit.unidentified.length === 1 ? 'it belongs' : 'they belong' }} to this array.
+              Encryption is blocked until {{ encryption.lastAudit.unidentified.length === 1 ? 'it is' : 'they are' }}
+              identified or detached.
+            </div>
+          </div>
+
+          <div v-else-if="auditIsStale" class="notice warning">
+            <i class="fa-solid fa-clock" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">The recovery passphrase has {{ auditAgeDays === null ? 'never been' : 'not been' }} checked
+              against the disks{{ auditAgeDays === null ? '' : ` in ${auditAgeDays} days` }}.</strong>
+              STRUBS unlocks these disks with the keyfile, so a passphrase that has stopped working would not show up
+              anywhere else — until the day you need it. Check it now.
+            </div>
+          </div>
+        </section>
+
+        <!-- ===================== BUCKETS ===================== -->
+        <section v-show="activeTab === 'buckets'" class="stack">
+          <div v-if="authEnforced === false" class="notice warning">
+            <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong class="notice-title">The object API is unauthenticated.</strong>
+              Every bucket is publicly readable and writable regardless of the policy toggles below —
+              they take effect only once enforcement is enabled.
+            </div>
+          </div>
+
+          <!-- ---------- Bucket CONTENTS (file explorer) ---------- -->
+          <div v-if="browsePath" class="card">
+            <div class="card-header">
+              <nav class="breadcrumbs" aria-label="Breadcrumb">
+                <button type="button" class="crumb" @click="openPath('')">
+                  <i class="fa-solid fa-database" aria-hidden="true"></i> Buckets
+                </button>
+                <template v-for="(crumb, i) in breadcrumbs" :key="crumb.path">
+                  <i class="fa-solid fa-chevron-right crumb-sep" aria-hidden="true"></i>
+                  <button
+                    type="button"
+                    class="crumb"
+                    :class="{ current: i === breadcrumbs.length - 1 }"
+                    :aria-current="i === breadcrumbs.length - 1 ? 'page' : undefined"
+                    @click="openPath(crumb.path)"
+                  >{{ crumb.name }}</button>
+                </template>
+              </nav>
+              <span v-if="browseLoading" class="hint">Loading…</span>
+            </div>
+
+            <div v-if="browseError" class="card-section">
+              <div class="notice danger">
+                <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+                <div class="notice-body">{{ browseError }}</div>
               </div>
             </div>
-            <button
-              class="access-toggle-btn"
-              :class="{ on: authEnforced }"
-              :disabled="accessBusy || authEnforced === null"
-              @click="setAuthEnforced(!authEnforced)"
-            >
-              {{ authEnforced ? 'Enforced' : 'Enable enforcement' }}
-            </button>
+
+            <div v-else class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th class="num">Size</th>
+                    <th>Type</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="entry in browseEntries"
+                    :key="entry.id"
+                    :class="{ clickable: entry.isContainer }"
+                    @click="entry.isContainer && openPath(browsePath + '/' + entry.name)"
+                  >
+                    <td>
+                      <span class="entry">
+                        <i
+                          class="fa-solid entry-icon"
+                          :class="entry.isContainer ? 'fa-folder' : 'fa-file'"
+                          aria-hidden="true"
+                        ></i>
+                        <a
+                          v-if="entry.isFile"
+                          :href="objectUrl(browsePath + '/' + entry.name)"
+                          target="_blank"
+                          rel="noopener"
+                          @click.stop
+                        >{{ entry.name }}</a>
+                        <button
+                          v-else
+                          type="button"
+                          class="entry-folder"
+                          @click.stop="openPath(browsePath + '/' + entry.name)"
+                        >{{ entry.name }}</button>
+                      </span>
+                    </td>
+                    <td class="num">{{ entry.isFile && entry.size !== null ? formatBytes(entry.size) : '—' }}</td>
+                    <td class="muted">{{ entry.isContainer ? 'folder' : (entry.mime || 'unknown') }}</td>
+                  </tr>
+                  <tr v-if="!browseEntries.length && !browseLoading">
+                    <td colspan="3" class="table-empty">This folder is empty.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div v-if="browseHasMore" class="card-footer">
+              <button type="button" class="btn sm" :disabled="browseLoading" @click="loadMoreBrowse">
+                {{ browseLoading ? 'Loading…' : 'Load more' }}
+              </button>
+              <span class="hint">{{ browseEntries.length.toLocaleString() }} shown</span>
+            </div>
+            <div v-else-if="browseEntries.length" class="card-footer">
+              <span class="hint">{{ browseEntries.length.toLocaleString() }} entries</span>
+            </div>
           </div>
-        </div>
 
-        <!-- Buckets -->
-        <div class="access-subsection">
-          <div class="access-subtitle">
-            Buckets
-            <span v-if="bucketStatsLoading" class="browse-status">counting…</span>
+          <!-- ---------- Bucket LIST ---------- -->
+          <template v-else>
+            <!-- Also where a "that path no longer exists" message lands: the browse view it would otherwise
+                 have shown in is exactly the view we just left. -->
+            <div v-if="bucketError" class="notice danger" role="alert">
+              <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+              <div class="notice-body">{{ bucketError }}</div>
+            </div>
+
+            <!-- Enforcement switch -->
+            <div class="card">
+              <div class="setting-row">
+                <div>
+                  <div class="setting-title">Auth enforcement</div>
+                  <div class="hint">
+                    While off, all object requests are allowed (today's behaviour). Turning it on begins
+                    rejecting anonymous access to non-public buckets.
+                    <em>The object API is plain HTTP — Basic credentials cross the wire in cleartext.</em>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  class="toggle"
+                  role="switch"
+                  :aria-checked="!!authEnforced"
+                  aria-label="Auth enforcement"
+                  :disabled="accessBusy || authEnforced === null"
+                  @click="setAuthEnforced(!authEnforced)"
+                >
+                  <span class="track" aria-hidden="true"></span>
+                  {{ authEnforced ? 'Enforced' : 'Enable enforcement' }}
+                </button>
+              </div>
+            </div>
+
+            <!-- Buckets -->
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <h2>Buckets</h2>
+                  <span v-if="bucketStatsLoading" class="hint">counting…</span>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Bucket</th>
+                      <th class="num">Objects</th>
+                      <th class="num">Size</th>
+                      <th>Public read</th>
+                      <th>Public write</th>
+                      <th title="Blocks ALL object deletes in this bucket">Delete protection</th>
+                      <th class="num" title="Requests seen since the server last started">Anon / Auth</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="b in buckets" :key="b.id">
+                      <td>
+                        <button type="button" class="bucket-link" title="Browse this bucket" @click="openPath(b.name)">
+                          <i class="fa-solid fa-folder" aria-hidden="true"></i> {{ b.name }}
+                        </button>
+                      </td>
+                      <!-- Counts arrive separately (a $group over every file); the names and toggles above do
+                           not wait on them. -->
+                      <td class="num">{{ b.objectCount === null ? '…' : b.objectCount.toLocaleString() }}</td>
+                      <td class="num">{{ b.logicalBytes === null ? '…' : formatBytes(b.logicalBytes) }}</td>
+                      <td>
+                        <label class="check">
+                          <input
+                            type="checkbox"
+                            :checked="b.publicRead === true"
+                            :disabled="accessBusy"
+                            @change="onPolicyToggle(b, 'publicRead', $event)"
+                          />
+                          <span>{{ b.publicRead === null ? 'unset' : (b.publicRead ? 'public' : 'private') }}</span>
+                        </label>
+                      </td>
+                      <td>
+                        <label class="check" title="Public write also allows anonymous DELETE">
+                          <input
+                            type="checkbox"
+                            :checked="b.publicWrite === true"
+                            :disabled="accessBusy"
+                            @change="onPolicyToggle(b, 'publicWrite', $event)"
+                          />
+                          <span :class="{ 'text-danger': b.publicWrite === true }">
+                            {{ b.publicWrite === null ? 'unset' : (b.publicWrite ? 'public — incl. anon DELETE' : 'private') }}
+                          </span>
+                        </label>
+                      </td>
+                      <td>
+                        <label class="check" title="When on, every object delete in this bucket is refused">
+                          <input
+                            type="checkbox"
+                            :checked="b.deleteProtected"
+                            :disabled="accessBusy"
+                            @change="onPolicyToggle(b, 'deleteProtected', $event)"
+                          />
+                          <span :class="{ 'text-success': b.deleteProtected }">{{ b.deleteProtected ? 'protected' : 'off' }}</span>
+                        </label>
+                      </td>
+                      <td class="num">{{ b.activity.anon.toLocaleString() }} / {{ b.activity.auth.toLocaleString() }}</td>
+                    </tr>
+                    <tr v-if="!buckets.length"><td colspan="7" class="table-empty">No buckets.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </template>
+        </section>
+
+        <!-- ===================== CREDENTIALS ===================== -->
+        <section v-show="activeTab === 'credentials'" class="stack">
+          <div v-if="credentialError" class="notice danger" role="alert">
+            <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+            <div class="notice-body">{{ credentialError }}</div>
           </div>
-          <table class="access-table">
-            <thead>
-              <tr>
-                <th>Bucket</th>
-                <th class="num">Objects</th>
-                <th class="num">Size</th>
-                <th>Public read</th>
-                <th>Public write</th>
-                <th title="Blocks ALL object deletes in this bucket">Delete protection</th>
-                <th class="num" title="Requests seen since the server last started">Anon / Auth</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="b in buckets" :key="b.id">
-                <td>
-                  <button type="button" class="bucket-link" @click="openPath(b.name)" title="Browse this bucket">
-                    📁 {{ b.name }}
-                  </button>
-                </td>
-                <!-- Counts arrive separately (a $group over every file); the names and toggles above do
-                     not wait on them. -->
-                <td class="num">{{ b.objectCount === null ? '…' : b.objectCount.toLocaleString() }}</td>
-                <td class="num">{{ b.logicalBytes === null ? '…' : formatBytes(b.logicalBytes) }}</td>
-                <td>
-                  <label class="access-switch">
-                    <input
-                      type="checkbox"
-                      :checked="b.publicRead === true"
-                      :disabled="accessBusy"
-                      @change="onPolicyToggle(b, 'publicRead', $event)"
-                    />
-                    <span>{{ b.publicRead === null ? 'unset' : (b.publicRead ? 'public' : 'private') }}</span>
-                  </label>
-                </td>
-                <td>
-                  <label class="access-switch" title="Public write also allows anonymous DELETE">
-                    <input
-                      type="checkbox"
-                      :checked="b.publicWrite === true"
-                      :disabled="accessBusy"
-                      @change="onPolicyToggle(b, 'publicWrite', $event)"
-                    />
-                    <span :class="{ 'write-warn': b.publicWrite === true }">
-                      {{ b.publicWrite === null ? 'unset' : (b.publicWrite ? 'public — incl. anon DELETE' : 'private') }}
-                    </span>
-                  </label>
-                </td>
-                <td>
-                  <label class="access-switch" title="When on, every object delete in this bucket is refused">
-                    <input
-                      type="checkbox"
-                      :checked="b.deleteProtected"
-                      :disabled="accessBusy"
-                      @change="onPolicyToggle(b, 'deleteProtected', $event)"
-                    />
-                    <span :class="{ 'delete-protected': b.deleteProtected }">{{ b.deleteProtected ? 'protected' : 'off' }}</span>
-                  </label>
-                </td>
-                <td class="num">{{ b.activity.anon.toLocaleString() }} / {{ b.activity.auth.toLocaleString() }}</td>
-              </tr>
-              <tr v-if="!buckets.length"><td colspan="7" class="access-empty">No buckets.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
 
-    <!-- ===================== CREDENTIALS ===================== -->
-    <section v-show="activeTab === 'credentials'" class="section access-panel">
-      <div class="verify-header">
-        <div class="verify-title">
-          <h2>Credentials</h2>
-        </div>
-      </div>
-
-      <div class="access-body">
-        <div v-if="credentialError" class="access-banner error">{{ credentialError }}</div>
-
-        <div class="access-subsection">
-          <div class="access-hint">
-            Object-API credentials (HTTP Basic). They take effect only while auth enforcement is on.
-          </div>
+          <p class="hint">Object-API credentials (HTTP Basic). They take effect only while auth enforcement is on.</p>
 
           <!-- A newly-issued secret, shown once. -->
-          <div v-if="issuedSecret" class="access-banner secret">
-            <div><strong>Secret for {{ issuedSecret.accessKeyId }}</strong> — copy it now, it is not shown again.</div>
-            <div class="secret-row">
-              <code class="mono">{{ issuedSecret.secret }}</code>
-              <button class="access-mini-btn" @click="copySecret(issuedSecret.secret)">Copy</button>
-              <button class="access-mini-btn" @click="issuedSecret = null">Dismiss</button>
+          <div v-if="issuedSecret" class="notice success">
+            <i class="fa-solid fa-key" aria-hidden="true"></i>
+            <div class="notice-body">
+              <strong>Secret for {{ issuedSecret.accessKeyId }}</strong> — copy it now, it is not shown again.
+              <div class="notice-row">
+                <code class="secret">{{ issuedSecret.secret }}</code>
+                <button type="button" class="btn sm" @click="copySecret(issuedSecret.secret)">
+                  <i class="fa-solid fa-copy" aria-hidden="true"></i> Copy
+                </button>
+                <button type="button" class="btn sm ghost" @click="issuedSecret = null">Dismiss</button>
+              </div>
             </div>
           </div>
 
-          <table class="access-table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Access key</th>
-                <th>Grants</th>
-                <th>Last used</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="c in credentials" :key="c.accessKeyId" :class="{ disabled: !c.enabled }">
-                <td>{{ c.name }}</td>
-                <td class="mono">{{ c.accessKeyId }}</td>
-                <td>
-                  <span v-for="(g, gi) in c.grants" :key="gi" class="grant-pill">
-                    {{ g.bucket }}:{{ g.read ? 'r' : '' }}{{ g.write ? 'w' : '' }}
-                  </span>
-                </td>
-                <td>{{ formatDateTime(c.lastUsedAt) }}</td>
-                <td class="access-actions">
-                  <button class="access-mini-btn" :disabled="accessBusy" @click="toggleCredentialEnabled(c)">
-                    {{ c.enabled ? 'Disable' : 'Enable' }}
-                  </button>
-                  <button class="access-mini-btn" :disabled="accessBusy" @click="rotateCredential(c)">Rotate</button>
-                  <button class="access-mini-btn danger" :disabled="accessBusy" @click="deleteCredential(c)">Delete</button>
-                </td>
-              </tr>
-              <tr v-if="!credentials.length"><td colspan="5" class="access-empty">No credentials.</td></tr>
-            </tbody>
-          </table>
+          <div class="card">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Access key</th>
+                    <th>Grants</th>
+                    <th>Last used</th>
+                    <th><span class="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="c in credentials" :key="c.accessKeyId" :class="{ 'dim-row': !c.enabled }">
+                    <td class="name-cell">{{ c.name }}</td>
+                    <td class="mono-cell">{{ c.accessKeyId }}</td>
+                    <td>
+                      <div class="status-cell">
+                        <span v-for="(g, gi) in c.grants" :key="gi" class="tag mono">
+                          {{ g.bucket }}:{{ g.read ? 'r' : '' }}{{ g.write ? 'w' : '' }}
+                        </span>
+                      </div>
+                    </td>
+                    <td class="nowrap">{{ formatDateTime(c.lastUsedAt) }}</td>
+                    <td>
+                      <div class="row-actions">
+                        <button type="button" class="btn sm" :disabled="accessBusy" @click="toggleCredentialEnabled(c)">
+                          {{ c.enabled ? 'Disable' : 'Enable' }}
+                        </button>
+                        <button type="button" class="btn sm" :disabled="accessBusy" @click="rotateCredential(c)">Rotate</button>
+                        <button type="button" class="btn sm danger" :disabled="accessBusy" @click="deleteCredential(c)">Delete</button>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr v-if="!credentials.length"><td colspan="5" class="table-empty">No credentials.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
 
           <!-- Create form -->
-          <div class="access-create">
-            <div class="access-subtitle small">New credential</div>
-            <div class="access-create-row">
-              <input v-model="newCredName" class="access-input" placeholder="Name (e.g. photo-app)" />
-            </div>
-            <div v-for="(g, gi) in newCredGrants" :key="gi" class="access-grant-row">
-              <input v-model="g.bucket" class="access-input grant-bucket" placeholder="bucket or *" />
-              <label class="access-switch"><input type="checkbox" v-model="g.read" /><span>read</span></label>
-              <label class="access-switch"><input type="checkbox" v-model="g.write" /><span>write</span></label>
-              <button class="access-mini-btn" :disabled="newCredGrants.length <= 1" @click="removeNewGrant(gi)">✕</button>
-            </div>
-            <div class="access-create-row">
-              <button class="access-mini-btn" @click="addNewGrant">+ grant</button>
-              <button class="access-btn primary" :disabled="accessBusy" @click="createCredential">Create credential</button>
+          <div class="card">
+            <div class="card-header"><div><h2>New credential</h2></div></div>
+            <div class="card-body create-form">
+              <label class="field">
+                Name
+                <input v-model="newCredName" class="input" placeholder="Name (e.g. photo-app)" />
+              </label>
+              <div class="field">
+                Grants
+                <div v-for="(g, gi) in newCredGrants" :key="gi" class="grant-row">
+                  <input v-model="g.bucket" class="input grant-bucket" placeholder="bucket or *" aria-label="Bucket" />
+                  <label class="check"><input v-model="g.read" type="checkbox" /><span>read</span></label>
+                  <label class="check"><input v-model="g.write" type="checkbox" /><span>write</span></label>
+                  <button
+                    type="button"
+                    class="btn ghost sm icon"
+                    title="Remove grant"
+                    aria-label="Remove grant"
+                    :disabled="newCredGrants.length <= 1"
+                    @click="removeNewGrant(gi)"
+                  >
+                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                  </button>
+                </div>
+                <button type="button" class="btn sm add-grant" @click="addNewGrant">
+                  <i class="fa-solid fa-plus" aria-hidden="true"></i> Add grant
+                </button>
+              </div>
+              <div class="form-actions">
+                <button type="button" class="btn primary" :disabled="accessBusy" @click="createCredential">
+                  Create credential
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      </div>
-    </section>
+        </section>
 
-      <div
-        v-if="!error && loading && !storageStats && volumes.length === 0 && blockDevices.length === 0"
-        class="loading"
-      >
-        Loading...
+        <div
+          v-if="!error && loading && !storageStats && volumes.length === 0 && blockDevices.length === 0"
+          class="loader"
+          role="status"
+          aria-label="Loading"
+        >
+          <i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i>
+        </div>
       </div>
     </main>
 
     <!-- Add Volume Modal -->
-    <div v-if="showModal" class="modal-overlay" @click="closeModal">
-      <div class="modal" @click.stop>
-        <div class="modal-header">
-          <h2>Add Volume</h2>
-          <button @click="closeModal" class="close-btn">&times;</button>
+    <div v-if="showModal" class="modal-scrim" @click="closeModal">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="add-volume-title" @click.stop>
+        <div class="modal-head">
+          <h2 id="add-volume-title">Add Volume</h2>
+          <button type="button" class="btn ghost icon" aria-label="Close" @click="closeModal">
+            <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+          </button>
         </div>
-        <div class="modal-body">
-          <p v-if="availableDevices.length === 0" class="no-devices">
-            No available devices without volumes.
-          </p>
-          <div v-else class="device-list">
-            <div
-              v-for="device in availableDevices"
-              :key="device.path"
-              class="modal-device-item"
+        <p v-if="availableDevices.length === 0" class="hint">
+          No available devices without volumes.
+        </p>
+        <div v-else class="device-list">
+          <div
+            v-for="device in availableDevices"
+            :key="device.path"
+            class="device-option"
+            :class="{ disabled: hasMountedPartitions(device) }"
+          >
+            <label class="device-choice">
+              <input
+                type="checkbox"
+                :checked="selectedDevices.has(device.path)"
+                :disabled="hasMountedPartitions(device)"
+                @change="toggleDeviceSelection(device.path)"
+              />
+              <span class="device-choice-text">
+                <span class="device-choice-name">{{ device.name }}</span>
+                <span class="hint">
+                  <code>{{ device.path }}</code> · {{ formatBytes(device.size) }}<template v-if="device.model"> · {{ device.model }}</template>
+                </span>
+                <span v-if="hasMountedPartitions(device)" class="device-note text-danger">
+                  Cannot add: has mounted partition(s)
+                </span>
+                <span v-else-if="device.children.length > 0" class="device-note warning-text">
+                  Has {{ device.children.length }} partition(s) - wipe required
+                </span>
+              </span>
+            </label>
+            <label
+              v-if="device.children.length > 0 && selectedDevices.has(device.path)"
+              class="check wipe-check"
             >
-              <label class="device-checkbox" :class="{ 'disabled': hasMountedPartitions(device) }">
-                <input
-                  type="checkbox"
-                  :checked="selectedDevices.has(device.path)"
-                  @change="toggleDeviceSelection(device.path)"
-                  :disabled="hasMountedPartitions(device)"
-                />
-                <div class="device-info-modal">
-                  <div class="device-name-modal">{{ device.name }}</div>
-                  <div class="device-details">
-                    {{ device.path }} - {{ formatBytes(device.size) }}
-                    <span v-if="device.model"> - {{ device.model }}</span>
-                  </div>
-                  <div v-if="hasMountedPartitions(device)" class="partition-error">
-                    Cannot add: has mounted partition(s)
-                  </div>
-                  <div v-else-if="device.children.length > 0" class="partition-info">
-                    Has {{ device.children.length }} partition(s) - wipe required
-                  </div>
-                </div>
-              </label>
-              <label
-                v-if="device.children.length > 0 && selectedDevices.has(device.path)"
-                class="wipe-checkbox"
-              >
-                <input
-                  type="checkbox"
-                  :checked="wipeDevices.has(device.path)"
-                  @change="toggleWipe(device.path)"
-                />
-                <span class="wipe-label">Wipe</span>
-              </label>
-            </div>
+              <input
+                type="checkbox"
+                :checked="wipeDevices.has(device.path)"
+                @change="toggleWipe(device.path)"
+              />
+              <span>Wipe</span>
+            </label>
           </div>
         </div>
-        <div class="modal-footer">
-          <button @click="closeModal" class="cancel-btn">Cancel</button>
+        <div class="modal-actions">
+          <button type="button" class="btn" @click="closeModal">Cancel</button>
           <button
-            @click="createVolumes"
+            type="button"
+            class="btn primary"
             :disabled="!canCreateVolumes || creatingVolumes"
-            class="create-btn"
+            @click="createVolumes"
           >
             {{ creatingVolumes ? 'Creating...' : `Create ${selectedDevices.size} Volume${selectedDevices.size !== 1 ? 's' : ''}` }}
           </button>
@@ -3320,161 +3524,167 @@ onUnmounted(() => {
     <div
       v-if="contextMenu.volumeId !== null"
       ref="contextMenuEl"
-      class="context-menu"
+      class="menu"
+      role="menu"
       :style="{ top: `${contextMenu.y}px`, left: `${contextMenu.x}px` }"
       @click.stop
     >
-      <div class="context-menu-item" @click="openEditLabelModal">Edit Label</div>
-      <div class="context-menu-item" @click="openEditCommentModal">Edit Comment</div>
-      <div
-        v-if="contextMenuVolume"
-        class="context-menu-item"
-        @click="toggleVolumeReadOnly"
-      >
-        {{ contextMenuVolume.isReadOnly ? 'Clear Read-Only' : 'Set Read-Only' }}
-      </div>
-      <div
-        v-if="contextMenuVolume"
-        class="context-menu-item"
-        @click="toggleVolumeEnabled"
-      >
-        {{ contextMenuVolume.isEnabled ? 'Disable' : 'Enable' }}
-      </div>
-      <div
-        v-if="contextMenuVolume"
-        class="context-menu-item"
-        @click="toggleVolumeDrain"
-      >
-        {{ contextMenuVolume.isDraining ? 'Cancel Drain' : 'Drain (read-only + offload)' }}
-      </div>
-      <!-- Only offered on a plaintext volume: encrypting REBUILDS the disk, so the server refuses unless it
-           has already been drained. Shown regardless, so the refusal explains itself rather than the action
-           simply not being there. -->
-      <div
-        v-if="contextMenuVolume && !contextMenuVolume.isEncrypted"
-        class="context-menu-item"
-        @click="encryptVolume"
-      >
-        Encrypt (wipe + rebuild, drained only)
-      </div>
-      <div
-        v-if="contextMenuVolume"
-        class="context-menu-item"
-        @click="openIdentify"
-      >
-        Identify (flash LED)
-      </div>
-      <div
-        v-if="contextMenuVolume"
-        class="context-menu-item"
-        @click="openSmart"
-      >
-        View SMART Data
-      </div>
-      <div class="context-menu-item delete" @click="deleteVolume">Delete</div>
+      <button type="button" class="menu-item" role="menuitem" @click="openEditLabelModal">
+        <i class="fa-solid fa-tag" aria-hidden="true"></i> Edit Label
+      </button>
+      <button type="button" class="menu-item" role="menuitem" @click="openEditCommentModal">
+        <i class="fa-solid fa-comment" aria-hidden="true"></i> Edit Comment
+      </button>
+      <template v-if="contextMenuVolume">
+        <div class="menu-separator" role="separator"></div>
+        <button type="button" class="menu-item" role="menuitem" @click="toggleVolumeReadOnly">
+          <i class="fa-solid fa-eye" aria-hidden="true"></i>
+          {{ contextMenuVolume.isReadOnly ? 'Clear Read-Only' : 'Set Read-Only' }}
+        </button>
+        <button type="button" class="menu-item" role="menuitem" @click="toggleVolumeEnabled">
+          <i class="fa-solid fa-power-off" aria-hidden="true"></i>
+          {{ contextMenuVolume.isEnabled ? 'Disable' : 'Enable' }}
+        </button>
+        <button type="button" class="menu-item" role="menuitem" @click="toggleVolumeDrain">
+          <i class="fa-solid fa-arrow-right-from-bracket" aria-hidden="true"></i>
+          {{ contextMenuVolume.isDraining ? 'Cancel Drain' : 'Drain (read-only + offload)' }}
+        </button>
+        <!-- Only offered on a plaintext volume: encrypting REBUILDS the disk, so the server refuses unless it
+             has already been drained. Shown regardless, so the refusal explains itself rather than the action
+             simply not being there. -->
+        <button
+          v-if="!contextMenuVolume.isEncrypted"
+          type="button"
+          class="menu-item"
+          role="menuitem"
+          @click="encryptVolume"
+        >
+          <i class="fa-solid fa-lock" aria-hidden="true"></i> Encrypt (wipe + rebuild, drained only)
+        </button>
+        <div class="menu-separator" role="separator"></div>
+        <button type="button" class="menu-item" role="menuitem" @click="openIdentify">
+          <i class="fa-solid fa-lightbulb" aria-hidden="true"></i> Identify (flash LED)
+        </button>
+        <button type="button" class="menu-item" role="menuitem" @click="openSmart">
+          <i class="fa-solid fa-heart-pulse" aria-hidden="true"></i> View SMART Data
+        </button>
+      </template>
+      <div class="menu-separator" role="separator"></div>
+      <button type="button" class="menu-item danger" role="menuitem" @click="deleteVolume">
+        <i class="fa-solid fa-trash" aria-hidden="true"></i> Delete
+      </button>
     </div>
 
     <!-- Identify Drive Modal: flashing LED indicator + stop -->
-    <div v-if="identifyDrive !== null" class="modal-overlay" @click="stopIdentify">
-      <div class="modal identify-modal" @click.stop style="max-width: 420px;">
-        <div class="modal-header">
-          <h2>Identify Drive</h2>
-          <button @click="stopIdentify" class="close-btn">&times;</button>
+    <div v-if="identifyDrive !== null" class="modal-scrim" @click="stopIdentify">
+      <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="identify-title" @click.stop>
+        <div class="modal-head">
+          <h2 id="identify-title">Identify Drive</h2>
+          <button type="button" class="btn ghost icon" aria-label="Close" @click="stopIdentify">
+            <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+          </button>
         </div>
-        <div class="modal-body">
-          <div class="identify-status">
-            <span class="identify-blink" aria-hidden="true"></span>
-            <div>
-              <div class="identify-line">
-                Flashing volume <strong>{{ identifyDrive.volumeId }}</strong><span v-if="identifyDrive.device"> (<code>{{ identifyDrive.device }}</code>)</span>
-              </div>
-              <div class="identify-hint">Watch the drive bays for the flashing activity LED. Reads are read-only and stop automatically a few seconds after you close this.</div>
+        <div class="identify-status">
+          <span class="identify-blink" aria-hidden="true"></span>
+          <div>
+            <div class="identify-line">
+              Flashing volume <strong>{{ identifyDrive.volumeId }}</strong><span v-if="identifyDrive.device"> (<code>{{ identifyDrive.device }}</code>)</span>
             </div>
+            <div class="hint">Watch the drive bays for the flashing activity LED. Reads are read-only and stop automatically a few seconds after you close this.</div>
           </div>
         </div>
-        <div class="modal-footer">
-          <button @click="stopIdentify" class="create-btn">Stop</button>
+        <div class="modal-actions">
+          <button type="button" class="btn primary" @click="stopIdentify">Stop</button>
         </div>
       </div>
     </div>
 
     <!-- SMART Data Modal -->
-    <div v-if="smartModal !== null" class="modal-overlay" @click="closeSmart">
-      <div class="modal" @click.stop style="max-width: 560px;">
-        <div class="modal-header">
-          <h2>SMART Data — Volume {{ smartModal.volumeId }}</h2>
-          <button @click="closeSmart" class="close-btn">&times;</button>
+    <div v-if="smartModal !== null" class="modal-scrim" @click="closeSmart">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="smart-title" @click.stop>
+        <div class="modal-head">
+          <h2 id="smart-title">SMART Data — Volume {{ smartModal.volumeId }}</h2>
+          <button type="button" class="btn ghost icon" aria-label="Close" @click="closeSmart">
+            <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+          </button>
         </div>
-        <div class="modal-body">
-          <div v-if="smartModal.loading" class="smart-note">Loading…</div>
-          <div v-else-if="smartModal.error" class="smart-note smart-error">{{ smartModal.error }}</div>
-          <div v-else-if="!smartModal.data || smartModal.data.summary.isSupported === false" class="smart-note">
-            SMART is not available for this drive.
-          </div>
-          <div v-else>
-            <div class="smart-summary">
-              <div class="smart-row">
-                <span class="smart-label">Health</span>
+        <div v-if="smartModal.loading" class="loader sm" role="status" aria-label="Loading">
+          <i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i>
+        </div>
+        <div v-else-if="smartModal.error" class="notice danger">
+          <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+          <div class="notice-body">{{ smartModal.error }}</div>
+        </div>
+        <p v-else-if="!smartModal.data || smartModal.data.summary.isSupported === false" class="hint">
+          SMART is not available for this drive.
+        </p>
+        <template v-else>
+          <dl class="kv boxed">
+            <div>
+              <dt>Health</dt>
+              <dd>
                 <span
-                  class="smart-value smart-health"
-                  :class="smartModal.data.summary.isHealthy === false ? 'bad' : (smartModal.data.summary.isHealthy ? 'good' : '')"
+                  class="tag"
+                  :class="smartModal.data.summary.isHealthy === false ? 'danger' : (smartModal.data.summary.isHealthy ? 'success' : 'neutral')"
                 >{{ smartModal.data.summary.isHealthy === null ? 'Unknown' : (smartModal.data.summary.isHealthy ? 'PASSED' : 'FAILED') }}</span>
-              </div>
-              <div class="smart-row">
-                <span class="smart-label">Temperature</span>
-                <span class="smart-value">{{ smartModal.data.summary.temperatureC !== null ? smartModal.data.summary.temperatureC + ' °C' : '—' }}</span>
-              </div>
-              <div class="smart-row">
-                <span class="smart-label">Power-on hours</span>
-                <span class="smart-value">{{ smartModal.data.summary.powerOnHours !== null ? smartModal.data.summary.powerOnHours.toLocaleString() : '—' }}</span>
-              </div>
-              <div class="smart-row">
-                <span class="smart-label">Last updated</span>
-                <span class="smart-value">{{ smartModal.data.summary.updatedAt ?? '—' }}</span>
-              </div>
-              <div v-if="smartModal.data.summary.error" class="smart-row">
-                <span class="smart-label">Error</span>
-                <span class="smart-value smart-error">{{ smartModal.data.summary.error }}</span>
-              </div>
-              <div v-if="smartModal.data.summary.statusFlags.length" class="smart-row">
-                <span class="smart-label">Flags</span>
-                <span class="smart-value">
-                  <span v-for="flag in smartModal.data.summary.statusFlags" :key="flag" class="smart-flag">{{ flag }}</span>
-                </span>
-              </div>
+              </dd>
             </div>
-            <details v-if="smartModal.data.details" class="smart-details">
-              <summary>Raw smartctl output</summary>
-              <pre class="smart-raw">{{ JSON.stringify(smartModal.data.details, null, 2) }}</pre>
-            </details>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button @click="closeSmart" class="create-btn">Close</button>
+            <div>
+              <dt>Temperature</dt>
+              <dd>{{ smartModal.data.summary.temperatureC !== null ? smartModal.data.summary.temperatureC + ' °C' : '—' }}</dd>
+            </div>
+            <div>
+              <dt>Power-on hours</dt>
+              <dd>{{ smartModal.data.summary.powerOnHours !== null ? smartModal.data.summary.powerOnHours.toLocaleString() : '—' }}</dd>
+            </div>
+            <div>
+              <dt>Last updated</dt>
+              <dd>{{ smartModal.data.summary.updatedAt ?? '—' }}</dd>
+            </div>
+            <div v-if="smartModal.data.summary.error">
+              <dt>Error</dt>
+              <dd class="text-danger">{{ smartModal.data.summary.error }}</dd>
+            </div>
+            <div v-if="smartModal.data.summary.statusFlags.length">
+              <dt>Flags</dt>
+              <dd class="status-cell">
+                <span v-for="flag in smartModal.data.summary.statusFlags" :key="flag" class="tag warning">{{ flag }}</span>
+              </dd>
+            </div>
+          </dl>
+          <details v-if="smartModal.data.details" class="smart-details">
+            <summary>Raw smartctl output</summary>
+            <pre><code>{{ JSON.stringify(smartModal.data.details, null, 2) }}</code></pre>
+          </details>
+        </template>
+        <div class="modal-actions">
+          <button type="button" class="btn" @click="closeSmart">Close</button>
         </div>
       </div>
     </div>
 
     <!-- Edit Label Modal -->
-    <div v-if="showEditLabelModal" class="modal-overlay" @click="closeEditLabelModal">
-      <div class="modal" @click.stop style="max-width: 400px;">
-        <div class="modal-header">
-          <h2>Edit Label</h2>
-          <button @click="closeEditLabelModal" class="close-btn">&times;</button>
+    <div v-if="showEditLabelModal" class="modal-scrim" @click="closeEditLabelModal">
+      <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="edit-label-title" @click.stop>
+        <div class="modal-head">
+          <h2 id="edit-label-title">Edit Label</h2>
+          <button type="button" class="btn ghost icon" aria-label="Close" @click="closeEditLabelModal">
+            <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+          </button>
         </div>
-        <div class="modal-body">
-          <label class="form-label">Volume Label</label>
+        <label class="field">
+          Volume Label
           <input
             v-model="editLabelValue"
             type="text"
-            class="form-input"
+            class="input"
             placeholder="Enter label (optional)"
             @keyup.enter="saveLabel"
           />
-        </div>
-        <div class="modal-footer">
-          <button @click="closeEditLabelModal" class="cancel-btn" :disabled="savingLabel">Cancel</button>
-          <button @click="saveLabel" class="create-btn" :disabled="savingLabel">
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="btn" :disabled="savingLabel" @click="closeEditLabelModal">Cancel</button>
+          <button type="button" class="btn primary" :disabled="savingLabel" @click="saveLabel">
             {{ savingLabel ? 'Saving...' : 'Save' }}
           </button>
         </div>
@@ -3482,24 +3692,26 @@ onUnmounted(() => {
     </div>
 
     <!-- Edit Comment Modal -->
-    <div v-if="showEditCommentModal" class="modal-overlay" @click="closeEditCommentModal">
-      <div class="modal" @click.stop style="max-width: 400px;">
-        <div class="modal-header">
-          <h2>Edit Comment</h2>
-          <button @click="closeEditCommentModal" class="close-btn">&times;</button>
+    <div v-if="showEditCommentModal" class="modal-scrim" @click="closeEditCommentModal">
+      <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="edit-comment-title" @click.stop>
+        <div class="modal-head">
+          <h2 id="edit-comment-title">Edit Comment</h2>
+          <button type="button" class="btn ghost icon" aria-label="Close" @click="closeEditCommentModal">
+            <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+          </button>
         </div>
-        <div class="modal-body">
-          <label class="form-label">Volume Comment</label>
+        <label class="field">
+          Volume Comment
           <textarea
             v-model="editCommentValue"
-            class="form-input"
+            class="input"
             rows="4"
             placeholder="Enter comment (optional)"
           ></textarea>
-        </div>
-        <div class="modal-footer">
-          <button @click="closeEditCommentModal" class="cancel-btn" :disabled="savingComment">Cancel</button>
-          <button @click="saveComment" class="create-btn" :disabled="savingComment">
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="btn" :disabled="savingComment" @click="closeEditCommentModal">Cancel</button>
+          <button type="button" class="btn primary" :disabled="savingComment" @click="saveComment">
             {{ savingComment ? 'Saving...' : 'Save' }}
           </button>
         </div>
@@ -3508,1356 +3720,451 @@ onUnmounted(() => {
   </div>
 </template>
 
-<style scoped>
-.auth-loading {
-  display: flex; align-items: center; justify-content: center;
-  min-height: 60vh; color: #888; font-size: 15px;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+<style scoped lang="scss">
+// Screen-specific pieces. Shared primitives (buttons, tags, notices, cards, tables, modal, menu, toggle,
+// segmented control) live in styles/base.scss and styles/strubs.scss; everything here uses their tokens.
+
+.capitalize {
+  text-transform: capitalize;
 }
 
-.login-screen {
-  display: flex; align-items: center; justify-content: center;
-  min-height: 80vh; padding: 20px;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-}
-.login-card {
-  display: flex; flex-direction: column; gap: 14px;
-  width: 320px; max-width: 100%; padding: 32px;
-  border: 1px solid #e0e0e0; border-radius: 10px;
-  box-shadow: 0 2px 12px rgba(0,0,0,0.06); background: #fff;
-}
-.login-card h1 { margin: 0; font-size: 22px; text-align: center; }
-.login-sub { margin: -6px 0 6px; text-align: center; color: #888; font-size: 13px; }
-.login-card input {
-  padding: 10px 12px; font-size: 15px;
-  border: 1px solid #ccc; border-radius: 6px;
-}
-.login-card button {
-  padding: 10px; font-size: 15px; font-weight: 600; color: #fff;
-  background: #1565c0; border: none; border-radius: 6px; cursor: pointer;
-}
-.login-card button:disabled { opacity: 0.6; cursor: default; }
-.login-error { margin: 0; color: #c62828; font-size: 13px; text-align: center; }
-
-.logout-btn {
-  padding: 6px 12px; font-size: 13px; font-weight: 600;
-  color: #555; background: #f2f2f2; border: 1px solid #ddd;
-  border-radius: 6px; cursor: pointer;
-}
-.logout-btn:hover { background: #e8e8e8; }
-
-.container {
-  /* The tab bar stays put and the page under it scrolls. dvh, not vh: on a phone the browser chrome slides away
-     and 100vh is then taller than the screen, which hides the bottom of the scroller behind the URL bar. */
-  height: 100dvh;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-
-  width: 100%;
-  margin: 0 auto;
-  padding: 20px;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-  box-sizing: border-box;
+.warning-text {
+  color: var(--warning);
 }
 
-/* min-height:0 is the whole trick. A flex item's default min-height is auto -- it refuses to shrink below its
-   content -- so without this the body grows to fit the volume list, pushes the container past the viewport, and
-   the WINDOW scrolls (taking the tabs with it) instead of this box. */
-.tab-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-}
-
-header, .main-tabs, .container > .error {
-  flex: 0 0 auto;
-}
-
-header {
-  margin-bottom: 15px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-}
-
-h1 {
-  font-size: 28px;
-  font-weight: 600;
-  margin: 0;
-  color: #333;
-}
-
-h2 {
-  font-size: 20px;
-  font-weight: 600;
-  margin-bottom: 15px;
-  color: #555;
-}
-
-.controls {
-  margin-bottom: 20px;
-  display: flex;
-  gap: 10px;
-  justify-content: center;
-}
-
-.refresh-btn, .add-btn, .freeze-btn, .unfreeze-btn {
-  padding: 6px 14px;
-  color: white;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
+.mono-cell {
+  font-family: var(--font-mono);
   font-size: 12px;
-  font-weight: 500;
-}
-
-.refresh-btn {
-  background-color: #2196F3;
-}
-
-.refresh-btn:hover:not(:disabled) {
-  background-color: #1976D2;
-}
-
-.refresh-btn:disabled, .add-btn:disabled, .freeze-btn:disabled, .unfreeze-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.add-btn {
-  background-color: #4caf50;
-}
-
-.add-btn:hover:not(:disabled) {
-  background-color: #45a049;
-}
-
-/* --- maintenance freeze --- */
-.freeze-pill {
-  font-size: 12px;
-  font-weight: 600;
-  padding: 3px 10px;
-  border-radius: 999px;
   white-space: nowrap;
 }
-.freeze-pill.frozen {
-  background-color: #e1f5fe;
-  color: #0277bd;
-  border: 1px solid #4fc3f7;
-}
-.freeze-pill.active {
-  background-color: #e8f5e9;
-  color: #2e7d32;
-  border: 1px solid #81c784;
-}
-.freeze-banner {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
-  margin-bottom: 15px;
-  padding: 10px 16px;
-  background-color: #e1f5fe;
-  border: 1px solid #4fc3f7;
-  border-radius: 6px;
-  color: #01579b;
-  font-size: 13px;
-}
-.freeze-btn {
-  background-color: #ff9800;
-}
-.freeze-btn:hover:not(:disabled) {
-  background-color: #f57c00;
-}
-.unfreeze-btn {
-  background-color: #0288d1;
-}
-.unfreeze-btn:hover:not(:disabled) {
-  background-color: #0277bd;
-}
 
-.section {
-  margin-bottom: 40px;
-  width: 100%;
-}
-
-.section-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 15px;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
-.section-header h2 {
-  margin-bottom: 0;
-}
-
-.sort-controls {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.sort-label {
-  font-size: 14px;
-  font-weight: 500;
-  color: #666;
-}
-
-.sort-select {
-  padding: 6px 12px;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  font-size: 14px;
-  background-color: white;
-  cursor: pointer;
-  color: #333;
-  font-family: inherit;
-}
-
-.sort-select:focus {
-  outline: none;
-  border-color: #2196F3;
-}
-
-.sort-select:hover {
-  border-color: #bbb;
-}
-
-.error {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  background-color: #ffebee;
-  color: #c62828;
-  padding: 15px;
-  border-radius: 4px;
-  margin-bottom: 20px;
-}
-
-/* It is PINNED now -- it does not scroll away like it used to, so it needs a way out. */
-.error-dismiss {
-  flex: 0 0 auto;
-  background: none;
-  border: none;
-  color: inherit;
-  cursor: pointer;
-  font-size: 22px;
-  line-height: 1;
-  padding: 0 4px;
-  opacity: 0.6;
-}
-
-.error-dismiss:hover {
-  opacity: 1;
-}
-
-.loading {
-  text-align: center;
-  padding: 40px;
-  font-size: 18px;
-  color: #666;
-}
-
-.devices-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 15px;
-  width: 100%;
-}
-
-.device-card {
-  border: 2px solid #ddd;
-  border-radius: 8px;
-  overflow: hidden;
-  background-color: white;
-  transition: opacity 0.3s, box-shadow 0.3s;
-  min-width: 0;
-}
-
-.device-card:hover {
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-}
-
-.device-card.offline {
-  border-style: dashed;
-}
-
-/* Title + badges stack on the left; the action button sits alone on the right, AFTER them. The badges
-   previously shared a wrapping flex row with the title and the button, so a card with several badges
-   wrapped into a mess. */
-.device-header {
-  padding: 15px 20px;
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  color: white;
+.name-cell {
   font-weight: 600;
 }
 
-.device-head-main {
+.status-cell,
+.row-actions {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;          /* let a long name ellipsize rather than push the button off */
-}
-
-.device-name {
-  font-size: 18px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.label-prefix {
-  background-color: rgba(255, 255, 255, 0.2);
-  padding: 4px 10px;
-  border-radius: 8px;
-  font-size: 14px;
-  font-weight: 700;
-}
-
-.device-badges {
-  display: flex;
-  gap: 6px;
   align-items: center;
   flex-wrap: wrap;
-}
-
-.header-badges {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-.badge {
-  background-color: rgba(0, 0, 0, 0.3);
-  padding: 4px 12px;
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.offline-badge {
-  background-color: rgba(0, 0, 0, 0.5);
-}
-
-.device-body {
-  padding: 20px;
-}
-
-.device-info {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.info-row {
-  display: flex;
-  justify-content: space-between;
-  padding: 8px 0;
-  border-bottom: 1px solid #f0f0f0;
-}
-
-.info-row .label {
-  font-weight: 600;
-  color: #666;
-  margin-right: 10px;
-}
-
-.info-row .value {
-  color: #333;
-  text-align: right;
-  word-break: break-word;
-}
-
-.info-row .value.small {
-  font-size: 12px;
-  font-family: monospace;
-}
-
-.error-text {
-  color: #f44336;
-  font-weight: 700;
-}
-
-/* Verify Panel */
-.verify-panel {
-  border: 1px solid #e0e0e0;
-  border-radius: 8px;
-  padding: 20px;
-  background-color: #fafafa;
-  box-sizing: border-box;
-}
-
-.verify-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.maintenance-summary {
-  cursor: pointer;
-  user-select: none;
-  margin-bottom: 0;
-}
-
-.collapse-chevron {
-  font-size: 32px;
-  line-height: 1;
-  color: #666;
-  width: 18px;
-  display: inline-block;
-}
-
-.verify-subheader {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 10px;
-  margin: 14px 0 6px;
-  padding-top: 12px;
-  border-top: 1px solid #eee;
-}
-
-.verify-subheader h3 {
-  margin: 0;
-  font-size: 15px;
-  color: #555;
-}
-
-/* Keeps a status pill hugging its heading instead of drifting into the middle of the
-   space-between subheader. */
-.subheader-title {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.verify-title {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.verify-title h2 {
-  margin: 0;
-}
-
-.verify-state {
-  padding: 3px 12px;
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: 700;
-  color: white;
-}
-
-.verify-state.running {
-  background-color: #4caf50;
-}
-
-.verify-state.idle {
-  background-color: #9e9e9e;
-}
-
-.verify-actions {
-  display: flex;
-  gap: 10px;
-}
-
-.verify-start-btn, .verify-stop-btn {
-  padding: 6px 14px;
-  color: white;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 500;
-}
-
-.verify-start-btn {
-  background-color: #4caf50;
-}
-
-.verify-start-btn:hover:not(:disabled) {
-  background-color: #45a049;
-}
-
-.verify-stop-btn {
-  background-color: #f44336;
-}
-
-.verify-stop-btn:hover:not(:disabled) {
-  background-color: #d32f2f;
-}
-
-.verify-start-btn:disabled, .verify-stop-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.verify-stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 12px;
-}
-
-.verify-stat {
-  display: flex;
-  flex-direction: column;
   gap: 4px;
 }
 
-.verify-stat-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: #888;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
+.row-actions {
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
-.verify-stat-value {
-  font-size: 16px;
-  color: #333;
+// ---- Maintenance ----
+
+.concurrency-input {
+  width: 64px;
+  padding-right: 4px;
   font-weight: 600;
 }
 
-.verify-volume-errors {
+.progress {
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid #eee;
+  flex-direction: column;
+  gap: 6px;
 }
 
-.verify-targets {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid #eee;
+.row-chevron {
+  width: 12px;
+  margin-right: 6px;
+  color: var(--text-3);
+  font-size: 10px;
 }
 
-.verify-target-badge {
-  background-color: #e3f2fd;
-  color: #1565c0;
-  padding: 3px 10px;
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.verify-volume-badge {
-  background-color: #ffebee;
-  color: #c62828;
-  padding: 3px 10px;
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-/* Verify run history */
-.run-history-table-wrap {
-  overflow-x: auto;
-}
-
-.run-history-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-}
-
-.run-history-table th {
-  text-align: left;
-  padding: 6px 10px;
-  font-size: 11px;
-  font-weight: 600;
-  color: #888;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  border-bottom: 1px solid #e0e0e0;
-}
-
-.run-history-table td {
-  padding: 6px 10px;
-  color: #333;
-  border-bottom: 1px solid #eee;
-}
-
-.run-row {
-  cursor: pointer;
-}
-
-.run-row:hover {
-  background-color: #f0f0f0;
-}
-
-.run-detail-row td {
-  background-color: #f5f5f5;
-  padding: 12px 10px;
+.run-detail-row > td {
+  background: var(--surface-2);
 }
 
 .run-detail {
   display: flex;
   flex-wrap: wrap;
-  gap: 16px;
-}
-
-.run-detail-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  gap: 12px 28px;
+  padding: 4px 0 4px 18px;
 }
 
 .run-detail-trigger {
   flex: 1 1 260px;
 }
 
-.run-trigger-badge {
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-size: 11px;
-  font-weight: 700;
-  color: white;
-  white-space: nowrap;
-}
+// ---- Volumes ----
 
-.run-trigger-badge.fault {
-  background-color: #e64a19;
-}
-
-.run-trigger-badge.manual {
-  background-color: #1565c0;
-}
-
-.run-trigger-badge.scheduled {
-  background-color: #757575;
-}
-
-.run-status-badge {
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-size: 11px;
-  font-weight: 700;
-  color: white;
-  white-space: nowrap;
-  text-transform: capitalize;
-}
-
-.run-status-badge.running {
-  background-color: #4caf50;
-}
-
-.run-status-badge.completed {
-  background-color: #5c6bc0;
-}
-
-.run-status-badge.stopped {
-  background-color: #f9a825;
-}
-
-/* Rebalance */
-.concurrency-control {
+.toolbar {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-right: 4px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
-.concurrency-input {
-  width: 56px;
-  padding: 4px 6px;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-  font-size: 13px;
-  font-weight: 600;
-  color: #333;
+.volumes-table td {
+  white-space: nowrap;
+
+  .status-cell {
+    flex-wrap: nowrap;
+  }
 }
 
-.concurrency-input:disabled {
-  opacity: 0.6;
-}
-
-/* A verify held back until the rebalance releases the disks. */
-.verify-waiting-pill {
-  background-color: #fff3e0;
-  color: #e65100;
-  padding: 3px 10px;
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.rebalance-progress {
-  margin-top: 16px;
-}
-
-.rebalance-bar {
-  width: 100%;
-  height: 8px;
-  background-color: #eee;
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.rebalance-bar-fill {
-  height: 100%;
-  background-color: #1565c0;
-  border-radius: 4px;
-  transition: width 0.6s ease;
-}
-
-.rebalance-progress-label {
-  display: block;
-  margin-top: 6px;
-  font-size: 12px;
-  color: #666;
-}
-
-.rebalance-submetric {
-  font-size: 12px;
-  font-weight: 400;
-  color: #888;
-}
-
-/* The source currently being drained, among the over-target volumes. */
-.rebalance-active-source {
-  background-color: #1565c0;
-  color: #fff;
-}
-
-/* Storage Panel */
-.storage-panel {
-  border: 1px solid #e0e0e0;
-  border-radius: 8px;
-  padding: 20px;
-  background-color: #fafafa;
-  box-sizing: border-box;
-}
-
-.storage-updated {
-  color: #777;
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.storage-tabs {
-  display: flex;
-  gap: 4px;
-  margin-bottom: 18px;
-  border-bottom: 1px solid #e0e0e0;
-}
-
-.storage-tab {
-  padding: 8px 16px;
-  border: none;
-  background: none;
-  cursor: pointer;
-  font-size: 14px;
-  font-weight: 600;
-  color: #888;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  font-family: inherit;
-}
-
-.storage-tab:hover {
-  color: #555;
-}
-
-.storage-tab.active {
-  color: #2196F3;
-  border-bottom-color: #2196F3;
-}
-
-/* Volume id + group.index label cell */
 .vol-id-cell {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.vol-id-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 28px;
-  padding: 2px 8px;
-  border-radius: 6px;
-  color: white;
-  font-weight: 700;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-}
-
 .vol-group-label {
-  background-color: #eceff1;
-  color: #555;
-  padding: 2px 8px;
-  border-radius: 10px;
+  color: var(--text-2);
+  font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 600;
-  font-variant-numeric: tabular-nums;
 }
 
-.vol-unassigned-badge {
-  display: inline-flex;
-  align-items: center;
-  background-color: #eceff1;
-  color: #888;
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-
-/* Non-volumed drives are visually muted and pinned to the bottom of the list */
-.storage-table tr.storage-row-unassigned td {
-  color: #999;
-}
-
-.storage-table tr.storage-row-unassigned td.device-cell {
-  color: #999;
-}
-
-.storage-stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 12px;
-}
-
-.storage-stat {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.storage-stat-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: #888;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-
-.storage-stat-value {
-  font-size: 16px;
-  color: #333;
-  font-weight: 600;
-}
-
-.storage-table-wrap {
-  overflow-x: auto;
-  margin-top: 18px;
-}
-
-.storage-table {
-  width: 100%;
-  border-collapse: collapse;
-  min-width: 860px;
-}
-
-.storage-table th,
-.storage-table td {
-  border-bottom: 1px solid #e8e8e8;
-  padding: 10px 8px;
-  text-align: right;
-  white-space: nowrap;
-}
-
-.storage-table th:first-child,
-.storage-table td:first-child {
-  text-align: left;
-}
-
-.storage-table th {
-  color: #666;
-  font-size: 12px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-
-.storage-table td {
-  color: #333;
-  font-size: 14px;
-}
-
-.storage-table td.device-cell {
-  text-align: left;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  color: #555;
-}
-
-.storage-table td.comment-cell {
-  text-align: left;
-  max-width: 200px;
-}
-
-.comment-cell .comment-text {
-  display: block;
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: #777;
-  font-size: 13px;
-}
-
-.comment-value {
-  display: inline-block;
+.data-table td.comment-cell {
   max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
-  vertical-align: bottom;
 }
 
-.fullness-cell {
-  min-width: 150px;
+.comment-text {
+  display: block;
+  overflow: hidden;
+  color: var(--text-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .fullness {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
   gap: 8px;
+
+  .bar {
+    flex: 1 1 auto;
+    min-width: 64px;
+  }
 }
 
-.fullness-bar {
-  position: relative;
-  flex: 1;
-  max-width: 110px;
-  height: 8px;
-  background-color: #e8e8e8;
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.fullness-fill {
-  height: 100%;
-  border-radius: 4px;
-  transition: width 0.3s ease;
-}
-
-.fullness-ok .fullness-fill {
-  background-color: #2e9e5b;
-}
-
-.fullness-warn .fullness-fill {
-  background-color: #d9a400;
-}
-
-.fullness-critical .fullness-fill {
-  background-color: #d64545;
+.fullness-cell {
+  min-width: 130px;
 }
 
 .fullness-label {
-  min-width: 36px;
+  min-width: 32px;
+  color: var(--text-2);
+  font-size: 12px;
   text-align: right;
-  font-variant-numeric: tabular-nums;
-  color: #333;
 }
 
-.fullness-unknown {
-  color: #999;
+.data-table .actions-col {
+  width: 1%;
+  padding-left: 4px;
+  text-align: right;
 }
 
-/* Volumes view: shared toolbar + view toggle */
-.volumes-view {
-  margin-top: 18px;
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
 }
 
-.volumes-toolbar {
+.tile {
   display: flex;
+  flex-direction: column;
+
+  &.offline {
+    border-style: dashed;
+    border-color: var(--border-strong);
+  }
+
+  &.unassigned {
+    opacity: 0.6;
+  }
+}
+
+.tile-head {
+  display: flex;
+  align-items: flex-start;
   justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
   gap: 12px;
-  margin-bottom: 12px;
+  padding: 14px 18px 12px;
+  border-bottom: 1px solid var(--border);
 }
 
-.view-toggle {
-  display: inline-flex;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  overflow: hidden;
-  background-color: white;
-}
-
-.view-toggle-btn {
-  padding: 6px 16px;
-  border: none;
-  background: none;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 600;
-  color: #666;
-  font-family: inherit;
-}
-
-.view-toggle-btn + .view-toggle-btn {
-  border-left: 1px solid #ddd;
-}
-
-.view-toggle-btn:hover {
-  background-color: #f5f5f5;
-}
-
-.view-toggle-btn.active {
-  background-color: #2196F3;
-  color: white;
-}
-
-.volumes-empty,
-.storage-empty {
-  color: #888;
-  font-size: 14px;
-  padding: 16px 0;
-}
-
-/* Sortable table headers */
-.storage-table th.sortable {
-  cursor: pointer;
-  user-select: none;
-}
-
-.storage-table th.sortable:hover {
-  color: #2196F3;
-}
-
-.storage-table th.sort-active {
-  color: #2196F3;
-}
-
-.sort-arrow {
-  margin-left: 4px;
-  font-size: 10px;
-}
-
-/* Status badges (table view) */
-.status-cell {
+.tile-head-main {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  justify-content: flex-end;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
 }
 
-.state-badge {
-  padding: 2px 7px;
-  border-radius: 10px;
-  font-size: 11px;
-  font-weight: 700;
-  color: white;
+.tile-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tile-title {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.state-badge.ro {
-  background-color: #f9a825;
-}
-
-.state-badge.disabled {
-  background-color: #757575;
-}
-
-.state-badge.offline {
-  background-color: #f44336;
-}
-
-.state-badge.draining {
-  background-color: #26a69a;
-}
-
-.state-badge.encrypted {
-  background-color: #5c6bc0;
-}
-
-.state-badge.err {
-  background-color: #ff9800;
-}
-
-.state-muted {
-  color: #bbb;
-}
-
-/* Per-row / per-tile action buttons */
-.actions-col {
-  width: 36px;
-  text-align: center !important;
-}
-
-.row-action-btn {
-  border: none;
-  background: none;
-  cursor: pointer;
-  font-size: 18px;
-  line-height: 1;
-  color: #888;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: inherit;
-}
-
-.row-action-btn:hover {
-  background-color: #f0f0f0;
-  color: #333;
-}
-
-.tile-action-btn {
-  border: none;
-  background-color: rgba(0, 0, 0, 0.25);
-  cursor: pointer;
-  font-size: 16px;
-  line-height: 1;
-  color: white;
-  padding: 2px 8px;
-  border-radius: 12px;
-  font-weight: 700;
-  font-family: inherit;
-}
-
-.tile-action-btn:hover {
-  background-color: rgba(0, 0, 0, 0.45);
-}
-
-.ro-badge {
-  background-color: rgba(0, 0, 0, 0.4);
-}
-
-.draining-badge {
-  background-color: rgba(38, 166, 154, 0.85);
-}
-
-.encrypted-badge {
-  background-color: rgba(92, 107, 192, 0.85);
-}
-
-/* --- encryption coverage bar (Volumes tab) --- */
-.conversion-banner {
+.tile-tags {
   display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
-.conversion-spinner {
-  flex: 0 0 auto;
-  width: 14px;
-  height: 14px;
-  /* The track is the banner's own text colour, faded -- a white track would vanish into #fff8e1. */
-  border: 2px solid rgba(122, 91, 0, 0.22);
-  border-top-color: currentColor;
-  border-radius: 50%;
-  animation: conversion-spin 0.9s linear infinite;
-}
-
-@keyframes conversion-spin {
-  to { transform: rotate(360deg); }
-}
-
-.encryption-bar {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-  padding: 16px;
-  margin: 0 18px 12px;
-  background-color: #fff;
-  border: 1px solid #e0e0e0;
-  border-radius: 6px;
-}
-
-/* Each control is its own full-width row: label and explanation on the left, the switch on the right. They
-   used to wrap side-by-side because this bar sat above the volumes table and had to be short. It no longer does. */
-.encryption-default {
-  justify-content: space-between;
-}
-
-.encryption-default + .encryption-default {
-  border-top: 1px solid #f0f0f0;
-  padding-top: 18px;
-}
-
-/* Modal Styles */
-.modal-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background-color: rgba(0, 0, 0, 0.7);
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  z-index: 1000;
-}
-
-.modal {
-  background-color: white;
-  border-radius: 8px;
-  width: 90%;
-  max-width: 600px;
-  max-height: 80vh;
-  display: flex;
-  flex-direction: column;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-}
-
-.modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 20px;
-  border-bottom: 1px solid #e0e0e0;
-}
-
-.modal-header h2 {
+// Definition list: label left, value right, hairline between rows.
+.kv {
   margin: 0;
-  font-size: 20px;
+  padding: 4px 18px 8px;
+  font-size: 13px;
+
+  > div {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 36px;
+    padding: 6px 0;
+  }
+
+  > div + div {
+    border-top: 1px solid var(--border);
+  }
+
+  dt {
+    flex-shrink: 0;
+    color: var(--text-3);
+  }
+
+  dd {
+    min-width: 0;
+    margin: 0;
+    color: var(--text);
+    text-align: right;
+    overflow-wrap: anywhere;
+  }
+
+  dd.fullness {
+    flex: 0 1 180px;
+  }
+
+  dd.comment-text {
+    color: var(--text-2);
+  }
+
+  &.boxed {
+    padding: 2px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
 }
 
-.close-btn {
-  background: none;
-  border: none;
-  font-size: 28px;
-  cursor: pointer;
-  color: #666;
-  padding: 0;
-  width: 30px;
-  height: 30px;
+// ---- Buckets ----
+
+.breadcrumbs {
   display: flex;
   align-items: center;
-  justify-content: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-width: 0;
+  font-size: 13px;
 }
 
-.close-btn:hover {
-  color: #333;
+.crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--link);
+  font: inherit;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--surface-2);
+  }
+
+  &.current {
+    color: var(--text);
+    font-weight: 600;
+    cursor: default;
+
+    &:hover {
+      background: none;
+    }
+  }
+
+  i {
+    font-size: 11px;
+  }
 }
 
-.modal-body {
-  padding: 20px;
-  overflow-y: auto;
-  flex: 1;
+.crumb-sep {
+  color: var(--text-3);
+  font-size: 9px;
 }
 
-.no-devices {
+.entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.entry-icon {
+  width: 14px;
+  color: var(--text-3);
   text-align: center;
-  color: #666;
-  padding: 20px;
+
+  &.fa-folder {
+    color: var(--warning);
+  }
 }
 
-.device-list {
+.entry-folder,
+.bucket-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--link);
+  }
+}
+
+.bucket-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--link);
+  font-weight: 600;
+
+  i {
+    color: var(--warning);
+    font-size: 12px;
+  }
+
+  &:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+}
+
+// ---- Credentials ----
+
+.create-form {
   display: flex;
   flex-direction: column;
-  gap: 15px;
-}
-
-.modal-device-item {
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  padding: 12px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.modal-device-item:hover {
-  background-color: #f5f5f5;
-}
-
-.device-checkbox {
-  display: flex;
-  align-items: center;
   gap: 12px;
-  cursor: pointer;
-  flex: 1;
+
+  .field {
+    max-width: 520px;
+  }
 }
 
-.device-checkbox.disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+.grant-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
-.device-checkbox input[type="checkbox"] {
-  width: 18px;
-  height: 18px;
-  cursor: pointer;
+.grant-bucket {
+  flex: 1 1 200px;
+  max-width: 280px;
 }
 
-.device-info-modal {
-  flex: 1;
-}
-
-.device-name-modal {
-  font-weight: 600;
-  font-size: 16px;
-  margin-bottom: 4px;
-}
-
-.device-details {
-  font-size: 13px;
-  color: #666;
-}
-
-.partition-info {
-  font-size: 12px;
-  color: #ff9800;
-  margin-top: 4px;
+.add-grant {
+  align-self: flex-start;
   font-weight: 500;
 }
 
-.partition-error {
-  font-size: 12px;
-  color: #f44336;
-  margin-top: 4px;
-  font-weight: 600;
-}
-
-.wipe-checkbox {
+.form-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  background-color: #fff3e0;
-  border-radius: 4px;
-  cursor: pointer;
-  border: 1px solid #ff9800;
+  gap: 8px;
+  margin-top: 4px;
 }
 
-.wipe-checkbox input[type="checkbox"] {
-  width: 16px;
-  height: 16px;
-  cursor: pointer;
+// ---- Modals ----
+
+.device-list {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
 }
 
-.wipe-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: #ff9800;
-}
-
-.modal-footer {
+.device-option {
   display: flex;
-  justify-content: flex-end;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  transition: background-color 0.12s;
+
+  & + & {
+    border-top: 1px solid var(--border);
+  }
+
+  &:hover {
+    background: var(--surface-hover);
+  }
+
+  &.disabled {
+    opacity: 0.55;
+
+    .device-choice {
+      cursor: not-allowed;
+    }
+  }
+}
+
+.device-choice {
+  display: flex;
+  align-items: flex-start;
   gap: 10px;
-  padding: 20px;
-  border-top: 1px solid #e0e0e0;
+  min-width: 0;
+  cursor: pointer;
+
+  input {
+    margin-top: 2px;
+  }
+}
+
+.device-choice-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.device-choice-name {
+  font-weight: 600;
+}
+
+.device-note {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.wipe-check {
+  flex-shrink: 0;
+  color: var(--danger-strong);
+  font-weight: 500;
 }
 
 .identify-status {
@@ -4868,243 +4175,48 @@ h2 {
 
 .identify-blink {
   flex: 0 0 auto;
-  width: 16px;
-  height: 16px;
-  margin-top: 2px;
+  width: 14px;
+  height: 14px;
+  margin-top: 3px;
   border-radius: 50%;
-  background: #f44336;
-  box-shadow: 0 0 8px 2px rgba(244, 67, 54, 0.7);
+  background: var(--danger);
+  box-shadow: 0 0 0 4px var(--danger-soft);
   animation: identify-blink 1s steps(1, end) infinite;
 }
 
 @keyframes identify-blink {
-  50% { opacity: 0.15; box-shadow: none; }
+  50% {
+    opacity: 0.15;
+    box-shadow: none;
+  }
 }
 
-.identify-line { font-size: 15px; }
-.identify-line code { font-family: monospace; }
-
-.identify-hint {
-  margin-top: 6px;
-  font-size: 12px;
-  color: #888;
-  line-height: 1.4;
-}
-
-.cancel-btn, .create-btn {
-  padding: 10px 20px;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
+.identify-line {
+  margin-bottom: 4px;
   font-size: 14px;
-  font-weight: 500;
 }
 
-.cancel-btn {
-  background-color: #f5f5f5;
-  color: #333;
+.smart-details {
+  summary {
+    color: var(--link);
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  pre {
+    max-height: 300px;
+    margin-top: 8px;
+    overflow: auto;
+  }
 }
 
-.cancel-btn:hover {
-  background-color: #e0e0e0;
+@media (max-width: 640px) {
+  .tiles {
+    grid-template-columns: 1fr;
+  }
+
+  .toolbar {
+    align-items: stretch;
+  }
 }
-
-.create-btn {
-  background-color: #4caf50;
-  color: white;
-}
-
-.create-btn:hover:not(:disabled) {
-  background-color: #45a049;
-}
-
-.create-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-/* Context Menu */
-.context-menu {
-  position: fixed;
-  background-color: white;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
-  z-index: 2000;
-  min-width: 150px;
-}
-
-.context-menu-item {
-  padding: 10px 16px;
-  cursor: pointer;
-  font-size: 14px;
-  color: #333;
-  white-space: nowrap;
-}
-
-.context-menu-item:hover {
-  background-color: #f5f5f5;
-}
-
-.context-menu-item:first-child {
-  border-radius: 4px 4px 0 0;
-}
-
-.context-menu-item:last-child {
-  border-radius: 0 0 4px 4px;
-}
-
-.context-menu-item.delete {
-  color: #f44336;
-}
-
-.context-menu-item.delete:hover {
-  background-color: #ffebee;
-}
-
-/* Form Elements */
-.form-label {
-  display: block;
-  margin-bottom: 8px;
-  font-weight: 600;
-  font-size: 14px;
-  color: #333;
-}
-
-.form-input {
-  width: 100%;
-  padding: 10px;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  font-size: 14px;
-  font-family: inherit;
-  box-sizing: border-box;
-}
-
-.form-input:focus {
-  outline: none;
-  border-color: #2196F3;
-}
-
-/* --- Top-level tabs --- */
-.main-tabs {
-  display: flex; gap: 4px; margin: 0 0 16px;
-  border-bottom: 1px solid #e0e0e0; flex-wrap: wrap;
-}
-.main-tab {
-  padding: 10px 18px; border: none; background: none; cursor: pointer;
-  font-size: 14px; font-weight: 500; color: #666;
-  border-bottom: 2px solid transparent; margin-bottom: -1px;
-  display: inline-flex; align-items: center; gap: 6px;
-}
-.main-tab:hover { color: #333; }
-.main-tab.active { color: #2196F3; border-bottom-color: #2196F3; font-weight: 600; }
-.tab-dot { color: #43a047; font-size: 9px; line-height: 1; }
-.tab-dot.warn { color: #f9a825; }
-
-.overview-badges {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding: 12px 18px; border-bottom: 1px solid #f0f0f0;
-}
-.overview-activity { font-size: 12px; color: #777; }
-
-/* --- Bucket content browser --- */
-.browse-bar {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  flex-wrap: wrap; padding-bottom: 4px;
-}
-.breadcrumbs { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 13px; }
-.crumb {
-  background: none; border: none; padding: 3px 6px; border-radius: 4px;
-  color: #2196F3; cursor: pointer; font-size: 13px; font-family: inherit;
-}
-.crumb:hover { background: #eef3fb; }
-.crumb.current { color: #333; font-weight: 600; cursor: default; }
-.crumb.current:hover { background: none; }
-.crumb-sep { color: #bbb; }
-.browse-status { font-size: 12px; color: #999; font-weight: 400; margin-left: 8px; }
-.browse-more { display: flex; align-items: center; gap: 10px; margin: 6px 0 0; }
-.browse-count { font-size: 12px; color: #999; }
-
-.browse-table tr.clickable { cursor: pointer; }
-.browse-table tr.clickable:hover { background: #f7fbff; }
-.entry-icon { margin-right: 8px; }
-.entry-folder { font-weight: 600; }
-.entry-mime { color: #888; font-size: 12px; }
-.entry-name { cursor: pointer; }
-.entry-link { color: #1976d2; text-decoration: none; }
-.entry-link:hover { text-decoration: underline; }
-.smart-note { padding: 12px 0; color: #666; font-size: 14px; }
-.smart-note.smart-error, .smart-value.smart-error { color: #f44336; }
-.smart-summary { display: flex; flex-direction: column; gap: 8px; }
-.smart-row { display: flex; align-items: baseline; gap: 12px; }
-.smart-label { flex: 0 0 130px; color: #888; font-size: 13px; }
-.smart-value { color: #333; font-size: 14px; }
-.smart-health.good { color: #2e7d32; font-weight: 600; }
-.smart-health.bad { color: #f44336; font-weight: 600; }
-.smart-flag { display: inline-block; background: #fff3e0; color: #e65100; border-radius: 3px; padding: 1px 6px; margin-right: 6px; font-size: 12px; }
-.smart-details { margin-top: 14px; }
-.smart-details summary { cursor: pointer; color: #1976d2; font-size: 13px; }
-.smart-raw { max-height: 300px; overflow: auto; background: #f7f7f7; border: 1px solid #eee; border-radius: 4px; padding: 10px; font-size: 12px; margin-top: 8px; }
-
-.bucket-link {
-  background: none; border: none; padding: 0; cursor: pointer;
-  color: #2196F3; font-size: 13px; font-weight: 600; font-family: inherit;
-}
-.bucket-link:hover { text-decoration: underline; }
-
-/* --- Buckets & Access panel --- */
-.access-body { padding: 4px 18px 18px; display: flex; flex-direction: column; gap: 20px; }
-.access-banner { padding: 10px 12px; border-radius: 6px; font-size: 13px; line-height: 1.45; }
-.access-banner.warn { background: #fff8e1; border: 1px solid #ffe082; color: #7a5b00; }
-.access-banner.error { background: #fdecea; border: 1px solid #f5c6cb; color: #a12622; }
-.access-banner.secret { background: #e8f5e9; border: 1px solid #a5d6a7; color: #1b5e20; display: flex; flex-direction: column; gap: 8px; }
-.access-banner.banner-standalone { margin: 0 18px 4px; }
-.write-warn { color: #c62828; font-weight: 600; }
-.delete-protected { color: #2e7d32; font-weight: 600; }
-.secret-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.secret-row code { background: #fff; padding: 4px 8px; border-radius: 4px; border: 1px solid #c8e6c9; word-break: break-all; }
-
-.access-subsection { display: flex; flex-direction: column; gap: 10px; }
-.access-subtitle { font-size: 14px; font-weight: 600; color: #333; }
-.access-subtitle.small { font-size: 13px; color: #555; }
-.access-hint { font-size: 12px; color: #777; line-height: 1.5; max-width: 640px; }
-.access-hint em { color: #a12622; font-style: normal; }
-
-.access-enforce-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-.access-toggle-btn {
-  padding: 8px 16px; border-radius: 6px; border: 1px solid #ccc; background: #f5f5f5;
-  cursor: pointer; font-size: 13px; font-weight: 600; white-space: nowrap;
-}
-.access-toggle-btn.on { background: #e53935; border-color: #e53935; color: #fff; }
-.access-toggle-btn:disabled { opacity: 0.5; cursor: default; }
-
-.access-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.access-table th, .access-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #eee; }
-.access-table th { color: #888; font-weight: 600; font-size: 12px; }
-.access-table th.num, .access-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
-.access-table tr.disabled td { opacity: 0.5; }
-.access-empty { color: #999; text-align: center; padding: 14px; }
-.mono { font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; }
-
-.access-switch { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; color: #555; }
-.grant-pill { display: inline-block; background: #eef3fb; color: #2c5aa0; border-radius: 4px; padding: 1px 6px; margin: 1px 3px 1px 0; font-size: 11px; font-family: ui-monospace, monospace; }
-
-.access-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-.access-mini-btn {
-  padding: 4px 10px; border-radius: 5px; border: 1px solid #ccc; background: #fafafa;
-  cursor: pointer; font-size: 12px;
-}
-.access-mini-btn:hover { background: #f0f0f0; }
-.access-mini-btn.danger { color: #c62828; border-color: #ef9a9a; }
-.access-mini-btn:disabled { opacity: 0.5; cursor: default; }
-
-.access-create { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; padding-top: 12px; border-top: 1px dashed #e0e0e0; }
-.access-create-row { display: flex; align-items: center; gap: 8px; }
-.access-grant-row { display: flex; align-items: center; gap: 12px; }
-.access-input { padding: 6px 9px; border: 1px solid #ccc; border-radius: 5px; font-size: 13px; }
-.access-input.grant-bucket { width: 160px; }
-.access-btn { padding: 7px 14px; border-radius: 6px; border: 1px solid #ccc; background: #f5f5f5; cursor: pointer; font-size: 13px; }
-.access-btn.primary { background: #2196F3; border-color: #2196F3; color: #fff; font-weight: 600; }
-.access-btn:disabled { opacity: 0.5; cursor: default; }
 </style>

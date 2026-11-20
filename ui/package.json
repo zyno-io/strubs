@@ -10,12 +10,15 @@
     "typecheck": "npx vue-tsc --noEmit --pretty false > .tsc.out 2>&1; ! grep -E '^src/' .tsc.out; rc=$?; rm -f .tsc.out; exit $rc"
   },
   "dependencies": {
+    "@fontsource/inter": "^5.3.0",
+    "@fortawesome/fontawesome-free": "^7.3.1",
     "vue": "^3.5.24"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
     "@vitejs/plugin-vue": "^6.0.1",
     "@vue/tsconfig": "^0.8.1",
+    "sass": "^1.104.1",
     "typescript": "^5.9.3",
     "vite": "^7.2.2"
   }
