@@ -634,7 +634,7 @@ export class HttpMgmt {
         // no physical evidence for a replay to check it against, and a compensating record could fail in exactly
         // the same way.
         //
-        // That is why the restore refuses to let a journalled policy OPEN a bucket (see restore.ts). It closes
+        // That is why the restore refuses to let a journaled policy OPEN a bucket (see restore.ts). It closes
         // the hole from the other end: whatever fails, and however it fails, the worst a stale or escaped policy
         // record can do is leave a bucket MORE closed than it should be. An operator sees that in a moment --
         // things stop being publicly readable -- and fixes it with one call. Nothing leaks, ever.
@@ -901,7 +901,7 @@ export class HttpMgmt {
     // takes effect immediately (not just on the next restart). Freezing stops the
     // scheduler/worker and asks any in-flight verify run to stop while preserving
     // its persisted progress; unfreezing restarts them mirroring core.ts's boot
-    // config so behaviour matches a fresh, unfrozen start.
+    // config so behavior matches a fresh, unfrozen start.
     private static async handleMaintenanceFreezeSetRequest(req: HttpRequest): Promise<{ frozen: boolean }> {
         const payload = await this.parseJsonBody<{ frozen?: unknown }>(req);
         if (typeof payload.frozen !== 'boolean')
@@ -1403,7 +1403,7 @@ export class HttpMgmt {
         // Resolve it by the PARTITION UUID, not by chopping the digits off the path. These are USB disks: sde
         // becomes sdf when somebody breathes on the rack, and a rule that manufactures a disk path out of a
         // partition path is a rule that will one day `parted` the wrong spindle. The uuid is an identity; the
-        // path is a rumour.
+        // path is a rumor.
         const disk = await this.resolveDiskHoldingPartition(volume);
 
         // THE DOOR MUST ALREADY BE SHUT. WE DO NOT SHUT IT OURSELVES AND WALK STRAIGHT IN.
@@ -1493,7 +1493,7 @@ export class HttpMgmt {
         // On this rack the bridge serial is not an identity at all: six pairs of disks share one and eight
         // report none, because the enclosure answers on the drive's behalf (every disk claims WWN
         // 0x5000000000000001). Holding a wipe to that would let the disk in the next bay inherit the blessing
-        // meant for its neighbour. The SMART serial comes from the platter's own controller: 31 drives, 31
+        // meant for its neighbor. The SMART serial comes from the platter's own controller: 31 drives, 31
         // distinct values.
         const serial = (await smartInfoService.fetch(match.disk.path))?.serial_number;
 
@@ -1742,7 +1742,7 @@ export class HttpMgmt {
     // So the operator supplies it one more time. It is checked against the recorded hash -- a wrong one changes
     // nothing -- and then sealed. This is NOT a rotation: no keyslot is touched, and the passphrase is the same
     // one it always was. It is the difference between a machine that knows the passphrase and one that merely
-    // recognises it.
+    // recognizes it.
     private static async handleEncryptionSealRequest(req: HttpRequest): Promise<{ passphraseUsable: boolean }> {
         const payload = await this.parseJsonBody<{ passphrase?: unknown }>(req);
 

@@ -10,7 +10,7 @@ import { resolve } from 'path';
 // to compensate; the safety now lives entirely in "we never hand a path to a key operation".
 //
 // So this test fails if anyone reintroduces a path-based header operation in those modules. It is deliberately a
-// source-text check, not a behaviour test: the whole point is to catch the shape at author time, before it can
+// source-text check, not a behavior test: the whole point is to catch the shape at author time, before it can
 // ship. (Provisioning is intentionally NOT covered here -- it operates on a FRESH header whose uuid does not
 // exist until luksFormat mints it, and it is fenced on the whole-disk SMART serial instead. See
 // notes/dr-g-by-uuid-migration-plan.md, stage 5.)

@@ -19,7 +19,7 @@ export function applyFileMetadataHeaders(res: HttpResponse, record: StoredObject
 // Content types that a browser may render INLINE without executing anything the uploader controls.
 // Deliberately narrow: `image/svg+xml` is NOT here -- an SVG can carry <script>, so it is treated like
 // any other active content and forced to download. Everything not on this list downloads rather than
-// renders, which is what neutralises "upload evil.html to a public bucket, get an admin to open it".
+// renders, which is what neutralizes "upload evil.html to a public bucket, get an admin to open it".
 const INLINE_SAFE = new Set([
     'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
     'image/bmp', 'image/x-icon', 'image/tiff'
@@ -31,10 +31,10 @@ function isInlineSafe(mime: string | null | undefined): boolean {
     return INLINE_SAFE.has(type) || type.startsWith('video/') || type.startsWith('audio/') || type === 'application/octet-stream';
 }
 
-// Defence in depth against object-hosted active content. The origin split (object API on its own
+// Defense in depth against object-hosted active content. The origin split (object API on its own
 // port/scheme) is the real boundary; these headers ensure that even so, uploaded HTML/SVG/JS cannot
 // execute in a browser that opens it directly.
-//   - nosniff: the browser honours our Content-Type instead of guessing an executable one;
+//   - nosniff: the browser honors our Content-Type instead of guessing an executable one;
 //   - Content-Disposition: attachment for anything not inline-safe, so it downloads instead of rendering;
 //   - CSP: the content can load/run nothing.
 // A caller-supplied disposition (?download_as) already forces a download, so it is left untouched.

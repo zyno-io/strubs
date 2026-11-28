@@ -49,7 +49,7 @@ const log = createLogger('luks-recovery-key');
 // which opens every volume outright without troubling the passphrase at all. The hash gives an attacker nothing
 // they did not already have.
 //
-// The passphrase itself is NEVER stored, logged, journalled, or written to a nameplate. Only the hash.
+// The passphrase itself is NEVER stored, logged, journaled, or written to a nameplate. Only the hash.
 export const RECOVERY_VERIFIER_KEY = 'luksRecoveryVerifier';
 
 // The last time the passphrase was PROVEN against the platters (see auditRecoveryKey). Not load-bearing -- the
@@ -267,7 +267,7 @@ const defaultDeps: RecoveryKeyDeps = {
 //
 // `scanFleet()` cannot answer this: `absentVolumeIds()` filters DELETED volumes out of its list (they are
 // retired, and must not block a rotation). So asking it "is the deleted volume 12 absent?" always answers no --
-// which made the undelete guard dead code, and a test that mocked `absent: [15]` was modelling a state the real
+// which made the undelete guard dead code, and a test that mocked `absent: [15]` was modeling a state the real
 // code cannot produce. The test agreed with me instead of with the machine.
 //
 // So ask about the disk itself.
@@ -307,7 +307,7 @@ export async function scanFleet(
 
 const MIN_LENGTH = 12;
 
-// NO IDENTITY MEANS WE CANNOT RECOGNISE OUR OWN DISKS -- SO WE MAY NOT TOUCH THE KEYS.
+// NO IDENTITY MEANS WE CANNOT RECOGNIZE OUR OWN DISKS -- SO WE MAY NOT TOUCH THE KEYS.
 //
 // In RECOVERY mode `config.identity` is null, and the whole encrypted-disk enumeration is keyed on it: a disk's
 // nameplate is compared against our identity to decide whether it is ours. With no identity, our own encrypted

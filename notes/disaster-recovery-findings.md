@@ -104,7 +104,7 @@ payload), and `0xFF` is μ-law digital silence. They are **silent PCMU call reco
 That 36 GB video accounted for essentially the entire 37 GB of orphan space, and had been one disk failure
 from oblivion for twelve years without anybody knowing. Sean confirmed none of it was wanted.
 
-**The window is the interesting part, and it is still unexplained.** Orphan rate by month, normalised against
+**The window is the interesting part, and it is still unexplained.** Orphan rate by month, normalized against
 ingest (which is the control I nearly skipped — a raw count means nothing if the array simply stopped taking
 writes):
 
@@ -139,7 +139,7 @@ matched. The array is healthy.
 
 **Status: ALL THREE FIXED (`bbe8a4d`), and DR-G itself is now implemented and shipped in `off` — no volume
 is encrypted. The original finding is kept below because the fail-open pattern it describes is the one this
-codebase keeps repeating, and it is worth being able to recognise on sight.**
+codebase keeps repeating, and it is worth being able to recognize on sight.**
 
 1. **The wipe guard reports an encrypted disk as `'clean'`.** A `crypto_LUKS` disk looks empty to the
    probe, so the guard that exists specifically to stop us destroying a disk with data on it would wave

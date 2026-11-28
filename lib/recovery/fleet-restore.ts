@@ -16,7 +16,7 @@ const log = createLogger('fleet-restore');
 //
 // Deleted volumes are restored too, and it matters. A recovery that quietly dropped them would produce a
 // fleet that believes disks it has never heard of are foreign -- and the wipe guard would then be looking at
-// a drive full of STRUBS slices with no record of it, which is the one situation where "I don't recognise
+// a drive full of STRUBS slices with no record of it, which is the one situation where "I don't recognize
 // this, it must be blank" costs you 3TB.
 export function volumeConfigsFromManifest(manifest: BootstrapManifest): PersistedVolumeConfig[] {
     return manifest.volumes.map((v: ManifestVolume) => ({

@@ -116,11 +116,11 @@ describe('the bootstrap scan', () => {
         const found = await findManifestsOnDevices({ recoveryPassphrase: 'the fleet recovery passphrase' });
 
         expect(found).toHaveLength(0);
-        // It was recognised as an encrypted disk and counted against the recovery -- NOT skipped as foreign.
+        // It was recognized as an encrypted disk and counted against the recovery -- NOT skipped as foreign.
         expect(silentOf(found)).toEqual(['/dev/sdf1']);
 
         // ...and it was actually TREATED as encrypted: we tried to unlock it. Asserting only that it votes
-        // would still pass if the classifier had merely dumped it into `silent` without ever recognising it as
+        // would still pass if the classifier had merely dumped it into `silent` without ever recognizing it as
         // a LUKS container -- which is a different bug wearing this one's clothes.
         const unlock = spawnHelper.mock.calls.find(call => (call[1] as string[])[0] === 'luksOpen');
         expect(unlock).toBeDefined();

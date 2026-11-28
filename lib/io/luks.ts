@@ -16,7 +16,7 @@ const log = createLogger('luks');
 // recordings.
 //
 // It does NOT defend against a compromised host: the key must be online to serve reads, so a root shell on this
-// machine reads everything regardless. It does not defend against the network either. This is defence in depth,
+// machine reads everything regardless. It does not defend against the network either. This is defense in depth,
 // not a foundation, and pretending otherwise would be the most dangerous thing in this file.
 //
 // It also DEPENDS ON THE RECOVERY STORY EXISTING FIRST (DR-A through DR-F). Encryption converts "we lost the
@@ -573,13 +573,13 @@ export async function backupHeader(partitionPath: string, to: string): Promise<v
 // the name is silently truncated.
 // ---------------------------------------------------------------------------------------------------------
 
-// NORMALISE FIRST. The instance identity on this array is a HYPHENATED UUID
+// NORMALIZE FIRST. The instance identity on this array is a HYPHENATED UUID
 // (`2fb05f23-1d5e-4c00-bb71-f3109b42476c`), and slicing the raw string would put hyphens in the middle of the
 // nameplate -- `strubs-2fb05f23-1d5e-4-12` -- which parseNameplate() below then refuses, because it expects 16
 // hex characters. The plate would be written to every encrypted disk and read back by nobody: the locked-disk
 // identification this whole mechanism exists for, silently dead.
 //
-// Same normalisation the identity guard itself uses (config.normalizeIdentity): strip non-hex, lowercase.
+// Same normalization the identity guard itself uses (config.normalizeIdentity): strip non-hex, lowercase.
 export const nameplateFor = (instanceIdentity: string, volumeId: number): string =>
     `strubs-${instanceIdentity.replace(/[^0-9a-f]/gi, '').toLowerCase().slice(0, 16)}-${volumeId}`;
 

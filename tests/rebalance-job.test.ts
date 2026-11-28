@@ -212,7 +212,7 @@ describe('RebalanceJob', () => {
     it('reserves space on the destination so CONCURRENT moves do not all pile onto one volume', async () => {
         // pickTarget is deterministic (emptiest under-target volume) and the free-space debit only lands
         // AFTER a move commits -- so concurrent moves all see identical inputs and, without a
-        // reservation, every one of them picks the same dest: serialising on one spindle and
+        // reservation, every one of them picks the same dest: serializing on one spindle and
         // over-committing it past pickTarget's own free-space guard.
         // vol2 and vol3 are within one sliceSize of each other, so a single reservation is exactly what
         // tips the choice to the other volume. All 3 moves are in flight before any of them commits.

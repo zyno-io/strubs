@@ -80,7 +80,7 @@ For the real codec, `tests/parity-roundtrip.integration.test.ts` loads it via `c
 
 A test that passes against the *old* code is worth nothing. When you fix a bug, check that the test fails without the fix — temporarily revert the change, run it, watch it fail, put it back. Several bugs in this codebase were "covered" by tests that never would have caught them.
 
-Concurrency and placement bugs especially: assert on the thing that actually distinguishes the behaviours (peak in-flight count, which volume was chosen), not on something the buggy version also satisfies.
+Concurrency and placement bugs especially: assert on the thing that actually distinguishes the behaviors (peak in-flight count, which volume was chosen), not on something the buggy version also satisfies.
 
 ## Codebase conventions
 

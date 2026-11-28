@@ -32,8 +32,8 @@ const log = createLogger('restore');
 // abandoned, or a `del` for one whose deletion failed. A restore that trusted it blindly would manufacture
 // objects that never existed and delete ones that still do. So:
 //
-//     a `put` is materialised ONLY IF its slices are actually FOUND on the platters
-//     a `del` is honoured     ONLY IF its slices are actually GONE from the platters
+//     a `put` is materialized ONLY IF its slices are actually FOUND on the platters
+//     a `del` is honored     ONLY IF its slices are actually GONE from the platters
 //
 // The journal supplies the names. The disks supply the truth.
 
@@ -55,7 +55,7 @@ export type RestoreSummary = {
     // a forced or resumed restore it is the deleted objects that would otherwise have come back from the dead.
     rowsPruned: number;
 
-    // Journalled policy records that would have OPENED a bucket, and were refused. A restore may close a
+    // Journaled policy records that would have OPENED a bucket, and were refused. A restore may close a
     // bucket, never open one -- see the note in the replay. Surfaced so the operator can re-apply them.
     policiesDeclined: number;
 
@@ -345,7 +345,7 @@ export class NamespaceRestore {
                 for (const [lineIndex, line] of lines.entries()) {
                     if (!line) continue;
 
-                    // A torn last line is the one flavour of damage a journal is ALLOWED to have: it is
+                    // A torn last line is the one flavor of damage a journal is ALLOWED to have: it is
                     // append-only, and a crash can cut the record being written in half. Anywhere else, damage
                     // is damage -- so this has to mean the LAST line, exactly, and not "the last line or the one
                     // before it".
@@ -388,7 +388,7 @@ export class NamespaceRestore {
                     // through on it and the operation is simply... not applied -- counted, reported as replayed,
                     // and silently absent from the restored namespace. A lost `del` resurrects a deleted object;
                     // a lost `put` leaves its data on the platters with no name. Neither is something to find out
-                    // about later, and "we did not recognise it so we ignored it" is not a thing a recovery gets
+                    // about later, and "we did not recognize it so we ignored it" is not a thing a recovery gets
                     // to say.
                     const shape = r as { op?: unknown; id?: unknown };
                     // THE SAME COHERENCE TEST THE SNAPSHOT USES. One definition, in one place -- because when
@@ -413,7 +413,7 @@ export class NamespaceRestore {
                         // A JOURNAL CONTAINER RECORD DOES NOT GET TO CARRY A POLICY. NOT EVER.
                         //
                         // The journal has a `policy` op for that, and the replay puts it through the close-only
-                        // rule: a journalled policy may shut a bucket, never open one. Spreading `...r` here
+                        // rule: a journaled policy may shut a bucket, never open one. Spreading `...r` here
                         // walked straight around that. A line reading
                         //
                         //     {"op":"container","id":"…","cid":null,"name":"photos","pr":true}
@@ -450,7 +450,7 @@ export class NamespaceRestore {
                             continue;
                         }
 
-                        // A JOURNALLED POLICY MAY CLOSE A BUCKET. IT MAY NEVER OPEN ONE.
+                        // A JOURNALED POLICY MAY CLOSE A BUCKET. IT MAY NEVER OPEN ONE.
                         //
                         // This is the one op the platters cannot arbitrate. A `put` is checked against its
                         // slices, a `del` against theirs -- but a bucket's access flags leave no physical
@@ -462,7 +462,7 @@ export class NamespaceRestore {
                         // platter for a change whose caller was told it FAILED. That is unavoidable: the two
                         // cases are byte-identical and no local rule distinguishes them. I tried several.
                         //
-                        // So make the CONSEQUENCE safe rather than the question decidable. Honour the record
+                        // So make the CONSEQUENCE safe rather than the question decidable. Honor the record
                         // when it RESTRICTS access, refuse it when it GRANTS. An escaped record can then only
                         // ever over-close a bucket -- which an operator notices in a moment (things 404) and
                         // fixes with one call. It can never, under any failure, hand the public a bucket
@@ -485,10 +485,10 @@ export class NamespaceRestore {
                             if (want === undefined) continue;
 
                             if (want === true && bucket[f] !== true) {
-                                log.error('journal: a policy record would OPEN %s on bucket %s. A journalled policy '
+                                log.error('journal: a policy record would OPEN %s on bucket %s. A journaled policy '
                                     + 'is the one record the platters cannot vouch for -- a rejected batch whose '
                                     + 'rollback could not be proven may leave one behind -- so a restore may CLOSE '
-                                    + 'a bucket but never open one. NOT honouring this flag. Re-apply it '
+                                    + 'a bucket but never open one. NOT honoring this flag. Re-apply it '
                                     + 'deliberately if it was real.', f, r.id);
                                 policiesDeclined++;
                                 continue;
@@ -498,15 +498,15 @@ export class NamespaceRestore {
                         }
 
                         // deleteProtected INVERTS the polarity: dp=true CLOSES (blocks deletes), dp=false OPENS
-                        // (allows them). The close-only rule is the same principle -- a journalled policy may only
+                        // (allows them). The close-only rule is the same principle -- a journaled policy may only
                         // ever RESTRICT -- so here it is dp=false, the one that would strip protection off a bucket
                         // somebody locked, that must be refused. An escaped record can then only ever over-protect
                         // (deletes 403; an operator clears it in one call), never silently expose a locked bucket.
                         if (r.dp !== undefined) {
                             if (r.dp === false && bucket.dp === true) {
                                 log.error('journal: a policy record would REMOVE delete-protection on bucket %s. A '
-                                    + 'journalled policy may only ever ADD protection on restore, never strip it. NOT '
-                                    + 'honouring this flag. Re-apply it deliberately if it was real.', r.id);
+                                    + 'journaled policy may only ever ADD protection on restore, never strip it. NOT '
+                                    + 'honoring this flag. Re-apply it deliberately if it was real.', r.id);
                                 policiesDeclined++;
                             }
                             else {
@@ -520,7 +520,7 @@ export class NamespaceRestore {
                     else if (r.op === 'del') {
                         // A `del` for a CONTAINER is the compensating record written when a container was
                         // journaled and its Mongo insert then failed. It has no slices to check against --
-                        // a folder has none -- so it is simply honoured. Restoring it would recreate an empty
+                        // a folder has none -- so it is simply honored. Restoring it would recreate an empty
                         // folder that never existed, which is precisely what the compensation was for.
                         if (containers.delete(r.id)) continue;
 
@@ -533,7 +533,7 @@ export class NamespaceRestore {
             }
             log('journal: %d records applied on top', applied);
 
-            // THE OTHER RULE, and the symmetry is the point: a `del` is only honoured if the platters agree.
+            // THE OTHER RULE, and the symmetry is the point: a `del` is only honored if the platters agree.
             //
             // The journal makes the delete durable BEFORE the slices are unlinked -- that ordering is what
             // stops a crash from leaving a name pointing at data that is already gone. The price of it is
@@ -565,7 +565,7 @@ export class NamespaceRestore {
             };
 
             for (const [id, named] of deleted) {
-                if (!hasAnySlice(id)) continue;          // genuinely gone: the delete completed. Honour it.
+                if (!hasAnySlice(id)) continue;          // genuinely gone: the delete completed. Honor it.
 
                 log('journal says object %s (%s) was deleted, but its slices are still on the platters: the delete '
                     + 'did not complete, so the name is being KEPT', id, named.name);
@@ -594,9 +594,9 @@ export class NamespaceRestore {
             // record it -- the bucket is the root of an object's container chain, and a chain is exactly what
             // we have just finished rebuilding.
             //
-            // This is not cosmetic. Phase 2 denormalised bucketId onto every document precisely so that
-            // authorisation and per-bucket stats would not have to walk to the root on every request, and
-            // Phase 3's object authorisation reads it directly. A namespace restored without it would come
+            // This is not cosmetic. Phase 2 denormalized bucketId onto every document precisely so that
+            // authorization and per-bucket stats would not have to walk to the root on every request, and
+            // Phase 3's object authorization reads it directly. A namespace restored without it would come
             // back with every object in an "unknown bucket" -- which the auth model treats as unknown, never
             // as a wildcard, so the array would come up refusing to serve its own data.
             const bucketOf = (cid: string | null): string | null => {
@@ -641,7 +641,7 @@ export class NamespaceRestore {
                     // between a bookkeeping entry and a funeral.
                     //
                     // NO SLICES AT ALL: the write was abandoned -- journaled, then it failed. The rule says a
-                    // `put` is only believed if the platters back it up, so we drop the name. Materialising it
+                    // `put` is only believed if the platters back it up, so we drop the name. Materializing it
                     // would be a PHANTOM: a name that reads as data loss for data that never existed.
                     //
                     // SLICES, BUT NOT ONE READABLE HEADER: the data is there and we cannot describe it. That
@@ -789,7 +789,7 @@ export class NamespaceRestore {
 
             summary.policiesDeclined = policiesDeclined;
             if (policiesDeclined)
-                log.error('%d journalled bucket-policy record(s) would have OPENED a bucket and were refused. If '
+                log.error('%d journaled bucket-policy record(s) would have OPENED a bucket and were refused. If '
                     + 'those were real changes, re-apply them deliberately -- a restore may close a bucket, never '
                     + 'open one.', policiesDeclined);
 
@@ -844,7 +844,7 @@ export function orderParentsFirst<T extends { id: string; cid: string | null }>(
 // The real thing, wired to the actual array.
 //
 // fetchSnapshot is the interesting one: it finds the snapshot object by SCANNING the platters for its
-// slices, synthesises the record Mongo would have held from their headers, and then hands that to the
+// slices, synthesizes the record Mongo would have held from their headers, and then hands that to the
 // ordinary FileObject reader. So the recovery decodes 4+2 Reed-Solomon using the same code path that serves
 // every GET on an ordinary Tuesday -- which is exactly where you want your erasure coding to come from on
 // the day you actually need it, rather than from a second implementation in a recovery tool that nobody has
@@ -1154,7 +1154,7 @@ export const namespaceRestore = new NamespaceRestore({
 
             replicasRead++;
             for (const f of files) {
-                // A FILE WE DO NOT RECOGNISE IN THE JOURNAL DIRECTORY IS NOT A FILE TO IGNORE.
+                // A FILE WE DO NOT RECOGNIZE IN THE JOURNAL DIRECTORY IS NOT A FILE TO IGNORE.
                 //
                 // Skipping it means the gap check never sees it: `000001x.jsonl`, or a segment whose name got
                 // mangled, holds real history and would be quietly dropped -- and the segments either side of

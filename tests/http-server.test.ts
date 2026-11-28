@@ -174,7 +174,7 @@ describe('HttpServer', () => {
         expect(resData.body).toBe('malformed URL');
     });
 
-    // The 'all' role gates /$/ behind auth (defence in depth), so mgmt-routing tests need a session.
+    // The 'all' role gates /$/ behind auth (defense in depth), so mgmt-routing tests need a session.
     // bootstrap() loads the persisted signing key that stateless session tokens are minted with.
     const authCookie = async (): Promise<string> => {
         const { adminAuth, SESSION_COOKIE } = await import('../lib/server/http/admin-auth');
@@ -243,7 +243,7 @@ describe('HttpServer', () => {
         expect(resData.status).toBe(404);
     });
 
-    it('DEFENCE IN DEPTH: the legacy "all" role also gates /$/ behind auth', async () => {
+    it('DEFENSE IN DEPTH: the legacy "all" role also gates /$/ behind auth', async () => {
         const server = await importServer('all');   // no session
         const { req, res, resData } = createReqRes('GET', '/$/volumes');
 

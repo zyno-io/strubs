@@ -169,7 +169,7 @@ describe('DeviceProvisioner', () => {
                 .rejects.toThrow(/disabled during recovery/);
 
             // Refused BEFORE we even look at the hardware -- the array we are trying to rescue must not
-            // be offered up for reinitialisation.
+            // be offered up for reinitialization.
             expect(deps.listRawBlockDevices).not.toHaveBeenCalled();
             expect(deps.spawnHelper).not.toHaveBeenCalled();
         });
@@ -606,7 +606,7 @@ describe('DeviceProvisioner', () => {
         // THE GATE IS FOR ENCRYPTED PROVISIONS ONLY. A plaintext disk has no keyslot to get wrong, and blocking
         // a passphrase rotation for the ten minutes it takes to mkfs a 4TB disk would be a needless refusal.
         // (An earlier version wrapped EVERY provision while its comment claimed it did not -- worse than either
-        // behaviour on its own.)
+        // behavior on its own.)
         it('does not take the encryption gate for a plaintext provision', async () => {
             stageDiscovery(deviceWithPartition('PART-UUID'));
 
@@ -1102,7 +1102,7 @@ describe('DeviceProvisioner', () => {
             // THE ONE THAT NEARLY SHIPPED BROKEN. `config.identity` is a hyphenated UUID; the probe returns
             // plain hex. Comparing them raw NEVER matches -- so conversion would have refused every disk we
             // own, forever, while telling the operator their own disk belonged to somebody else.
-            it('recognises our own disk despite the identity being stored as a hyphenated UUID', async () => {
+            it('recognizes our own disk despite the identity being stored as a hyphenated UUID', async () => {
                 ourDisk(7);   // probe: '2fb05f231d5e4c00bb71f3109b42476c'   config: '2fb05f23-1d5e-...'
                 deps.listRawBlockDevices
                     .mockResolvedValueOnce([deviceWithPartition('PART-UUID')])
@@ -1120,8 +1120,8 @@ describe('DeviceProvisioner', () => {
             });
 
             // A LOCKED disk identifies itself by its GPT nameplate, which only carries the FIRST 16 hex
-            // characters of the identity. A prefix, not the whole thing -- and it still has to be recognised.
-            it('recognises our own disk from a 16-hex nameplate prefix', async () => {
+            // characters of the identity. A prefix, not the whole thing -- and it still has to be recognized.
+            it('recognizes our own disk from a 16-hex nameplate prefix', async () => {
                 ourDisk(7, '2fb05f231d5e4c00');   // what parseNameplate() hands back
                 deps.listRawBlockDevices
                     .mockResolvedValueOnce([deviceWithPartition('PART-UUID')])
@@ -1163,7 +1163,7 @@ describe('DeviceProvisioner', () => {
                 expect(deps.spawnHelper).not.toHaveBeenCalledWith('parted', expect.anything());
             });
 
-            // The last line of defence against a caller that forgot to stop the volume: the disk is still
+            // The last line of defense against a caller that forgot to stop the volume: the disk is still
             // mounted and in service. The mounted-partitions guard must catch it.
             it('refuses a volume that is still mounted', async () => {
                 ourDisk(7);

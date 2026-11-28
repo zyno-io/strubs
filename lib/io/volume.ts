@@ -169,7 +169,7 @@ export class Volume extends EventEmitter {
 
     // `initializeIdentity` is passed ONLY by the provisioning path (a brand-new, just-formatted disk that
     // legitimately has no identity yet). Every other caller -- fleet start, hotplug remount, the device
-    // reconciler, recovery probing -- leaves it off, so an unrecognised disk is REJECTED rather than
+    // reconciler, recovery probing -- leaves it off, so an unrecognized disk is REJECTED rather than
     // silently stamped as ours.
     async start(opts: { initializeIdentity?: boolean } = {}): Promise<void> {
         try {
@@ -388,7 +388,7 @@ export class Volume extends EventEmitter {
 
     // READ-ONLY. A function called "verify" has no business writing to a disk it was asked to inspect --
     // and it used to: on ENOENT it stamped our identity onto the volume. That meant the ordinary startup
-    // path, pointed at an unknown disk, would silently claim it. Recovery probing an unrecognised disk
+    // path, pointed at an unknown disk, would silently claim it. Recovery probing an unrecognized disk
     // must be incapable of that, so the dangerous capability now lives in initializeIdentity() and is
     // reachable ONLY from the provisioning path (Volume.start({ initializeIdentity: true })).
     async verify(): Promise<void> {

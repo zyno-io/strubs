@@ -8,7 +8,7 @@ over an array's normal drive-replacement cycle.
 on a single-host array whose failing drives get pulled routinely and hold customers' data.
 
 **What it does not defend against:** a compromised host. The key has to be online to serve reads, so a root
-shell on the box reads everything regardless. This is defence in depth, not a foundation.
+shell on the box reads everything regardless. This is defense in depth, not a foundation.
 
 ::: tip The short version
 Two secrets: a **keyfile** (on the OS disk, unlocks the disks unattended) and a **recovery passphrase** (in your

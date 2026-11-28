@@ -29,7 +29,7 @@ Verified empirically against real slice files — from headers alone we recover:
 
 So losing Mongo is **not** losing the array. It is losing *the namespace* and *the integrity gate*. That is a far smaller problem, and it names precisely what has to be protected: a record of `{_id, containerId, name, mime, md5}` — roughly 130 bytes per object, ~500 MB raw across 3.6M objects, far less compressed. (The entire database is only 450 MB on disk, so in practice we just back up all of it.)
 
-Once Mongo is rebuildable from the disks, its loss is an **outage, not a data loss**. Snapshots become a speed optimisation rather than a safety requirement, and the choice of database stops being existential.
+Once Mongo is rebuildable from the disks, its loss is an **outage, not a data loss**. Snapshots become a speed optimization rather than a safety requirement, and the choice of database stops being existential.
 
 ---
 
@@ -221,7 +221,7 @@ So the stamping job must:
 
 1. read **only directly-read, per-chunk-checksum-verified data slices** — no parity, no reconstruction;
 2. **refuse to stamp** any object where a data slice was missing, unreadable, or had to be rebuilt, and report it instead;
-3. leave such objects frozen. They are readable, immovable, and honestly labelled as unverifiable — which is the correct state, not a failure.
+3. leave such objects frozen. They are readable, immovable, and honestly labeled as unverifiable — which is the correct state, not a failure.
 
 Recomputing is otherwise a full read of the object, so it is a **background pass**, never part of the restore. If the snapshot and journal survived there will be few orphans and it is trivial. If neither survived, *every* object is an orphan and stamping is a full read of the array (weeks). Bring the array up, serve reads, grind through them in the background. Until then they are readable but immovable — exactly the safe state.
 
@@ -427,7 +427,7 @@ If the snapshot object is itself below quorum, recovery falls back to the **prev
 
 **The rule: detect and refuse. Never adopt.**
 
-Provisioning *formats disks*. The catastrophic version of this feature is the one that helpfully "recovers" the array by reinitialising it.
+Provisioning *formats disks*. The catastrophic version of this feature is the one that helpfully "recovers" the array by reinitializing it.
 
 ### Two required code changes before any of this is safe
 
@@ -442,7 +442,7 @@ Split it, rather than asking every future caller to remember:
 
 Recovery probing then simply cannot go wrong, because the dangerous capability isn't reachable from the path it uses. (Fixing the design beats documenting the hazard.)
 
-**2. Provisioning must be blocked in the BACKEND during recovery, not just greyed out in the UI.** With a fresh Mongo, `ensureDeviceNotRegistered` (`device-provisioner.ts:103`) has no registered volumes to protect — there is nothing in the database to say the disk is ours. And `wipe` only checks for *mounted* partitions before destroying the partition table (`device-provisioner.ts:44`, `:144`). So on a rebuilt host, the disks holding 130 TB are, as far as the provisioner is concerned, blank media.
+**2. Provisioning must be blocked in the BACKEND during recovery, not just grayed out in the UI.** With a fresh Mongo, `ensureDeviceNotRegistered` (`device-provisioner.ts:103`) has no registered volumes to protect — there is nothing in the database to say the disk is ours. And `wipe` only checks for *mounted* partitions before destroying the partition table (`device-provisioner.ts:44`, `:144`). So on a rebuilt host, the disks holding 130 TB are, as far as the provisioner is concerned, blank media.
 
 The recovery state must be a hard gate inside `deviceProvisioner`, refusing any device that carries a STRUBS nameplate or identity, regardless of what the API asks for.
 
@@ -541,7 +541,7 @@ This is what keeps "the disks are authoritative" an actual property rather than 
 
 Encryption at rest defends against exactly one thing here: **a disk leaving our physical control** — RMA'd, sold, discarded, stolen. That is a real threat: failing drives are pulled routinely and they hold customers' photos, video and call recordings.
 
-It does **not** defend against a compromised host (the key must be online to serve reads) or against the network. Sequencing follows from that: it is defence in depth, not a foundation.
+It does **not** defend against a compromised host (the key must be online to serve reads) or against the network. Sequencing follows from that: it is defense in depth, not a foundation.
 
 **It also depends on A–E existing first.** Encryption converts "we lost the metadata" into "we lost everything" — a lost key is unrecoverable in a way that a lost Mongo is not. Do not enable it before the recovery story is real.
 

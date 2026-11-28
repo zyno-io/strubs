@@ -28,8 +28,8 @@ const STOP_RECONFIGURE_WAIT_MS = 10_000;
 //
 // TWO RULES FOR THE REPLAY (DR-E), and neither is optional. Both say the same thing: THE DISKS DECIDE.
 //
-//   1. A `put` is materialised into a Mongo row ONLY IF the object's slices are FOUND on the platters.
-//   2. A `del` is honoured ONLY IF the object's slices are GONE from the platters.
+//   1. A `put` is materialized into a Mongo row ONLY IF the object's slices are FOUND on the platters.
+//   2. A `del` is honored ONLY IF the object's slices are GONE from the platters.
 //
 // The journal records INTENT, and it is made durable BEFORE the operation completes -- that ordering is the
 // whole design, and the price of it is that the journal can contain records for things that never actually
@@ -277,7 +277,7 @@ export class Journal {
         return chosen;
     }
 
-    // Rebuild the replica set. Serialised by `reconfiguring`, which append() waits on -- a record must
+    // Rebuild the replica set. Serialized by `reconfiguring`, which append() waits on -- a record must
     // never be acknowledged on a replica whose history is still being copied in, because the copy would
     // then overwrite it.
     //
@@ -285,7 +285,7 @@ export class Journal {
     // copying afterwards (the obvious order) is a data-loss bug: a flush landing in the gap writes an
     // ACKNOWLEDGED record into the new file, and copyFile then replaces the whole file. A replica whose
     // copy fails is not adopted at all -- an empty "replica" that reports success is worse than one fewer.
-    // SERIALISED against itself. Two fleet changes arriving together must not rebuild the set
+    // SERIALIZED against itself. Two fleet changes arriving together must not rebuild the set
     // concurrently: the second would replace `reconfiguring`, finish first, and release append() while the
     // FIRST one's copy is still running -- which is precisely the bug the lock exists to prevent (an
     // acknowledged record written into a target that copyFile then overwrites). So each reconfigure chains
@@ -1082,7 +1082,7 @@ export class Journal {
                 //   `del`  -- the platters settle it: slices still there, delete never completed. Ignored.
                 //   `container` -- accepted residue, and always was: a stray empty folder.
                 //   `policy` -- has no physical evidence anywhere, so replay makes it SAFE INSTEAD OF CERTAIN:
-                //               a journalled policy record may CLOSE a bucket, never OPEN one. An escaped record
+                //               a journaled policy record may CLOSE a bucket, never OPEN one. An escaped record
                 //               can then only ever over-restrict, which an operator notices and fixes in a
                 //               moment. It can never leak.
                 if (stuck.length)
@@ -1399,7 +1399,7 @@ async function agreeOnPrefix(a: string, b: string, length: number): Promise<bool
     finally { await fa.close(); }
 }
 
-// A CHEAP probe used only to GROUP disks into lineages -- never to authorise a write.
+// A CHEAP probe used only to GROUP disks into lineages -- never to authorize a write.
 //
 // The bound is safe here and nowhere else, and the distinction matters. Grouping only has to separate
 // unrelated journals, which differ within their first records (different object ids, different timestamps),

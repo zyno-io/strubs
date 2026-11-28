@@ -148,7 +148,7 @@ export class SystemLogWatcher {
             //
             // Most of the time this really is a disk we do not manage, and saying so quietly is right. But a
             // kernel filesystem error we could not attribute to a volume is the array losing its ability to
-            // notice a disk dying -- so a name we do not RECOGNISE is said loudly, once, rather than filed
+            // notice a disk dying -- so a name we do not RECOGNIZE is said loudly, once, rather than filed
             // under "not ours" with everything else.
             if (/^dm-\d+$/.test(signal.device))
                 this.log.error('a kernel error on %s could not be traced back to any volume. Under LUKS the '

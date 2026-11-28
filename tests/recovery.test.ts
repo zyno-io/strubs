@@ -289,7 +289,7 @@ describe('recovery: the journal proposes, the platters dispose', () => {
         expect(written[0]).toMatchObject({ id: ALIVE, name: 'still-here.jpg' });   // the name is KEPT
     });
 
-    it('HONOURS a del whose object really is gone', async () => {
+    it('HONORS a del whose object really is gone', async () => {
         const { summary, written } = await restoreWith({
             snapshot: [{ op: 'container', id: 'c1', cid: null, name: 'photo' }, put(ALIVE, 'deleted.jpg'), end(1, 1)],
             journal: [{ op: 'del', id: ALIVE }],
@@ -409,8 +409,8 @@ describe('recovery: the fleet, which cannot be read from a database that is gone
     });
 
     // A recovery that quietly dropped deleted volumes would produce a fleet that believes a disk full of
-    // STRUBS slices is foreign -- and "I don't recognise this, it must be blank" is how you lose 3TB.
-    it('restores DELETED volumes too, so the array still recognises its own disks', () => {
+    // STRUBS slices is foreign -- and "I don't recognize this, it must be blank" is how you lose 3TB.
+    it('restores DELETED volumes too, so the array still recognizes its own disks', () => {
         const configs = volumeConfigsFromManifest(manifest);
         expect(configs.find(c => c.id === 3)).toMatchObject({ is_deleted: true });
     });
@@ -676,7 +676,7 @@ describe('recovery: not on a live array', () => {
 
 // Everything downstream of the slice index treats an id's absence from it as a FACT about the world: the
 // restore drops the name as an abandoned write, the drift scrub calls it a phantom, a `del` that never
-// completed gets honoured. Every one of those is a decision to throw a name away -- made, if we are not
+// completed gets honored. Every one of those is a decision to throw a name away -- made, if we are not
 // careful, on the strength of a readdir that quietly returned nothing because a disk was too sick to answer.
 describe('recovery: a disk that will not answer is not a disk with nothing on it', () => {
     let root: string;
@@ -819,7 +819,7 @@ describe('recovery: refusing to mistake a failure to look for an absence of data
             { volumeId: 2, mountPoint: bad }
         ];
 
-        // The tempting, catastrophic behaviour is to shrug and return the one slice it could find. Do that to
+        // The tempting, catastrophic behavior is to shrug and return the one slice it could find. Do that to
         // two disks of a 4+2 object and a healthy file is declared below quorum -- unrecoverable, and wrong.
         await expect(locateSlices(ID, platters)).rejects.toThrow(/cannot read .* on volume 2/);
     });
@@ -2127,10 +2127,10 @@ describe('recovery: a restore may CLOSE a bucket, never OPEN one', () => {
 
     const BUCKET = 'c'.repeat(24);
 
-    const run = async (snapshotPublic: boolean, journalled: Record<string, unknown>) => {
+    const run = async (snapshotPublic: boolean, journaled: Record<string, unknown>) => {
         const written: Record<string, unknown>[] = [];
         const seg = path.join(root, '000000.jsonl');
-        await fsp.writeFile(seg, JSON.stringify({ op: 'policy', id: BUCKET, ...journalled }) + '\n');
+        await fsp.writeFile(seg, JSON.stringify({ op: 'policy', id: BUCKET, ...journaled }) + '\n');
 
         const restore = new NamespaceRestore({
             objectsInDatabase: async () => 0,
@@ -2163,7 +2163,7 @@ describe('recovery: a restore may CLOSE a bucket, never OPEN one', () => {
         return { summary, written };
     };
 
-    it('HONOURS a journalled policy that CLOSES a public bucket', async () => {
+    it('HONORS a journaled policy that CLOSES a public bucket', async () => {
         // The operator shut a public bucket. That must survive the restore -- and if the record turns out to be
         // an escaped one from a rejected batch, the worst that happens is a bucket is closed that need not be.
         // Somebody notices in a moment and re-opens it.
@@ -2260,7 +2260,7 @@ describe('recovery: a restore may CLOSE a bucket, never OPEN one', () => {
         expect(written[0].pw).toBeUndefined();
     });
 
-    it('REFUSES a journalled policy that would OPEN a private bucket', async () => {
+    it('REFUSES a journaled policy that would OPEN a private bucket', async () => {
         // The journal can hold a record for an operation that never happened: a batch rejected by every replica
         // is rolled back, but "the fsync failed" is not "the bytes are not there", and if the rollback cannot be
         // proven either, the record may survive for a change whose caller was told it FAILED. The two cases are

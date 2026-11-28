@@ -1,6 +1,6 @@
 # STRUBS
 
-**Striping & Redundancy Using Basic Disks** — a single-host, fault-tolerant object store for organisations that have a lot of data, a limited budget, and no appetite for a storage system that can fail all at once.
+**Striping & Redundancy Using Basic Disks** — a single-host, fault-tolerant object store for organizations that have a lot of data, a limited budget, and no appetite for a storage system that can fail all at once.
 
 STRUBS spreads every object across many independent disks using Reed–Solomon erasure coding. By default it writes **4 data slices + 2 parity slices**, on 6 different drives: any 2 of those drives can die and the object is still readable, and STRUBS rebuilds the missing slices onto healthy drives by itself.
 

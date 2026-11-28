@@ -110,7 +110,7 @@ If you *don't* grant everything, two features degrade rather than crash — both
 | udev access | Hotplug detection | `STRUBS_DISABLE_UDEV=true` (falls back to periodic scanning) |
 | Journal access | Kernel/smartd errors triggering a targeted verify | `STRUBS_SYSLOG_WATCH_INTERVAL_MS=0` |
 
-**The recommendation: run STRUBS on the host, under systemd.** It's a single-host appliance that already fits that shape, and every sharp edge above simply doesn't exist. Containerise MongoDB separately if you like — that one is a clean win, and it's the piece you most want to be able to move, upgrade, and back up independently.
+**The recommendation: run STRUBS on the host, under systemd.** It's a single-host appliance that already fits that shape, and every sharp edge above simply doesn't exist. Containerize MongoDB separately if you like — that one is a clean win, and it's the piece you most want to be able to move, upgrade, and back up independently.
 
 ## Watching it
 
@@ -145,7 +145,7 @@ curl -X POST --unix-socket /run/strubs/admin.sock localhost/\$/volumes -H 'Conte
 
 `wipe` is a **timestamp**, and it must be within 10 seconds of now — that freshness window is the only thing standing between a replayed request and a formatted disk.
 
-The new volume is mounted, started, and writable immediately, and new writes start landing on it (it has the most free space). Existing data doesn't move by itself — **[rebalance](#rebalancing) if you want it levelled.**
+The new volume is mounted, started, and writable immediately, and new writes start landing on it (it has the most free space). Existing data doesn't move by itself — **[rebalance](#rebalancing) if you want it leveled.**
 
 ## Encryption (LUKS)
 
@@ -270,7 +270,7 @@ curl -X DELETE --unix-socket /run/strubs/admin.sock localhost/\$/verify-volumes
 curl -s --unix-socket /run/strubs/admin.sock localhost/\$/verify-runs | jq
 ```
 
-A scrub runs automatically every 90 days by default. **Use `full`.** A light verify will happily tell you every slice is present and correctly labelled while your parity is worthless — only a full pass recomputes parity and compares it. See [Data integrity](data-integrity.md).
+A scrub runs automatically every 90 days by default. **Use `full`.** A light verify will happily tell you every slice is present and correctly labeled while your parity is worthless — only a full pass recomputes parity and compares it. See [Data integrity](data-integrity.md).
 
 If a rebalance is running, a verify request is **queued**, not rejected: the response carries `deferred: true` and it starts when the rebalance finishes. The UI shows it as *Waiting for rebalance*.
 

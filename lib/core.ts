@@ -176,7 +176,7 @@ export class Core {
             //
             //   - the missing disks are not "unmounted", they are UNKNOWN, so nothing refuses on their behalf;
             //   - every object living on them reads as data loss, on an array that has lost nothing;
-            //   - and then the periodic manifest write below serialises that partial table and stamps it onto
+            //   - and then the periodic manifest write below serializes that partial table and stamps it onto
             //     EVERY remaining disk -- overwriting the good manifests, which are the only record of the
             //     disks it forgot. The array would destroy its own map of itself while reporting for duty.
             //

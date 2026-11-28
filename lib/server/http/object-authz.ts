@@ -48,7 +48,7 @@ async function isAuthEnforced(now: number): Promise<boolean> {
             value = (await database.getRuntimeConfig(AUTH_ENFORCED_KEY)) === true;
         }
         catch (err) {
-            // Fail to NOT-enforced (today's behaviour) rather than locking out the whole object API on a
+            // Fail to NOT-enforced (today's behavior) rather than locking out the whole object API on a
             // transient DB blip. The enforced-path lookups below fail CLOSED; only this flag read fails open.
             log.error('could not read authEnforced flag, assuming disabled: %s', err);
             value = false;
@@ -204,7 +204,7 @@ export function parseBasicAuth(header: string | undefined): Identity | null {
     return { accessKeyId, secret };
 }
 
-// The bucket a raw request path addresses, WITHOUT any decoding -- authorisation runs on the exact bytes
+// The bucket a raw request path addresses, WITHOUT any decoding -- authorization runs on the exact bytes
 // that address storage (the server does not URL-decode before the DB lookup), so a confused-deputy split
 // between "what auth checked" and "what got served" is impossible. Returns:
 //   { form:'id' }              -> object addressed by id; the bucket needs a DB lookup (enforced path only)
@@ -222,8 +222,8 @@ export function bucketRefFromPath(rawUrl: string): { form: 'id' } | { form: 'pat
 
 const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
-// The single object-API authorisation decision. While authEnforced is false (the default, and where the
-// system ships) it ALWAYS allows -- behaviour, and cost, identical to today -- and only bumps a per-bucket
+// The single object-API authorization decision. While authEnforced is false (the default, and where the
+// system ships) it ALWAYS allows -- behavior, and cost, identical to today -- and only bumps a per-bucket
 // counter so the UI can show whether anonymous traffic is still arriving. Flipping authEnforced activates
 // the full policy check below. Enforcement failures are the ONLY denials; the dark path never blocks.
 export async function authorizeObjectRequest(rawUrl: string, method: string, authHeader: string | undefined): Promise<AuthzDecision> {
@@ -280,7 +280,7 @@ async function resolveBucket(ref: ReturnType<typeof bucketRefFromPath>, rawUrl: 
     if (ref.form === 'none')
         return null;
     if (ref.form === 'id') {
-        // Object addressed by id: find its record, then its bucket via the denormalised bucketId. This
+        // Object addressed by id: find its record, then its bucket via the denormalized bucketId. This
         // double lookup runs ONLY on the enforced path (never while dark), so it costs nothing today.
         const id = rawUrl.split('?')[0].slice(2);
         let bucketId: string | null = null;

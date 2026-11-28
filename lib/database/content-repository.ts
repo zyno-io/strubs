@@ -63,7 +63,7 @@ export class ContentRepository {
         const bucketMongoId = object.bucketId ? this.toMongoId(object.bucketId) : null;
         // An object inside a container MUST carry its bucket. If it didn't, we'd write bucketId:null and
         // the additive backfill ({ bucketId: { $exists: false } }) would then skip it forever, silently
-        // excluding it from stats and authorisation. Fail loudly instead. bucketId:null is valid ONLY for
+        // excluding it from stats and authorization. Fail loudly instead. bucketId:null is valid ONLY for
         // a genuine root object (containerId null) -- production has none, and Phase 3 rejects them.
         if (containerMongoId && !bucketMongoId)
             throw createError('EINVAL', 'object in a container must have a bucketId');
@@ -843,7 +843,7 @@ export class ContentRepository {
     // an existing value and is safe to re-run and to run alongside live writes (which already carry it).
     //
     // Strategy: the container tree is small (~55k nodes), so load it into memory, resolve each node's
-    // root ancestor once (memoised, cycle/orphan guarded), stamp the containers, then stamp their
+    // root ancestor once (memoized, cycle/orphan guarded), stamp the containers, then stamp their
     // children (files + any still-unstamped sub-containers) with a handful of grouped updateMany calls
     // -- one bounded batch per bucket -- rather than a per-object walk over millions of documents.
     async backfillBucketIds(
@@ -1117,7 +1117,7 @@ export class ContentRepository {
                     ...rest,
                     containerId,
                     // WITHOUT THIS the array comes back refusing to serve its own data: Phase 3 reads bucketId
-                    // to authorise every object request, and treats its absence as an unknown bucket -- never
+                    // to authorize every object request, and treats its absence as an unknown bucket -- never
                     // as a wildcard. A restore that omitted it would rebuild 3.5 million names into objects
                     // nobody is allowed to read.
                     bucketId: bucketId ? new ObjectId(bucketId as string) : null,
@@ -1245,7 +1245,7 @@ export class ContentRepository {
         return res.matchedCount === 1;
     }
 
-    // Per-bucket object count and logical size in a single grouped aggregation over the denormalised
+    // Per-bucket object count and logical size in a single grouped aggregation over the denormalized
     // bucketId -- the number the UI needs, without a recursive walk of tens of thousands of containers.
     async computeBucketStats(): Promise<Array<{ bucketId: string; objectCount: number; logicalBytes: number }>> {
         const rows = await this.collection.aggregate<{ _id: ObjectId | null; objectCount: number; logicalBytes: number }>([

@@ -205,7 +205,7 @@ describe('luks', () => {
             expect(mapperPath('abc-123')).toBe('/dev/mapper/strubs-abc-123');
         });
 
-        it('recognises the LUKS fstype however lsblk chooses to capitalise it', () => {
+        it('recognizes the LUKS fstype however lsblk chooses to capitalize it', () => {
             expect(isLuksFsType('crypto_LUKS')).toBe(true);
             expect(isLuksFsType('crypto_luks')).toBe(true);
             expect(isLuksFsType('ext4')).toBe(false);
@@ -649,7 +649,7 @@ describe('the fleet recovery passphrase', () => {
         expect(await hasRecoveryPassphrase(db)).toBe(false);
     });
 
-    // ⚠️ NO IDENTITY MEANS WE CANNOT RECOGNISE OUR OWN DISKS. In RECOVERY mode the whole encrypted-disk scan is
+    // ⚠️ NO IDENTITY MEANS WE CANNOT RECOGNIZE OUR OWN DISKS. In RECOVERY mode the whole encrypted-disk scan is
     // keyed on the instance identity -- a disk's nameplate is compared against it. With no identity, our own
     // encrypted disks are classified as NEITHER ours NOR unknown: they simply vanish. A passphrase operation
     // would see an empty fleet, take the "nothing is encrypted yet" branch, and write a verifier into Mongo that
@@ -1211,8 +1211,8 @@ describe('finding the encrypted disks on the platters', () => {
         expect(found.unknown).toEqual([]);   // positively not ours: it said so itself
     });
 
-    // The fail-open that would undo the whole guard: an unlabelled LUKS container treated as "not ours".
-    it('reports an unlabelled LUKS container as UNKNOWN, never as not-ours', async () => {
+    // The fail-open that would undo the whole guard: an unlabeled LUKS container treated as "not ours".
+    it('reports an unlabeled LUKS container as UNKNOWN, never as not-ours', async () => {
         const found = await findEncryptedPartitions(IDENTITY, disks([
             { type: 'part', name: 'sdf1', path: '/dev/sdf1', fstype: 'crypto_LUKS', partlabel: null },
             { type: 'part', name: 'sdf2', path: '/dev/sdf2', fstype: 'crypto_LUKS', partlabel: 'primary' }

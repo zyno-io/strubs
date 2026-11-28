@@ -636,7 +636,7 @@ export class Database {
                 { key: { containerId: 1 }, name: 'containerId' },
                 // Sparse: pre-backfill documents have no bucketId yet; once backfill completes every
                 // document carries one, so the sparse index covers the whole collection. Used by
-                // authorisation (bucket lookup by id) and the per-bucket stats aggregation.
+                // authorization (bucket lookup by id) and the per-bucket stats aggregation.
                 { key: { bucketId: 1 }, name: 'bucketId', sparse: true },
                 { key: { lastVerifiedAt: 1 }, name: 'lastVerifiedAt' },
                 { key: { sliceErrors: 1 }, name: 'sliceErrors', sparse: true },

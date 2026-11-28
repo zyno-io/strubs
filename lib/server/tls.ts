@@ -59,7 +59,7 @@ export function computeSanEntries(extraHosts: string[] = []): string[] {
 }
 
 // The SANs a leaf was issued for are recorded in a sidecar file next to it, NOT read back from the
-// certificate. openssl normalises SANs on output (`::1` -> `0:0:0:0:0:0:0:1`, uppercased, expanded), so
+// certificate. openssl normalizes SANs on output (`::1` -> `0:0:0:0:0:0:0:1`, uppercased, expanded), so
 // comparing our computed list against the parsed cert never matches and we would reissue on every
 // startup. The sidecar stores exactly the strings we generated, making the drift check deterministic.
 async function readIssuedSans(sansPath: string): Promise<string[] | null> {
@@ -160,7 +160,7 @@ export async function ensureTlsMaterial(): Promise<TlsMaterial> {
         await run(['x509', '-req', '-in', csr, '-CA', caCrt, '-CAkey', caKey, '-CAcreateserial',
             '-out', tlsCrt, '-days', String(LEAF_DAYS), '-sha256', '-extfile', extfile], 'failed to sign leaf');
         await fs.chmod(tlsKey, 0o600);
-        // Record exactly the SANs we issued for, so the next startup's drift check is normalisation-proof.
+        // Record exactly the SANs we issued for, so the next startup's drift check is normalization-proof.
         await fs.writeFile(tlsSans, wantSans.join('\n') + '\n');
         await fs.rm(csr, { force: true });
         await fs.rm(extfile, { force: true });

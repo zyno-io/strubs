@@ -372,7 +372,7 @@ export class FileObject extends Duplex {
                 // The `del` is already durable, but the row is still there and the slices have not been
                 // touched: the object is still LIVE, and the caller is about to be told the delete FAILED.
                 // Left like this the journal's last word on the object is "deleted" -- so a rebuild from the
-                // platters would honour it and drop the name of an object that still exists, quietly turning
+                // platters would honor it and drop the name of an object that still exists, quietly turning
                 // it into a nameless orphan. Put the name back. The journal has to agree with reality, and
                 // reality is that this object is still here.
                 await this.deps.journalPut(deletedRecord).catch(compensationErr =>
