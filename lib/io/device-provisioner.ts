@@ -54,7 +54,7 @@ const log = createLogger('device-provisioner');
 //   2. LENGTH. A LOCKED disk identifies itself by its GPT nameplate, which only has room for the FIRST 16 hex
 //      characters. So the identity it offers is a PREFIX of the real one, not the whole thing.
 //
-// Normalise both (the same way config.normalizeIdentity does), then compare on the shorter of the two -- but
+// Normalize both (the same way config.normalizeIdentity does), then compare on the shorter of the two -- but
 // never on fewer than 16 hex characters, because a prefix that short stops being evidence of anything.
 const sameIdentity = (ours: string | null, theirs: string): boolean => {
     const a = normalizeIdentity(ours ?? '');
@@ -83,7 +83,7 @@ type DeviceProvisionerDeps = {
     // ⚠️ AND NOT `lsblk`'s SERIAL, WHICH IS THE USB BRIDGE'S. On this rack that value repeats: six pairs of disks
     // share a bridge serial and eight report none at all, because the enclosure answers on the drive's behalf
     // (its WWN is 0x5000000000000001 on all thirty-one of them). Holding a wipe to THAT identity would let a
-    // disk in the next bay inherit the blessing meant for its neighbour.
+    // disk in the next bay inherit the blessing meant for its neighbor.
     //
     // The SMART serial comes from the drive itself: 31 disks, 31 distinct values, none blank. It is the only
     // thing here that names one piece of metal.
@@ -179,7 +179,7 @@ export class DeviceProvisioner {
         // ONLY for encrypted provisions, and the decision is made HERE rather than inside -- a plaintext disk has
         // no keyslot to get wrong, and blocking a passphrase rotation for the ten minutes it takes to mkfs an 4TB
         // disk would be a needless refusal. (An earlier version wrapped every provision and claimed in a comment
-        // that it did not, which is worse than either behaviour on its own.)
+        // that it did not, which is worse than either behavior on its own.)
         const encrypt = await this.shouldEncrypt(options.encrypt);
 
         return encrypt
@@ -203,7 +203,7 @@ export class DeviceProvisioner {
 
         // HARD GATE 1: no instance identity means we are in RECOVERY. Provisioning FORMATS DISKS, and with
         // no identity we cannot even tell our own disks from a stranger's -- so the one thing we must not
-        // do is offer to reinitialise the array we are trying to rescue. Refuse in the backend, not just
+        // do is offer to reinitialize the array we are trying to rescue. Refuse in the backend, not just
         // in the UI: the API is reachable regardless of what the UI renders.
         if (this.deps.instanceIdentity() === null)
             throw new HttpBadRequestError('provisioning is disabled during recovery: restore the instance identity first');
@@ -464,7 +464,7 @@ export class DeviceProvisioner {
     }
 
     // The fleet default, overridable per disk. Read at provision time rather than cached: an operator who flips
-    // the setting expects the next disk they add to honour it, not the next restart.
+    // the setting expects the next disk they add to honor it, not the next restart.
     private async shouldEncrypt(explicit?: boolean): Promise<boolean> {
         if (typeof explicit === 'boolean')
             return explicit;
@@ -820,7 +820,7 @@ export class DeviceProvisioner {
     //
     // The serial comes from the hardware, not the kernel's enumeration order, so it survives a rename. Ask the
     // machine again, right now, and refuse if the answer changed. This costs one lsblk before an operation that
-    // takes minutes -- and a wipe aimed at the wrong disk is not something we get to apologise for afterwards.
+    // takes minutes -- and a wipe aimed at the wrong disk is not something we get to apologize for afterwards.
     private async assertStillTheSameDisk(blockPath: string, expected: string, context: string): Promise<void> {
         const now = await this.deps.currentDiskIdentity(blockPath);
 

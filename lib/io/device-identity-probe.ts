@@ -29,7 +29,7 @@ export type StrubsDiskIdentity = {
 //                dirty journal, I/O errors). REFUSE.
 //
 // 'unknown' must never collapse into 'clean'. This guard's only job is to stop a disk holding 4.4TB of
-// customer data from being repartitioned, and "I could not tell" is not a licence to destroy it. An
+// customer data from being repartitioned, and "I could not tell" is not a license to destroy it. An
 // earlier version of this returned null on a failed mount, which the caller read as "not ours" -- i.e. it
 // failed OPEN, in the one function that exists to fail closed.
 export type ProbeResult =
@@ -64,10 +64,10 @@ export async function probeStrubsIdentity(partition: RawBlockDeviceChild): Promi
     // and that is enough to REFUSE -- which is the only decision this function makes.
     //
     // Using an advisory field to refuse is always safe: the worst a forged or stale nameplate can do is stop us
-    // destroying a disk. (It would be a different matter to AUTHORISE a wipe on one, and we never do -- the
+    // destroying a disk. (It would be a different matter to AUTHORIZE a wipe on one, and we never do -- the
     // conversion path requires a disk to prove itself from INSIDE the filesystem, which a locked disk cannot.)
     //
-    // No nameplate, or one we do not recognise, still means 'unknown': a LUKS disk we hold no key for is either
+    // No nameplate, or one we do not recognize, still means 'unknown': a LUKS disk we hold no key for is either
     // somebody else's or ours with a lost key, and neither is a disk to reformat on a hunch.
     if (fs === 'crypto_luks') {
         const plate = parseNameplate(partition.partlabel);
@@ -82,7 +82,7 @@ export async function probeStrubsIdentity(partition: RawBlockDeviceChild): Promi
             status: 'unknown',
             reason: `${partitionPath} is a LUKS container carrying no STRUBS nameplate. Its contents cannot be `
                 + `read without the key, so this guard cannot establish whether it is blank or holds a STRUBS `
-                + `volume -- and "I could not tell" is not a licence to repartition 4TB. Unlock it, or take it `
+                + `volume -- and "I could not tell" is not a license to repartition 4TB. Unlock it, or take it `
                 + `out of the machine.`
         };
     }
@@ -93,7 +93,7 @@ export async function probeStrubsIdentity(partition: RawBlockDeviceChild): Promi
     // read the superblock -- which is exactly what a dying disk does. So a live STRUBS volume whose ext4
     // superblock has gone unreadable presents as a blank partition, and this guard, whose whole job is to stop
     // us wiping a disk with data on it, would happily wave 4TB of somebody's only copy through to be
-    // repartitioned. "I could not tell" is not a licence to destroy.
+    // repartitioned. "I could not tell" is not a license to destroy.
     //
     // So blankness is ESTABLISHED, not assumed. `blkid -p` probes the device itself rather than trusting a
     // cached fstype: exit 2 with no output is a positive "there is no signature here"; a signature means there

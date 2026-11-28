@@ -391,7 +391,7 @@ export class RebalanceJob {
         // Hold the space for the whole move. Nothing else does: relocateByCopy writes straight to a
         // temp handle, and reconstructing onto a loaded-from-record object carries no reservation. So
         // without this, every concurrent move sees identical free space, pickTarget is deterministic,
-        // and they ALL pile onto the same emptiest volume -- serialising on one spindle and
+        // and they ALL pile onto the same emptiest volume -- serializing on one spindle and
         // collectively over-committing it past pickTarget's own free-space guard. fill() already
         // subtracts bytesPending, so reserving fixes the guard and the spreading in one go.
         dest.reserveSpace(sliceBytes);

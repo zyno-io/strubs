@@ -1633,7 +1633,7 @@ describe('encrypting a volume', () => {
         uuid: 'vol-15',
 
         // ⚠️ A PARTITION, because that is what a real volume carries. This fixture used to say '/dev/sde' -- a
-        // whole disk -- and so it modelled a machine that does not exist. Every conversion test passed against
+        // whole disk -- and so it modeled a machine that does not exist. Every conversion test passed against
         // it while the real conversion could not run at all: the provisioner is handed this path and looks for
         // it among the WHOLE DISKS, where a partition never appears. "block device not found", every time.
         blockPath: '/dev/sde1',

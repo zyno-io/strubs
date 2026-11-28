@@ -65,7 +65,7 @@ export type BootstrapManifestDeps = {
 const defaultDeps: BootstrapManifestDeps = {
     getVolumeConfigs: () => database.getVolumes(),
     // Lazily resolved: ioManager hooks the manifest writer on every fleet change, so importing it at
-    // module scope here would close an initialisation cycle. Deferring to call time breaks it.
+    // module scope here would close an initialization cycle. Deferring to call time breaks it.
     getReadableTargets: () => {
         const { ioManager } = require('./manager') as typeof import('./manager');
         return ioManager.getVolumeEntries()
@@ -675,7 +675,7 @@ export function newestManifest(manifests: BootstrapManifest[]): BootstrapManifes
     // manifest that happens to have the freshest updatedAt but no snapshot pointer in it -- a volume that
     // came back from a spell offline, a disk that missed the last publish -- then the recovery concludes
     // there is no snapshot and rebuilds nothing, while 127MB of erasure-coded namespace sits on the platters
-    // a metre away. So a manifest carrying a usable snapshot always beats one that does not, and only then
+    // a meter away. So a manifest carrying a usable snapshot always beats one that does not, and only then
     // do we ask which is newer.
     const usable = manifests.filter(m => m && isUsableSnapshotRef(m.snapshot));
     const pool = usable.length ? usable : manifests.filter(Boolean);

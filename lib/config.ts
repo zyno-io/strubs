@@ -285,7 +285,7 @@ export class Config {
     //
     // The on-disk identity is stored in whatever form it was created in (ours is a hyphenated UUID), and
     // only its 16 hex BYTES are ever compared -- loadIdentity/verify both strip non-hex before building
-    // the buffer. So the "is this the same identity?" guard must compare the NORMALISED forms; comparing
+    // the buffer. So the "is this the same identity?" guard must compare the NORMALIZED forms; comparing
     // raw strings would make re-adopting the very same identity look like a different one and throw.
     async adoptIdentity(identity: string): Promise<void> {
         const normalized = normalizeIdentity(identity);

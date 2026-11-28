@@ -259,7 +259,7 @@ A **bucket** is a top-level container (the first path segment). These endpoints 
 | `PUT /$/buckets/{id}/policy` | Set any of `publicRead`, `publicWrite`, `deleteProtected` (booleans). |
 | `GET /$/buckets/stats` | Per-bucket object count and logical size (cached; the expensive aggregation). |
 
-`deleteProtected: true` blocks **every** object delete in the bucket — a `DELETE /{path}` on a contained object returns 403 — independent of the read/write flags. There is no bucket-*delete* endpoint at all (delete acts on objects), so this protects the objects inside it. Like the public flags it rides the durability rails: it's journalled, snapshotted, and restored. On recovery the two paths differ — journal replay only ever *adds* protection (it refuses to clear a flag the live bucket has set), while a snapshot restore rewrites policy to match the snapshot exactly, so it can also clear it.
+`deleteProtected: true` blocks **every** object delete in the bucket — a `DELETE /{path}` on a contained object returns 403 — independent of the read/write flags. There is no bucket-*delete* endpoint at all (delete acts on objects), so this protects the objects inside it. Like the public flags it rides the durability rails: it's journaled, snapshotted, and restored. On recovery the two paths differ — journal replay only ever *adds* protection (it refuses to clear a flag the live bucket has set), while a snapshot restore rewrites policy to match the snapshot exactly, so it can also clear it.
 
 ## Maintenance freeze
 

@@ -56,7 +56,7 @@ export type SnapshotDeps = {
     // Every container, in any order. Small enough to hold (tens of thousands): they have to be sorted
     // parent-first before they can be written, and you cannot sort a stream you have not seen the end of.
     listContainers: () => Promise<Array<{ id: string; cid: string | null; name: string; pr?: boolean; pw?: boolean; dp?: boolean }>>;
-    // Every object, streamed. There are millions, so this must never be materialised.
+    // Every object, streamed. There are millions, so this must never be materialized.
     streamObjects: () => AsyncIterable<{ id: string; cid: string | null; name: string; mime?: string | null; md5?: string | null; size: number; cs: number }>;
     now: () => Date;
 };
@@ -84,7 +84,7 @@ const defaultDeps: SnapshotDeps = {
 // and U+0085 are the trap, because JSON leaves them unescaped and plenty of tools treat them as line
 // terminators. Not hypothetical: an md5 whose bytes began f3 c1 e9 e2 80 a8 split its own record in two on
 // the very first real snapshot. e2 80 a8 is U+2028.
-function serialise(record: SnapshotRecord): string {
+function serialize(record: SnapshotRecord): string {
     const line = JSON.stringify(record);
     if (/[\n\r\u0085\u2028\u2029]/.test(line))
         throw new Error(`snapshot record for ${'id' in record ? record.id : record.op} contains a line terminator `
@@ -139,7 +139,7 @@ export class SnapshotBuilder {
         for await (const o of this.deps.streamObjects()) {
             objects++;
             if (o.cid) seenContainers.add(o.cid);
-            const line = serialise({ op: 'put', id: o.id, cid: o.cid, name: o.name, mime: o.mime ?? null, md5: o.md5 ?? null, size: o.size, cs: o.cs });
+            const line = serialize({ op: 'put', id: o.id, cid: o.cid, name: o.name, mime: o.mime ?? null, md5: o.md5 ?? null, size: o.size, cs: o.cs });
             if (!objectLines.write(line))
                 await once(objectLines, 'drain');
         }
@@ -177,7 +177,7 @@ export class SnapshotBuilder {
         ]);
 
         for (const c of ordered) {
-            const line = serialise({
+            const line = serialize({
                 op: 'container', id: c.id, cid: c.cid, name: c.name,
                 ...(c.pr === undefined ? {} : { pr: c.pr }),
                 ...(c.pw === undefined ? {} : { pw: c.pw }),
@@ -187,14 +187,14 @@ export class SnapshotBuilder {
             if (!gzip.write(line)) await drain();
         }
 
-        // The staged objects, streamed straight through -- never materialised.
+        // The staged objects, streamed straight through -- never materialized.
         for await (const chunk of createReadStream(scratch, { encoding: 'utf8' })) {
             hash.update(chunk as string);
             if (!gzip.write(chunk)) await drain();
         }
 
         const sha256 = hash.digest('hex');
-        gzip.write(serialise({ op: 'end', containers: ordered.length, objects, sha256 }));
+        gzip.write(serialize({ op: 'end', containers: ordered.length, objects, sha256 }));
 
         gzip.end();
         await done;

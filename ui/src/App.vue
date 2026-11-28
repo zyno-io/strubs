@@ -552,7 +552,7 @@ type StorageVolumeRow = {
   // Hardware-derived bus group (physical enclosure/HBA), present on volumes and
   // unassigned drives alike; used to slot unassigned drives next to their siblings
   busGroup: number | null;
-  // Status tone of the volume (see getVolumeTone); drives the volume-id tag colour.
+  // Status tone of the volume (see getVolumeTone); drives the volume-id tag color.
   tone: Tone;
   device: string | null;
   // Underlying sysfs path of the backing block device, when known (used for the
@@ -886,7 +886,7 @@ const canCreateVolumes = computed<boolean>(() => {
   return true;
 });
 
-// Status tone based on volume state (same precedence as the old per-volume colours)
+// Status tone based on volume state (same precedence as the old per-volume colors)
 function getVolumeTone(volume: VolumeStatus | null): Tone {
   if (!volume) return 'neutral'; // unassigned drive
   if (!volume.isEnabled) return 'neutral'; // disabled
@@ -1362,7 +1362,7 @@ async function setRecoveryPassphrase(): Promise<void> {
   }
 }
 
-// HAND THE PASSPHRASE BACK ONCE, so STRUBS can use it rather than merely recognise it.
+// HAND THE PASSPHRASE BACK ONCE, so STRUBS can use it rather than merely recognize it.
 //
 // An array that recorded its passphrase before STRUBS kept a usable copy (or whose keyfile was restored from a
 // different backup) holds a hash and nothing else -- it can check what you type and cannot encrypt a disk by
@@ -2984,7 +2984,7 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <!-- RECORDED, BUT NOT USABLE. The array can recognise the passphrase and cannot produce it, so it cannot
+          <!-- RECORDED, BUT NOT USABLE. The array can recognize the passphrase and cannot produce it, so it cannot
                write a keyslot -- and nothing else in the UI would ever say so. -->
           <div v-if="encryption && encryption.hasRecoveryPassphrase && !encryption.passphraseUsable" class="notice warning">
             <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
@@ -3259,7 +3259,7 @@ onUnmounted(() => {
                 <div>
                   <div class="setting-title">Auth enforcement</div>
                   <div class="hint">
-                    While off, all object requests are allowed (today's behaviour). Turning it on begins
+                    While off, all object requests are allowed (today's behavior). Turning it on begins
                     rejecting anonymous access to non-public buckets.
                     <em>The object API is plain HTTP — Basic credentials cross the wire in cleartext.</em>
                   </div>

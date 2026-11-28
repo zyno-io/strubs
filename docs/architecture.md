@@ -21,7 +21,7 @@ STRUBS is one Node process, a MongoDB database, and a pile of disks. That's the 
               MongoDB ── content, volumes, faults, runtimeConfig, storageStats
 ```
 
-Two things are worth internalising before reading further, because everything else follows from them:
+Two things are worth internalizing before reading further, because everything else follows from them:
 
 1. **The disks share nothing.** Each volume is its own filesystem with its own files. No layer spans them. Losing a disk is a *slice* problem, never an *array* problem.
 2. **Mongo holds the map — and the platters hold a copy of it.** A slice file on disk is an anonymous blob; the `content` record says which volumes hold which slice of which object. Losing Mongo used to mean losing the array, so STRUBS now writes the namespace back to the disks continuously: a replicated **journal** of every name, and a periodic **snapshot** of the whole namespace stored as an object and pointed at by every volume's bootstrap manifest. After a total database loss, `POST /$/recover-fleet` rebuilds the volume table from the disks and `POST /$/restore` rebuilds the namespace. Back Mongo up anyway — the restore is the bad day's path, not the cheap one.

@@ -136,7 +136,7 @@ function normalize<T extends ContentDocument>(object: T): T & { id: string; cont
     return out;
 }
 
-describe('bucketId denormalisation', () => {
+describe('bucketId denormalization', () => {
     let collection: FakeContentCollection;
     let repo: ContentRepository;
 

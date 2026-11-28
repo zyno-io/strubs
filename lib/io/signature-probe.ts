@@ -75,7 +75,7 @@ export async function probeSignature(devicePath: string): Promise<Signature> {
                 kind: 'unreadable',
                 reason: `wipefs found ${sigs.length} signature(s) on ${devicePath} but at least one of them has `
                     + `no type this understands. Something is on that disk and we cannot name it -- which is not `
-                    + `a licence to repartition it.`
+                    + `a license to repartition it.`
             };
 
         // LUKS anywhere in the list wins: it is the one signature that means "there may be an entire array in

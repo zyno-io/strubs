@@ -64,7 +64,7 @@ A byte-copy of a parity slice preserves a wrong one — a foreign parity slice i
 
 The `mode` (`light`/`full`) is shared by both entry points, but the parity recompute is **not**: only the per-object verify (`POST /$/verify-file`, and a fleet-wide sweep of it) rebuilds parity from the data. The rolling `verify-volumes` scrub, even in `full` mode, reads and per-chunk-MD5s every slice — parity included — but never recomputes parity.
 
-Light verification exists for a specific situation: when the fleet is fragile and you need answers *now*, a full read of every byte is exactly the stress you can't afford. Light gives you "is everything present and correctly labelled?" in hours instead of weeks.
+Light verification exists for a specific situation: when the fleet is fragile and you need answers *now*, a full read of every byte is exactly the stress you can't afford. Light gives you "is everything present and correctly labeled?" in hours instead of weeks.
 
 But be clear about the trade: **light verification cannot see corrupt parity, and it cannot see a self-consistent-but-wrong slice** — and neither can the rolling scrub see *foreign* parity, which only the per-object recompute catches. Light is a triage tool, not a substitute.
 

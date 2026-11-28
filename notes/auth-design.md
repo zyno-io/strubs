@@ -33,9 +33,9 @@ Worth stating explicitly, because it changes the shape of the work:
 
 What survives is one genuine piece of groundwork:
 
-### `bucketId` must be denormalised onto every object
+### `bucketId` must be denormalized onto every object
 
-Authorising a request means knowing its bucket. The path form is easy — first component of `/photo/2024/cat.jpg`. But an object is **also addressable by id** — `GET /$65f0a1b2c3d4e5f60718293a` (`helpers.ts:5`) — and a record only stores `containerId`, its *immediate* parent. Finding the bucket would mean walking up to the root, one lookup per level, on every request.
+Authorizing a request means knowing its bucket. The path form is easy — first component of `/photo/2024/cat.jpg`. But an object is **also addressable by id** — `GET /$65f0a1b2c3d4e5f60718293a` (`helpers.ts:5`) — and a record only stores `containerId`, its *immediate* parent. Finding the bucket would mean walking up to the root, one lookup per level, on every request.
 
 So: **store `bucketId` on every content document.**
 
@@ -72,7 +72,7 @@ fetch('/$/volumes', { method: 'POST', body: '{"blockPath":"/dev/sda","wipe":…}
 
 Two ways to close it; do **both**, belt and braces:
 
-1. **Separate origin for admin.** The UI and `/$/` on a **different port** (or host) from object content. A different port is a different origin, so object-hosted script cannot reach the admin cookie. This is the real fix; everything else is defence in depth.
+1. **Separate origin for admin.** The UI and `/$/` on a **different port** (or host) from object content. A different port is a different origin, so object-hosted script cannot reach the admin cookie. This is the real fix; everything else is defense in depth.
 2. **Neuter object responses.** On every object `GET`, regardless of origin: `X-Content-Type-Options: nosniff`, a restrictive `Content-Security-Policy` (`default-src 'none'`), and — for anything not on a short allowlist of genuinely-inert types (images, video, audio, `application/octet-stream`) — force `Content-Disposition: attachment` so the browser downloads rather than renders. HTML uploaded to a bucket should never *execute*; at most it should download.
 
 This reshapes the listener table below: admin is not merely "HTTPS-only", it is **its own origin**.
@@ -142,7 +142,7 @@ An earlier draft baked in `strubs.local`. Don't. Nothing resolves it (no mDNS, n
 
 **Reissue automatically when that set changes.** An IP move (DHCP, a re-cabled network) otherwise silently breaks the padlock and nobody notices until they need the UI. Comparing the computed SAN set against the current certificate at startup, and reissuing on a mismatch, makes the whole question self-healing — and costs a few milliseconds of `openssl` a year.
 
-This means **no naming decision is required to ship**, and no dependency on mDNS or DNS. If a stable name is wanted later, add it to `STRUBS_TLS_HOSTS` (and install `avahi-daemon` if `.local` is the flavour preferred); the cert picks it up on the next start.
+This means **no naming decision is required to ship**, and no dependency on mDNS or DNS. If a stable name is wanted later, add it to `STRUBS_TLS_HOSTS` (and install `avahi-daemon` if `.local` is the flavor preferred); the cert picks it up on the next start.
 
 Verified end-to-end on this host: CA + leaf, chain validates, HTTPS serves with it, and plain HTTP refuses `/$/`.
 
@@ -234,12 +234,12 @@ A bucket **is** a top-level container (`containerId: null, isContainer: true`). 
 
 Two independent booleans, as asked. `publicRead` without `publicWrite` is the common case (a public photo bucket); `publicWrite` without `publicRead` is a legitimate drop-box.
 
-> **`publicWrite` means anonymous DELETE.** The UI must say that in those words, not hide it behind a toggle labelled "write".
+> **`publicWrite` means anonymous DELETE.** The UI must say that in those words, not hide it behind a toggle labeled "write".
 
-**Bucket creation becomes explicit, and root objects are refused outright.** Two current behaviours have to change (both are in code, not just convention):
+**Bucket creation becomes explicit, and root objects are refused outright.** Two current behaviors have to change (both are in code, not just convention):
 
 - `PUT /newthing/x.jpg` silently creates the `newthing` bucket (`object-put-request.ts:174`). Once buckets carry policy, an implicit bucket has *no considered policy* — so creating a **top-level** container is refused unless the credential holds an explicit `createBucket` grant (or is admin). Nested containers still create implicitly; only the top level is special.
-- `PUT /file.bin` — a **single-component path** — creates an object *at the root*, with no bucket at all (`object-put-request.ts:174`; there is a test asserting exactly this, `object-requests.test.ts:436`). A root object has no bucket, so it has no policy, so it cannot be authorised. **Reject single-component object paths** (`400`, "objects must live in a bucket"). This is safe today precisely because production has **zero** root objects — but the code allows it, so auth must close it explicitly rather than assume.
+- `PUT /file.bin` — a **single-component path** — creates an object *at the root*, with no bucket at all (`object-put-request.ts:174`; there is a test asserting exactly this, `object-requests.test.ts:436`). A root object has no bucket, so it has no policy, so it cannot be authorized. **Reject single-component object paths** (`400`, "objects must live in a bucket"). This is safe today precisely because production has **zero** root objects — but the code allows it, so auth must close it explicitly rather than assume.
 
 ---
 
@@ -276,7 +276,7 @@ authorize(request) -> allow | deny
 
 1. Which bucket?
      /photo/2024/cat.jpg   -> first path component
-     /$65f0a1b2…           -> the record's denormalised bucketId
+     /$65f0a1b2…           -> the record's denormalized bucketId
 2. Who?
      Authorization: Basic … -> look up accessKeyId, argon2-verify the secret
      (none)                 -> anonymous
@@ -291,7 +291,7 @@ authorize(request) -> allow | deny
 
 `GET`/`HEAD`/`OPTIONS` are reads; `PUT`/`DELETE` are writes.
 
-**Authorise on the SAME bytes that address storage.** The server does not URL-decode path components before the DB lookup (`server.ts:142`, `content-repository.ts:45`) — the raw path *is* the key. So authz must run on the raw path too. If auth decodes `%2F`/`%2e`, normalises unicode, or lowercases while storage does not, then `photo` and `Photo` and `pho%74o` can mean one bucket to the permission check and another to the lookup — a classic confused-deputy bypass. One parse, shared by both.
+**Authorize on the SAME bytes that address storage.** The server does not URL-decode path components before the DB lookup (`server.ts:142`, `content-repository.ts:45`) — the raw path *is* the key. So authz must run on the raw path too. If auth decodes `%2F`/`%2e`, normalizes unicode, or lowercases while storage does not, then `photo` and `Photo` and `pho%74o` can mean one bucket to the permission check and another to the lookup — a classic confused-deputy bypass. One parse, shared by both.
 
 **Pin a strict bucket-name grammar now, while there are only seven.** Lowercase ASCII letters, digits, and hyphen; 3–63 chars; no leading/trailing hyphen. This closes unicode confusables, encoded-slash tricks, the `$`-prefix collision with the id form, and case-policy surprises in a single rule — and it costs nothing today because every existing bucket already conforms.
 
@@ -326,7 +326,7 @@ The pipeline is entirely under our control, so there is no need to discover unkn
 ```
 1. Ship admin auth. Mandatory from day one. This alone closes the wipe-a-disk hole.
 2. Ship the bucket/credential model with  authEnforced = false.
-     Buckets default to publicRead = publicWrite = true -> behaviour identical to today.
+     Buckets default to publicRead = publicWrite = true -> behavior identical to today.
 3. Provision credentials; update the consumers.
 4. Flip authEnforced = true, and tighten each bucket's public flags.
 ```
@@ -343,7 +343,7 @@ Keep an **anonymous-request counter per bucket** anyway, surfaced in the UI. Not
 |---|---|---|
 | **0** | **Listener split + TLS**: object listeners (HTTP/HTTPS) and a **separate admin origin** (own HTTPS port); self-issued CA + leaf, SANs from the host, auto-reissued on change; configurable ports; **harden object responses** (`nosniff`, `Content-Security-Policy`, forced `Content-Disposition` off the inert-type allowlist) | The origin split is a security boundary, not cosmetics — it must exist before any admin cookie does |
 | **1** | **Admin auth**: argon2 password, session + login page, **admin bearer tokens** (selector.secret), **root-only Unix socket**, everything on the admin origin gated, bootstrap password to the log | **Closes the disk-wipe hole. Ships first.** |
-| **2** | `bucketId` denormalisation + backfill; bucket policy fields; per-bucket stats aggregation | Unblocks everything else; breaks nothing; immediately gives the UI real numbers |
+| **2** | `bucketId` denormalization + backfill; bucket policy fields; per-bucket stats aggregation | Unblocks everything else; breaks nothing; immediately gives the UI real numbers |
 | **3** | Credentials collection; the single `authorize()` choke point; Basic auth on the object API; anonymous-request counters — all with `authEnforced = false` | The whole model, dark |
 | **4** | UI: login, buckets, credentials, settings | Makes it operable |
 | **5** | Provision credentials, update consumers, `authEnforced = true` | The actual security win |

@@ -164,7 +164,7 @@ export type Platter = { volumeId: number; mountPoint: string };
 //
 // This is the list that decides what "the platters say" means, and everything built on it is a decision to
 // throw a name away: an object whose slices are not in the index is dropped by the restore as an abandoned
-// write, reported by the drift scrub as a phantom, and has its pending delete honoured. A volume that failed
+// write, reported by the drift scrub as a phantom, and has its pending delete honored. A volume that failed
 // to mount contributes NOTHING to that index -- so quietly leaving it out does not produce a slightly
 // incomplete answer, it produces a confidently wrong one, about a disk that is sitting right there full of
 // data.
@@ -265,7 +265,7 @@ export async function buildSliceIndex(
     //
     // Everything downstream of this index treats an id's absence from it as a fact about the world: the
     // restore drops the object's name as an abandoned write, the drift scrub reports it as a phantom, and a
-    // `del` that never completed gets honoured. Every one of those is a decision to THROW A NAME AWAY, made
+    // `del` that never completed gets honored. Every one of those is a decision to THROW A NAME AWAY, made
     // on the strength of a readdir that quietly returned nothing because a disk was too sick to answer.
     //
     // So the errors are collected, and the scan REFUSES to hand back a picture of the array it knows to be
@@ -496,7 +496,7 @@ export async function synthesiseRecordFromIndex(
     // files on the SAME disk -- a rebalance that copied a slice and died leaves exactly that -- because the
     // whole point of corroboration is that a second, independent piece of hardware says the same thing. One
     // platter does not get to corroborate itself.
-    // ALL OF THEM AT ONCE, and this is not a micro-optimisation -- it is the difference between a tool you
+    // ALL OF THEM AT ONCE, and this is not a micro-optimization -- it is the difference between a tool you
     // would actually run and one you would not.
     //
     // Reading every header is what makes the vote sound, and on this array a cold header read costs ~10ms:
@@ -682,7 +682,7 @@ export async function synthesiseRecordFromIndex(
     // copy the index happens to have picked may be the corrupt one, while an intact copy of the very same
     // slice sits on another disk, unexamined, because it was second in the walk.
     //
-    // Declaring an object lost while a good copy of the slice it needs is on a platter a metre away is the
+    // Declaring an object lost while a good copy of the slice it needs is on a platter a meter away is the
     // worst thing this module can do. So when -- and only when -- an object comes up short, go and look. It
     // costs nothing in the normal case, because in the normal case we never get here.
     if (platters && !recoverable) {

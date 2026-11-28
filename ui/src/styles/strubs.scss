@@ -1,6 +1,6 @@
 // STRUBS layouts and the primitives PixelCI defines in DESIGN.md but styles inside its own screens or
 // through Vue Foundation (top bar, page header, modal, menu, toggle, segmented control, data table).
-// Every colour, radius and shadow comes from the tokens in base.scss.
+// Every color, radius and shadow comes from the tokens in base.scss.
 
 // Shell and top bar (PixelCI layout.vue)
 
@@ -306,7 +306,7 @@ main {
     }
 }
 
-// A labelled line of tags (target volumes, errors by volume, ...).
+// A labeled line of tags (target volumes, errors by volume, ...).
 .tag-line {
     display: flex;
     align-items: center;

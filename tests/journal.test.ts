@@ -239,7 +239,7 @@ describe('namespace journal', () => {
         // second could finish first and release append() while the FIRST one's copy is still running --
         // an acknowledged record written into a target that copyFile then overwrites. The very bug the
         // lock exists to prevent, reintroduced by the lock not being single-flight.
-        it('serialises concurrent re-elections, so no record is acknowledged mid-copy', async () => {
+        it('serializes concurrent re-elections, so no record is acknowledged mid-copy', async () => {
             configMock.journalReplicas = 1;
             let fleet = [volume(0, 1)];
             const j = new Journal({ getWritableVolumes: () => fleet });
@@ -377,7 +377,7 @@ describe('namespace journal', () => {
     // shards. A scanner that walked the tree by "everything that is a file" would sweep the journal into
     // a rebuild, or delete it as a stray slice. This predicate is what stops that, so it is load-bearing.
     describe('nothing else may be mistaken for a slice', () => {
-        it('recognises a slice file and rejects every recovery artifact beside it', () => {
+        it('recognizes a slice file and rejects every recovery artifact beside it', () => {
             expect(isSliceFileName('5c2ae06dd22cbb37a33ad7fa.0')).toBe(true);
             expect(isSliceFileName('5c2ae06dd22cbb37a33ad7fa.5')).toBe(true);
 
@@ -759,7 +759,7 @@ describe('namespace journal', () => {
             await j.start();
             await j.stop();
 
-            // It is recognised as the same (short) history and topped up, not discarded as foreign.
+            // It is recognized as the same (short) history and topped up, not discarded as foreign.
             expect(j.replicaVolumeIds).toEqual([0, 1]);
             expect((await readJournal(mounts[1])).map(r => r.id)).toEqual(['a', 'b']);
         });
@@ -1070,7 +1070,7 @@ describe('namespace journal', () => {
             await expect(j.append({ op: 'del', ts: 'T', id: 'real-object-id' }))
                 .rejects.toThrow(/EVERY replica/);
 
-            // The `del` is GONE from the platter. Had it survived, a rebuild would honour it and drop the
+            // The `del` is GONE from the platter. Had it survived, a rebuild would honor it and drop the
             // name of an object that is still there -- an object whose delete the caller was told FAILED.
             const records = await readJournal(mounts[0]);
             expect(records.map(r => r.op)).toEqual(['put']);

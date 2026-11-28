@@ -89,7 +89,7 @@ const defaultDeps: SnapshotJobDeps = {
         //
         // This is a CHECK, not a lock, and the difference is worth being honest about: two processes could
         // still interleave between this read and the write below. It is not defended further because the
-        // defence would be worse than the disease. A lock file on a volume introduces stale-lock recovery --
+        // defense would be worse than the disease. A lock file on a volume introduces stale-lock recovery --
         // a new way to be unable to snapshot at all -- and a second STRUBS on this array would be fighting
         // the first over mounted volumes, the journal replicas and the object writer long before it got
         // anywhere near the snapshot pointer. The array is single-host and single-process by construction.
@@ -161,7 +161,7 @@ export class SnapshotJob {
     // the one to use.
     //
     // The order is the entire job. A snapshot that has been written but not verified is not a snapshot, it
-    // is a rumour -- and the moment to find out that it cannot be read is now, while the thing it is a copy
+    // is a rumor -- and the moment to find out that it cannot be read is now, while the thing it is a copy
     // of is still sitting safely in Mongo, and not on the day it is the only copy left.
     //
     // The previous snapshot is kept, and its pointer stays in the manifest alongside the new one. At no

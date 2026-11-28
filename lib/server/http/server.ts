@@ -55,7 +55,7 @@ const defaultDeps: HttpServerDependencies = {
 
 // The two surfaces live on SEPARATE ORIGINS (see lib/server/tls.ts and the auth design). An 'object'
 // listener serves only the object API and 404s any `/$/` path; an 'admin' listener serves only the
-// management API + UI and 404s everything else. 'all' is the legacy single-origin behaviour, kept for
+// management API + UI and 404s everything else. 'all' is the legacy single-origin behavior, kept for
 // tests. The separation is a security boundary, so a cross-origin path is a hard 404, never a redirect.
 export type HttpServerRole = 'object' | 'admin' | 'all';
 
@@ -164,7 +164,7 @@ export class HttpServer {
             return this._outputHttpBadRequest('unsupported method', req, res);
 
         // Admin authentication for any `/$/` request that isn't on the object-only listener. Gating on
-        // `role !== 'object'` (rather than `=== 'admin'`) is defence in depth: the legacy single-origin
+        // `role !== 'object'` (rather than `=== 'admin'`) is defense in depth: the legacy single-origin
         // 'all' role must not silently serve the management API unauthenticated. The trusted Unix socket
         // is gated by filesystem permissions; login and the static UI are exempt (they are HOW you auth).
         if (this.role !== 'object' && !this._trusted && request.url.startsWith('/$/')) {
@@ -182,10 +182,10 @@ export class HttpServer {
                 return this._outputHttpUnauthorized(res);
         }
 
-        // Bucket authorisation for object-content requests. The single choke point: it runs before the
+        // Bucket authorization for object-content requests. The single choke point: it runs before the
         // object handler on any listener that serves content, never on the admin origin or the trusted
         // socket, and never for /$/ paths (handled above). DARK by default (authEnforced=false) -- it
-        // allows every request and only bumps a per-bucket counter -- so today's behaviour is unchanged
+        // allows every request and only bumps a per-bucket counter -- so today's behavior is unchanged
         // until an operator flips the switch.
         if (this.role !== 'admin' && !this._trusted && !request.url.startsWith('/$/')) {
             const decision = await authorizeObjectRequest(request.url, method, request.headers.authorization);
